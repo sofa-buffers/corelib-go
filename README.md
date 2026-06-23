@@ -159,24 +159,5 @@ go run ./cmd/perfbench encode_u64_array   # single workload, for Callgrind --tog
 
 The named-workload mode exposes `//go:noinline` `run_*` functions so a Callgrind
 harness can toggle collection on `main.run_<workload>` exactly as the C/C++/Rust
-tools do (setup excluded). The `time` mode reports real throughput on the
-current machine:
-
-```
-Workload                           MB/s
---------                           ----
-encode: u64 array (1000)          81.89
-encode: typical message            6.91
-decode: u64 array (1000)         128.79
-decode: typical message            9.13
-```
-
-Numbers vary with CPU speed, load and build flags — that's the point: they show
-real throughput here. The "typical message" figures are small because, exactly
-as in the C/C++/Rust tools, the per-iteration clock read dominates a sub-100 ns
-operation; they are comparable *across languages* but are not an absolute
-small-message speed. Input construction runs outside the timed loop.
-
-## License
-
-MIT (same as the SofaBuffers C corelib) — see [`LICENSE`](LICENSE).
+tools do (setup excluded). The `time` mode reports real wall-clock throughput on
+the current machine; numbers vary with CPU speed, load and build flags.
