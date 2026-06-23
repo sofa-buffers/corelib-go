@@ -1,38 +1,59 @@
-# sofab — SofaBuffers Go core library
+<p align="center"><img src="assets/sofabuffers_logo.png" alt="SofaBuffers Logo" height="140"></p>
 
-A Go implementation of the SofaBuffers (*Sofab*) serialization format — a
-compact, streaming, TLV-like binary format. This is the **runtime stream core**
-(equivalent to the C corelib's `istream`/`ostream`); it is meant to be driven by
-**generated code**: a schema-driven code generator emits one Go struct per
-message plus `Marshal`/`Unmarshal` methods that call the primitives here, the
-same way protobuf-go generated code calls its runtime.
+# SofaBuffers
 
-The wire format is specified in [`../ARCHITECTURE.md`](../ARCHITECTURE.md) and is
-reproduced byte-for-byte — the tests use the exact vectors from the C reference
-suite (`../test/c/test_ostream.c`), so output is interoperable with the C, C++
-and Rust implementations.
+<b>Structured Objects For Anyone</b><br>
+<i>... so optimized, feels amazing.</i>
+
+[Would you like to know more?](https://github.com/sofa-buffers)
+
+## SofaBuffers Go library
+
+[GitHub repository](https://github.com/sofa-buffers/corelib-go)
+
+A **streaming**, **dependency-free** Go implementation of the SofaBuffers
+(*Sofab*) serialization format — a compact, TLV-like binary format. It is the
+**runtime stream core** (equivalent to the C `corelib`'s `istream` / `ostream`),
+meant to be driven by **generated code**: a schema-driven code generator emits
+one Go struct per message plus `Marshal` / `Unmarshal` methods that call the
+primitives here, the same way protobuf-go's generated code calls its runtime.
+
+The wire format is specified, language-neutrally, in the
+[SofaBuffers documentation](https://github.com/sofa-buffers/documentation). The
+unit tests here use the exact byte vectors from the
+[C corelib](https://github.com/sofa-buffers/corelib-c-cpp)'s reference suite
+(`test/c/test_ostream.c`) to guarantee byte-for-byte interoperability with the
+C, C++ and Rust implementations.
 
 Module path: `github.com/sofa-buffers/corelib-go` · package `sofab`.
 
-## Design
+```bash
+go get github.com/sofa-buffers/corelib-go
+```
 
-- **Streaming both ways.** Encoding targets an `io.Writer`, decoding reads from
-  an `io.Reader`, so neither side holds the whole message — messages larger than
-  RAM stream naturally.
-- **Pull decoder.** `Decoder.Next()` returns the next field header; the caller
-  then calls a typed reader (or `Skip`) to consume the value. This maps directly
-  onto generated `switch id { ... }` dispatch and gives forward/backward
-  compatibility (unknown fields are skipped).
-- **Generics for arrays.** `WriteUnsignedArray[T]` / `ReadUnsignedArray[T]` (and
-  the signed variants) accept any `~uint8..~uint64` / `~int8..~int64` element
-  type; float arrays have dedicated methods.
-- **64-bit value type**, matching the C default configuration, so varint lengths
-  and bytes are identical across languages.
+## Why this design
+
+| Goal | How |
+|------|-----|
+| Streaming **out** | [`Encoder`] writes to any `io.Writer` (buffered), so a message can exceed RAM and stream straight to a socket or file. |
+| Streaming **in** | [`Decoder`] is a pull parser over any `io.Reader`; `Next()` returns one field header at a time, never materializing the whole message. |
+| No dependencies | Standard library only (`bufio`, `encoding/binary`, `io`, `math`, `errors`). No third-party modules, no `cgo`. |
+| Sticky errors | The encoder records the first failure and turns later writes into no-ops, so generated `Marshal` code can issue a run of writes and check once at `Flush`. |
+| Generics for arrays | `WriteUnsignedArray[T]` / `ReadUnsignedArray[T]` (and signed variants) accept any `~uint8..~uint64` / `~int8..~int64` element type; float arrays have dedicated methods. |
+| Forward/backward compatible | Unknown fields are consumed with `Skip()` — old readers tolerate new fields, new readers tolerate missing ones. |
+| 64-bit value type | Matches the C default configuration, so varint lengths and bytes are identical across languages. |
 
 ## Usage
 
 ```go
-// encode
+import (
+	"bytes"
+	"io"
+
+	sofab "github.com/sofa-buffers/corelib-go"
+)
+
+// ---- encode ----
 var buf bytes.Buffer
 e := sofab.NewEncoder(&buf)
 e.WriteUnsigned(1, 42)
@@ -41,43 +62,118 @@ e.WriteString(3, "hi")
 sofab.WriteUnsignedArray(e, 4, []uint16{10, 20, 30})
 if err := e.Flush(); err != nil { /* ... */ }
 
-// decode
+// ---- decode (pull parser) ----
 d := sofab.NewDecoder(&buf)
 for {
-    f, err := d.Next()
-    if err == io.EOF { break }
-    if err != nil { /* ... */ }
-    switch {
-    case f.ID == 1: v, _ := d.Unsigned(); _ = v
-    case f.ID == 2: v, _ := d.Signed();   _ = v
-    case f.ID == 3: s, _ := d.String();   _ = s
-    case f.ID == 4: a, _ := sofab.ReadUnsignedArray[uint16](d); _ = a
-    default:        d.Skip()
-    }
+	f, err := d.Next()
+	if err == io.EOF { break }
+	if err != nil { /* ... */ }
+	switch {
+	case f.ID == 1: v, _ := d.Unsigned(); _ = v
+	case f.ID == 2: v, _ := d.Signed();   _ = v
+	case f.ID == 3: s, _ := d.String();   _ = s
+	case f.ID == 4: a, _ := sofab.ReadUnsignedArray[uint16](d); _ = a
+	default:        d.Skip() // unknown field
+	}
 }
 ```
 
-See `example_test.go` for a full generated-code-style `Marshal`/`Unmarshal`
-example including a nested message (wire sequence), and `doc.go` for the
-package-level documentation.
+### Streaming a message larger than RAM
+
+Because the encoder targets an `io.Writer`, the "buffer" can be a socket, a
+pipe, or a file — nothing is held whole in memory:
+
+```go
+conn, _ := net.Dial("tcp", "collector:9000")
+e := sofab.NewEncoder(conn)            // bytes flow to the wire as they fill
+for i := uint32(0); i < 1_000_000; i++ {
+	e.WriteUnsigned(sofab.ID(i%128), uint64(i))
+}
+e.Flush()                              // push the tail
+```
+
+The decoder is symmetric: hand `NewDecoder` an `io.Reader` (socket, `os.Stdin`,
+`gzip.Reader`, ...) and pull fields with `Next()` as they arrive.
 
 ## API summary
 
-Encoder: `WriteUnsigned`, `WriteSigned`, `WriteBool`, `WriteFloat32`,
-`WriteFloat64`, `WriteString`, `WriteBytes`, `WriteSequenceBegin/End`, `Flush`;
-package functions `WriteUnsignedArray[T]`, `WriteSignedArray[T]`, methods
-`WriteFloat32Array`, `WriteFloat64Array`.
+**Encoder** — methods: `WriteUnsigned`, `WriteSigned`, `WriteBool`,
+`WriteFloat32`, `WriteFloat64`, `WriteString`, `WriteBytes`,
+`WriteSequenceBegin` / `WriteSequenceEnd`, `WriteFloat32Array`,
+`WriteFloat64Array`, `Flush`, `Err`; package functions `WriteUnsignedArray[T]`,
+`WriteSignedArray[T]`.
 
-Decoder: `Next`, `Unsigned`, `Signed`, `Bool`, `Float32`, `Float64`, `String`,
-`Bytes`, `Skip`; package functions `ReadUnsignedArray[T]`, `ReadSignedArray[T]`,
-methods `ReadFloat32Array`, `ReadFloat64Array`.
+**Decoder** — methods: `Next`, `Field`, `Unsigned`, `Signed`, `Bool`,
+`Float32`, `Float64`, `String`, `Bytes`, `ReadFloat32Array`, `ReadFloat64Array`,
+`Skip`; package functions `ReadUnsignedArray[T]`, `ReadSignedArray[T]`.
 
-## Tests
+> **Note on value width:** like the C default configuration, the scalar value
+> type is 64-bit (`uint64` / `int64`), so varint encodings match byte-for-byte
+> across the C, C++, Rust and Go implementations.
+
+## Layering vs. the C library
+
+| C file | Go file | Status |
+|--------|---------|--------|
+| `sofab.h` (types/constants) | `types.go` (`WireType`, `ID`, errors, zigzag) | ported |
+| `ostream.c` | `encoder.go` ([`Encoder`]) | ported |
+| `istream.c` | `decoder.go` ([`Decoder`]) | ported (pull-parser model instead of bind-target callbacks) |
+| `object.c` (descriptor transcoder) | — | not ported. The idiomatic Go equivalent is generated `Marshal` / `Unmarshal` code from a schema-driven generator; the streaming core above already covers serialize/deserialize. |
+
+See `example_test.go` for a full generated-code-style `Marshal` / `Unmarshal`
+example including a nested message (wire sequence), and `doc.go` for the
+package-level documentation.
+
+## Testing & coverage
 
 ```bash
 go test ./...            # unit + roundtrip + example tests
+go test ./... -race      # with the race detector
 go test ./... -cover     # with coverage
 go test ./... -v         # verbose
 ```
 
-All test vectors are taken from the C reference implementation.
+Tests are split by concern:
+
+- `encoder_test.go` — encoder, byte-exact vs. the C vectors
+- `decoder_test.go` — decoder over the same vectors + malformed-input errors
+- `roundtrip_test.go` — encode→decode value preservation
+- `example_test.go` — generated-code-style `Marshal` / `Unmarshal` walkthrough
+
+Current coverage: **~76% of statements** (`go test -cover .`). All test vectors
+are taken from the C reference implementation.
+
+## Benchmarks
+
+`cmd/perfbench` mirrors the C/C++/Rust corelib benchmarks — same messages, same
+workloads, same ids and values — so the implementations can be compared
+directly. It has two modes:
+
+```bash
+go run ./cmd/perfbench time            # real wall-clock throughput, MB/s (MB = 1e6)
+go run ./cmd/perfbench encode_u64_array   # single workload, for Callgrind --toggle-collect
+```
+
+The named-workload mode exposes `//go:noinline` `run_*` functions so a Callgrind
+harness can toggle collection on `main.run_<workload>` exactly as the C/C++/Rust
+tools do (setup excluded). The `time` mode reports real throughput on the
+current machine:
+
+```
+Workload                           MB/s
+--------                           ----
+encode: u64 array (1000)          81.89
+encode: typical message            6.91
+decode: u64 array (1000)         128.79
+decode: typical message            9.13
+```
+
+Numbers vary with CPU speed, load and build flags — that's the point: they show
+real throughput here. The "typical message" figures are small because, exactly
+as in the C/C++/Rust tools, the per-iteration clock read dominates a sub-100 ns
+operation; they are comparable *across languages* but are not an absolute
+small-message speed. Input construction runs outside the timed loop.
+
+## License
+
+MIT (same as the SofaBuffers C corelib) — see [`LICENSE`](LICENSE).
