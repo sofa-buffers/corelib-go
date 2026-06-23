@@ -5,6 +5,7 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -49,27 +50,32 @@ jobs:
       - name: Build
         run: go build ./...
 
-      - name: Test (race + coverage)
-        run: go test -race -covermode=atomic -coverprofile=coverage.out ./...
+      - name: Test (race)
+        run: go test -race ./...
 
-      - name: Coverage summary
-        run: go tool cover -func=coverage.out | tail -n 1
+  coverage:
+    name: Coverage (Coveralls)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
 
-      - name: Upload coverage artifact
-        if: matrix.go == 'stable'
-        uses: actions/upload-artifact@v4
+      - name: Set up Go
+        uses: actions/setup-go@v5
         with:
-          name: coverage
-          path: coverage.out
-          if-no-files-found: error
+          go-version: stable
+          check-latest: true
 
-      - name: Upload coverage to Codecov
-        if: matrix.go == 'stable'
-        uses: codecov/codecov-action@v4
+      - name: Generate coverage profile
+        # Cover the library package; the perfbench command has no tests.
+        run: go test -covermode=atomic -coverprofile=coverage.out .
+
+      - name: Convert coverage to LCOV
+        run: |
+          go install github.com/jandelgado/gcov2lcov@latest
+          "$(go env GOPATH)/bin/gcov2lcov" -infile=coverage.out -outfile=lcov.info
+
+      - name: Upload to Coveralls
+        uses: coverallsapp/github-action@v2
         with:
-          files: ./coverage.out
-          flags: unittests
-          # Optional for public repos; add a CODECOV_TOKEN repo secret to make
-          # uploads reliable (required for private repos).
-          token: ${{ secrets.CODECOV_TOKEN }}
-          fail_ci_if_error: false
+          file: lcov.info
+          format: lcov
