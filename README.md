@@ -9,6 +9,9 @@
 
 ## SofaBuffers Go library
 
+[![CI](https://github.com/sofa-buffers/corelib-go/actions/workflows/ci.yml/badge.svg)](https://github.com/sofa-buffers/corelib-go/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/sofa-buffers/corelib-go/branch/main/graph/badge.svg)](https://codecov.io/gh/sofa-buffers/corelib-go)
+
 [GitHub repository](https://github.com/sofa-buffers/corelib-go)
 
 A **streaming**, **dependency-free** Go implementation of the SofaBuffers
