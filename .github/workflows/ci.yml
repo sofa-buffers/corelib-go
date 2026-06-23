@@ -98,9 +98,9 @@ jobs:
           format: lcov
 
       - name: Publish badge to the badges branch
-        # Only on pushes to main: PRs (esp. from forks) lack write access and
-        # must not move the published badge.
-        if: github.event_name == 'push'
+        # Only from CI runs on main itself: PRs (ref refs/pull/*/merge) and runs
+        # on any other branch must not move the published badge.
+        if: github.ref == 'refs/heads/main'
         uses: peaceiris/actions-gh-pages@v4
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
