@@ -54,8 +54,10 @@ jobs:
         run: go test -race ./...
 
   coverage:
-    name: Coverage (Coveralls)
+    name: Coverage
     runs-on: ubuntu-latest
+    permissions:
+      contents: write # to publish the generated badge to the `badges` branch
     steps:
       - uses: actions/checkout@v4
 
@@ -69,13 +71,40 @@ jobs:
         # Cover the library package; the perfbench command has no tests.
         run: go test -covermode=atomic -coverprofile=coverage.out .
 
+      - name: Compute coverage badge data
+        id: cov
+        run: |
+          pct=$(go tool cover -func=coverage.out | awk '/^total:/ {gsub("%","",$3); print $3}')
+          int=${pct%.*}
+          if   [ "$int" -ge 90 ]; then color=brightgreen
+          elif [ "$int" -ge 75 ]; then color=green
+          elif [ "$int" -ge 50 ]; then color=yellow
+          else color=red; fi
+          echo "Coverage: ${pct}% (${color})"
+          echo "pct=${pct}" >> "$GITHUB_OUTPUT"
+          mkdir -p badge
+          printf '{"schemaVersion":1,"label":"coverage","message":"%s%%","color":"%s"}\n' \
+            "$pct" "$color" > badge/coverage.json
+
       - name: Convert coverage to LCOV
         run: |
           go install github.com/jandelgado/gcov2lcov@latest
           "$(go env GOPATH)/bin/gcov2lcov" -infile=coverage.out -outfile=lcov.info
 
-      - name: Upload to Coveralls
+      - name: Upload coverage to Coveralls
         uses: coverallsapp/github-action@v2
         with:
           file: lcov.info
           format: lcov
+
+      - name: Publish badge to the badges branch
+        # Only on pushes to main: PRs (esp. from forks) lack write access and
+        # must not move the published badge.
+        if: github.event_name == 'push'
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./badge
+          publish_branch: badges
+          force_orphan: true
+          commit_message: "chore(badge): update coverage to ${{ steps.cov.outputs.pct }}"
