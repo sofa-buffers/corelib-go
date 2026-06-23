@@ -1,0 +1,13 @@
+{
+  "name": "Go",
+  "build": { "dockerfile": "Dockerfile" },
+  "remoteUser": "root",
+  // Load local secrets (GitHub token, etc.) from .devcontainer/.env.
+  // Copy .env.example to .env first; the real .env is gitignored.
+  "runArgs": ["--env-file", "${localWorkspaceFolder}/.devcontainer/.env"],
+  "customizations": {
+    "vscode": {
+      "extensions": ["golang.go", "anthropic.claude-code"]
+    }
+  }
+}
