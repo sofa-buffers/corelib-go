@@ -10,7 +10,7 @@
 ## SofaBuffers Go library
 
 [![CI](https://github.com/sofa-buffers/corelib-go/actions/workflows/ci.yml/badge.svg)](https://github.com/sofa-buffers/corelib-go/actions/workflows/ci.yml)
-[![Coverage Status](https://coveralls.io/repos/github/sofa-buffers/corelib-go/badge.svg?branch=main)](https://coveralls.io/github/sofa-buffers/corelib-go?branch=main)
+[![Coverage](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fsofa-buffers%2Fcorelib-go%2Fbadges%2Fcoverage.json)](https://coveralls.io/github/sofa-buffers/corelib-go?branch=main)
 
 [GitHub repository](https://github.com/sofa-buffers/corelib-go)
 
