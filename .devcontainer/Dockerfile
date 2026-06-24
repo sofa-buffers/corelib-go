@@ -10,6 +10,7 @@ ENV PATH=/usr/local/go/bin:/root/go/bin:$PATH
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
         curl \
+        wget \
         git \
         build-essential \
         gnupg \
