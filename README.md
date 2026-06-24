@@ -46,6 +46,11 @@ go get github.com/sofa-buffers/corelib-go
 | Forward/backward compatible | Unknown fields are consumed with `Skip()` — old readers tolerate new fields, new readers tolerate missing ones. |
 | 64-bit value type | Matches the C default configuration, so varint lengths and bytes are identical across languages. |
 
+## Source documentation
+
+[Documentation](https://sofa-buffers.github.io/corelib-go/) — godoc HTML for the
+package, generated and published to GitHub Pages on every push to `main`.
+
 ## Usage
 
 ```go
