@@ -1,0 +1,95 @@
+name: Docs
+
+# Generate godoc HTML for the module and publish it to GitHub Pages.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Least privilege, plus what the Pages deployment needs.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Allow only one concurrent Pages deployment; let an in-flight one finish.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build godoc HTML
+    runs-on: ubuntu-latest
+    env:
+      MODULE: github.com/sofa-buffers/corelib-go
+      PORT: "6060"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          check-latest: true
+
+      - name: Install godoc
+        run: go install golang.org/x/tools/cmd/godoc@latest
+
+      - name: Generate static HTML docs
+        run: |
+          set -uo pipefail
+          # Serve the module docs locally, then snapshot them to static HTML.
+          godoc -http="localhost:${PORT}" &
+          godoc_pid=$!
+
+          ready=
+          for _ in $(seq 1 30); do
+            if curl -sf "http://localhost:${PORT}/pkg/${MODULE}/" >/dev/null 2>&1; then
+              ready=1; break
+            fi
+            sleep 1
+          done
+          if [ -z "$ready" ]; then
+            echo "::error::godoc did not become ready"; exit 1
+          fi
+
+          # Mirror the package docs plus godoc's shared assets; -k makes links
+          # relative so the site works under the Pages project subpath.
+          rm -rf mirror public
+          wget -q -r -np -E -p -k -e robots=off -P mirror \
+            "http://localhost:${PORT}/pkg/${MODULE}/" \
+            "http://localhost:${PORT}/lib/godoc/" || true
+          kill "$godoc_pid" 2>/dev/null || true
+
+          src="mirror/localhost:${PORT}"
+          # Fail loudly if the package page wasn't produced (no silent empty site).
+          if [ ! -s "$src/pkg/${MODULE}/index.html" ]; then
+            echo "::error::package documentation was not generated"; exit 1
+          fi
+
+          mkdir -p public
+          cp -a "$src/." public/
+          # Root entry point redirects to the package docs.
+          printf '<!doctype html>\n<meta charset="utf-8">\n<meta http-equiv="refresh" content="0; url=pkg/%s/">\n<title>corelib-go documentation</title>\n<a href="pkg/%s/">corelib-go documentation</a>\n' \
+            "$MODULE" "$MODULE" > public/index.html
+          # Serve the _-prefixed and static files as-is (no Jekyll processing).
+          touch public/.nojekyll
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: public
+
+  deploy:
+    name: Deploy to GitHub Pages
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@v4
