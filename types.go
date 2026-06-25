@@ -8,6 +8,11 @@ type ID uint32
 // IDMax is the largest valid field id (INT32_MAX), matching SOFAB_ID_MAX in C.
 const IDMax ID = 0x7FFF_FFFF
 
+// APIVersion is the SofaBuffers wire-format API version implemented by this
+// package. It matches API_VERSION in the language-neutral specification and is
+// used by callers and the code generator to check compatibility.
+const APIVersion = 1
+
 // arrayMax bounds array element counts and fixlen byte lengths (INT32_MAX).
 const arrayMax uint64 = 0x7FFF_FFFF
 
