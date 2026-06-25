@@ -11,6 +11,7 @@
 
 [![CI](https://github.com/sofa-buffers/corelib-go/actions/workflows/ci.yml/badge.svg)](https://github.com/sofa-buffers/corelib-go/actions/workflows/ci.yml)
 [![Coverage](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fsofa-buffers%2Fcorelib-go%2Fbadges%2Fcoverage.json)](https://coveralls.io/github/sofa-buffers/corelib-go?branch=main)
+[![Docs](https://img.shields.io/badge/docs-godoc-blue)](https://sofa-buffers.github.io/corelib-go/)
 
 [GitHub repository](https://github.com/sofa-buffers/corelib-go)
 
@@ -143,13 +144,18 @@ go test ./... -v         # verbose
 
 Tests are split by concern:
 
-- `encoder_test.go` — encoder, byte-exact vs. the C vectors
+- `vectors_test.go` — encode + decode against the shared conformance suite
+  (`assets/test_vectors.json`, copied verbatim from the `documentation` repo)
+- `streaming_test.go` — chunked streaming: small-buffer encode and byte-at-a-time
+  / odd-sized decode resume at any boundary
+- `encoder_test.go` — encoder, byte-exact vs. the reference vectors
 - `decoder_test.go` — decoder over the same vectors + malformed-input errors
 - `roundtrip_test.go` — encode→decode value preservation
 - `example_test.go` — generated-code-style `Marshal` / `Unmarshal` walkthrough
 
-Current coverage: **~76% of statements** (`go test -cover .`). All test vectors
-are taken from the C reference implementation.
+Coverage is reported by the badge above (well over the 90% bar). The shared
+`assets/test_vectors.json` is the cross-language source of truth, so output is
+byte-identical to the C, C++ and Rust implementations.
 
 ## Benchmarks
 
