@@ -98,70 +98,91 @@ func run_encode_typical() {
 	enc.Flush()
 }
 
-//go:noinline
-func run_decode_u64_array() {
-	for {
-		f, err := dec.Next()
-		if err != nil {
-			break
-		}
-		if f.Type == sofab.TypeVarintArrayUnsigned {
-			a, _ := sofab.ReadUnsignedArray[uint64](dec)
-			sink += a[0] + a[len(a)-1]
-		} else {
-			dec.Skip()
+// baseVisitor is a no-op visitor; workload visitors embed it and override only
+// the field kinds they care about (the generated code would do the same).
+type baseVisitor struct{}
+
+func (baseVisitor) Unsigned(sofab.ID, uint64) error                 { return nil }
+func (baseVisitor) Signed(sofab.ID, int64) error                    { return nil }
+func (baseVisitor) Float32(sofab.ID, float32) error                 { return nil }
+func (baseVisitor) Float64(sofab.ID, float64) error                 { return nil }
+func (baseVisitor) String(sofab.ID, string) error                   { return nil }
+func (baseVisitor) Bytes(sofab.ID, []byte) error                    { return nil }
+func (baseVisitor) UnsignedArray(sofab.ID, []uint64) error          { return nil }
+func (baseVisitor) SignedArray(sofab.ID, []int64) error             { return nil }
+func (baseVisitor) Float32Array(sofab.ID, []float32) error          { return nil }
+func (baseVisitor) Float64Array(sofab.ID, []float64) error          { return nil }
+func (b baseVisitor) BeginSequence(sofab.ID) (sofab.Visitor, error) { return b, nil }
+
+type u64ArrayVisitor struct{ baseVisitor }
+
+func (u64ArrayVisitor) UnsignedArray(_ sofab.ID, v []uint64) error {
+	sink += v[0] + v[len(v)-1]
+	return nil
+}
+
+type typicalVisitor struct{ baseVisitor }
+
+func (typicalVisitor) Unsigned(id sofab.ID, v uint64) error {
+	switch id {
+	case 1:
+		sink += v
+	case 3: // bool encoded as unsigned 0/1
+		if v != 0 {
+			sink++
 		}
 	}
+	return nil
+}
+func (typicalVisitor) Signed(id sofab.ID, v int64) error {
+	if id == 2 {
+		sink += uint64(v)
+	}
+	return nil
+}
+func (typicalVisitor) Float32(id sofab.ID, v float32) error {
+	if id == 4 {
+		sink += uint64(v)
+	}
+	return nil
+}
+func (typicalVisitor) String(id sofab.ID, s string) error {
+	if id == 5 {
+		sink += uint64(len(s))
+	}
+	return nil
+}
+func (typicalVisitor) UnsignedArray(id sofab.ID, v []uint64) error {
+	if id == 6 {
+		sink += v[0]
+	}
+	return nil
+}
+func (typicalVisitor) BeginSequence(sofab.ID) (sofab.Visitor, error) { return seqVisitor{}, nil }
+
+type seqVisitor struct{ baseVisitor }
+
+func (seqVisitor) Unsigned(id sofab.ID, v uint64) error {
+	if id == 1 {
+		sink += v
+	}
+	return nil
+}
+func (seqVisitor) Signed(id sofab.ID, v int64) error {
+	if id == 2 {
+		sink += uint64(v)
+	}
+	return nil
+}
+
+//go:noinline
+func run_decode_u64_array() {
+	_ = dec.Accept(u64ArrayVisitor{})
 }
 
 //go:noinline
 func run_decode_typical() {
-	for {
-		f, err := dec.Next()
-		if err != nil {
-			break
-		}
-		switch {
-		case f.ID == 1 && f.Type == sofab.TypeVarintUnsigned:
-			v, _ := dec.Unsigned()
-			sink += v
-		case f.ID == 2 && f.Type == sofab.TypeVarintSigned:
-			v, _ := dec.Signed()
-			sink += uint64(v)
-		case f.ID == 3:
-			if b, _ := dec.Bool(); b {
-				sink++
-			}
-		case f.ID == 4:
-			x, _ := dec.Float32()
-			sink += uint64(x)
-		case f.ID == 5:
-			s, _ := dec.String()
-			sink += uint64(len(s))
-		case f.ID == 6:
-			a, _ := sofab.ReadUnsignedArray[uint16](dec)
-			sink += uint64(a[0])
-		case f.Type == sofab.TypeSequenceStart:
-			for {
-				g, err := dec.Next()
-				if err != nil || g.Type == sofab.TypeSequenceEnd {
-					break
-				}
-				switch g.ID {
-				case 1:
-					v, _ := dec.Unsigned()
-					sink += v
-				case 2:
-					v, _ := dec.Signed()
-					sink += uint64(v)
-				default:
-					dec.Skip()
-				}
-			}
-		default:
-			dec.Skip()
-		}
-	}
+	_ = dec.Accept(typicalVisitor{})
 }
 
 // timeLoop runs fn for ~1s and returns throughput in MB/s for messages of the
