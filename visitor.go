@@ -29,6 +29,9 @@ type Visitor interface {
 	Float64Array(id ID, v []float64) error
 	// BeginSequence returns the visitor that receives the nested scope's fields.
 	BeginSequence(id ID) (Visitor, error)
+	// EndSequence is called on that nested visitor once its scope closes, so a
+	// generated nested object can finalize itself.
+	EndSequence() error
 }
 
 // Accept drives the decoder over the entire top-level stream, dispatching each
@@ -116,6 +119,9 @@ func (d *Decoder) accept(v Visitor, nested bool) error {
 				return err
 			}
 			if err := d.accept(child, true); err != nil {
+				return err
+			}
+			if err := child.EndSequence(); err != nil {
 				return err
 			}
 		case TypeSequenceEnd:

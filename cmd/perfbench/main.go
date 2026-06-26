@@ -113,6 +113,7 @@ func (baseVisitor) SignedArray(sofab.ID, []int64) error             { return nil
 func (baseVisitor) Float32Array(sofab.ID, []float32) error          { return nil }
 func (baseVisitor) Float64Array(sofab.ID, []float64) error          { return nil }
 func (b baseVisitor) BeginSequence(sofab.ID) (sofab.Visitor, error) { return b, nil }
+func (baseVisitor) EndSequence() error                              { return nil }
 
 type u64ArrayVisitor struct{ baseVisitor }
 
