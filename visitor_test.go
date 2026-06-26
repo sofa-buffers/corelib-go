@@ -191,19 +191,69 @@ func TestVisitorDecodesAllVectors(t *testing.T) {
 	}
 }
 
-// errVisitor rejects the first unsigned field, proving Accept surfaces visitor
-// errors verbatim.
-type errVisitor struct {
-	baseV
-	err error
+// failOn returns its sentinel error from the named visitor method, so we can
+// prove Accept surfaces a visitor error from every callback verbatim.
+type failOn struct {
+	which string
+	err   error
 }
 
-func (v errVisitor) Unsigned(sofab.ID, uint64) error { return v.err }
+func (f failOn) hit(name string) error {
+	if f.which == name {
+		return f.err
+	}
+	return nil
+}
+func (f failOn) Unsigned(sofab.ID, uint64) error        { return f.hit("Unsigned") }
+func (f failOn) Signed(sofab.ID, int64) error           { return f.hit("Signed") }
+func (f failOn) Float32(sofab.ID, float32) error        { return f.hit("Float32") }
+func (f failOn) Float64(sofab.ID, float64) error        { return f.hit("Float64") }
+func (f failOn) String(sofab.ID, string) error          { return f.hit("String") }
+func (f failOn) Bytes(sofab.ID, []byte) error           { return f.hit("Bytes") }
+func (f failOn) UnsignedArray(sofab.ID, []uint64) error { return f.hit("UnsignedArray") }
+func (f failOn) SignedArray(sofab.ID, []int64) error    { return f.hit("SignedArray") }
+func (f failOn) Float32Array(sofab.ID, []float32) error { return f.hit("Float32Array") }
+func (f failOn) Float64Array(sofab.ID, []float64) error { return f.hit("Float64Array") }
+func (f failOn) BeginSequence(sofab.ID) (sofab.Visitor, error) {
+	if f.which == "BeginSequence" {
+		return nil, f.err
+	}
+	return f, nil
+}
+func (f failOn) EndSequence() error { return f.hit("EndSequence") }
 
-func TestVisitorErrorPropagation(t *testing.T) {
-	msg := encode(t, func(e *sofab.Encoder) { e.WriteUnsigned(1, 5) })
+func TestVisitorPropagatesErrors(t *testing.T) {
+	seq := func(e *sofab.Encoder) { e.WriteSequenceBegin(1); e.WriteSequenceEnd() }
+	build := map[string]func(*sofab.Encoder){
+		"Unsigned":      func(e *sofab.Encoder) { e.WriteUnsigned(1, 5) },
+		"Signed":        func(e *sofab.Encoder) { e.WriteSigned(1, -5) },
+		"Float32":       func(e *sofab.Encoder) { e.WriteFloat32(1, 1.5) },
+		"Float64":       func(e *sofab.Encoder) { e.WriteFloat64(1, 1.5) },
+		"String":        func(e *sofab.Encoder) { e.WriteString(1, "x") },
+		"Bytes":         func(e *sofab.Encoder) { e.WriteBytes(1, []byte{1}) },
+		"UnsignedArray": func(e *sofab.Encoder) { sofab.WriteUnsignedArray(e, 1, []uint32{1}) },
+		"SignedArray":   func(e *sofab.Encoder) { sofab.WriteSignedArray(e, 1, []int32{-1}) },
+		"Float32Array":  func(e *sofab.Encoder) { e.WriteFloat32Array(1, []float32{1}) },
+		"Float64Array":  func(e *sofab.Encoder) { e.WriteFloat64Array(1, []float64{1}) },
+		"BeginSequence": seq,
+		"EndSequence":   seq,
+	}
 	sentinel := errors.New("stop")
-	if err := newDec(msg).Accept(errVisitor{err: sentinel}); !errors.Is(err, sentinel) {
+	for method, fn := range build {
+		t.Run(method, func(t *testing.T) {
+			msg := encode(t, fn)
+			if err := newDec(msg).Accept(failOn{which: method, err: sentinel}); !errors.Is(err, sentinel) {
+				t.Fatalf("Accept = %v, want sentinel", err)
+			}
+		})
+	}
+}
+
+func TestVisitorReaderError(t *testing.T) {
+	// A non-EOF reader error must surface verbatim (errReader is in coverage_test.go).
+	sentinel := errors.New("io boom")
+	var log []string
+	if err := sofab.NewDecoder(errReader{sentinel}).Accept(recorder{&log}); !errors.Is(err, sentinel) {
 		t.Fatalf("Accept = %v, want sentinel", err)
 	}
 }
@@ -228,6 +278,11 @@ func TestVisitorMalformed(t *testing.T) {
 		"signed array trunc":    append(vhdr(1, sofab.TypeVarintArraySigned), append(vbytes(2), 0x02, 0x80)...),
 		"array count truncated": append(vhdr(1, sofab.TypeVarintArrayUnsigned), 0x80),
 		"id above max":          append(vhdr(sofab.IDMax+1, sofab.TypeVarintUnsigned), 0x00),
+		"truncated signed":      append(vhdr(1, sofab.TypeVarintSigned), 0x80),
+		"signed array count":    append(vhdr(1, sofab.TypeVarintArraySigned), 0x80),
+		"fixlen array count":    append(vhdr(1, sofab.TypeFixlenArray), 0x80),
+		"fixlen array header":   append(vhdr(1, sofab.TypeFixlenArray), append(vbytes(1), 0x80)...),
+		"fp64 array payload":    append(vhdr(1, sofab.TypeFixlenArray), append(vbytes(1), append(vbytes((8<<3)|0x1), 0, 0, 0, 0, 0, 0, 0)...)...),
 	}
 	for name, in := range cases {
 		t.Run(name, func(t *testing.T) {
