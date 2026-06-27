@@ -32,6 +32,7 @@ type vector struct {
 	Name       string     `json:"name"`
 	Group      string     `json:"group"`
 	Offset     int        `json:"offset"`
+	Requires   []string   `json:"requires"`
 	SkipIDs    []uint32   `json:"skip_ids"`
 	Fields     []vecField `json:"fields"`
 	Serialized struct {
@@ -492,5 +493,129 @@ func TestVectorSkipIDs(t *testing.T) {
 	}
 	if ran == 0 {
 		t.Fatal("no vectors carried skip_ids; expected the suite to exercise the skip-ids scenario")
+	}
+}
+
+// --- requires (capability tags) ----------------------------------------------
+
+// goCaps is the set of optional wire-format capabilities this library supports.
+// The Go core ships the full format with no build toggles, so it supports every
+// capability a vector can declare — and therefore runs every vector regardless
+// of its "requires". Per the test-vector README, a full-feature implementation
+// ignores "requires" and runs all vectors; the tags only let a feature-reduced
+// build skip what it cannot represent. We still validate the tags below.
+var goCaps = map[string]bool{
+	"fixlen": true, "array": true, "sequence": true, "fp64": true, "int64": true,
+}
+
+// Boundaries that decide the int64 capability, mirroring the generator: a value,
+// array element, or field-header id that does not fit the 32-bit value domain
+// requires int64. The id cap is the largest id whose (id<<3)|type header still
+// fits in a uint32 varint, i.e. (2^32-1)>>3.
+const (
+	capU32Max  = 0xFFFFFFFF
+	capI32Max  = 0x7FFFFFFF
+	capI32Min  = -0x80000000
+	capIDCap32 = 0x1FFFFFFF
+)
+
+func needsInt64U(x uint64) bool { return x > capU32Max }
+func needsInt64I(x int64) bool  { return x > capI32Max || x < capI32Min }
+
+// deriveRequires recomputes the capability tags a vector needs from its fields,
+// the same way the generator derives them, so the declared "requires" cannot
+// silently drift from the actual content.
+func deriveRequires(t *testing.T, v vector) map[string]bool {
+	t.Helper()
+	caps := map[string]bool{}
+	for _, f := range v.Fields {
+		switch f.Op {
+		case "fp32", "string", "blob":
+			caps["fixlen"] = true
+		case "fp64":
+			caps["fixlen"] = true
+			caps["fp64"] = true
+		case "sequence_begin":
+			caps["sequence"] = true
+		case "unsigned":
+			if needsInt64U(pUint(t, f.Value)) {
+				caps["int64"] = true
+			}
+		case "signed":
+			if needsInt64I(pInt(t, f.Value)) {
+				caps["int64"] = true
+			}
+		case "array":
+			caps["array"] = true
+			switch f.ElementType {
+			case "fp32":
+				caps["fixlen"] = true
+			case "fp64":
+				caps["fixlen"] = true
+				caps["fp64"] = true
+			}
+			for _, r := range f.Values {
+				switch f.ElementType[0] {
+				case 'u':
+					if needsInt64U(pUint(t, r)) {
+						caps["int64"] = true
+					}
+				case 'i':
+					if needsInt64I(pInt(t, r)) {
+						caps["int64"] = true
+					}
+				}
+			}
+		}
+		// id-driven int64: the (id<<3)|type header must fit in a uint32 varint.
+		if f.Op != "sequence_end" && uint64(f.ID) > capIDCap32 {
+			caps["int64"] = true
+		}
+	}
+	return caps
+}
+
+func sameCaps(a, b map[string]bool) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k := range a {
+		if !b[k] {
+			return false
+		}
+	}
+	return true
+}
+
+// TestVectorRequires exercises the new "requires" capability tags. For the Go
+// core (full format), every declared capability must be one it supports, so no
+// vector is ever skipped — the encode/decode/skip-ids scenarios above iterate
+// the whole suite unconditionally, which is the documented full-feature
+// behavior. It also re-derives each vector's capabilities from its fields and
+// asserts they match the declared "requires", so the tags can't drift.
+func TestVectorRequires(t *testing.T) {
+	vf := loadVectors(t)
+	withRequires := 0
+	for _, v := range vf.Vectors {
+		if len(v.Requires) > 0 {
+			withRequires++
+		}
+		t.Run(v.Name, func(t *testing.T) {
+			for _, c := range v.Requires {
+				if !goCaps[c] {
+					t.Fatalf("vector requires %q, which this full-format build should support", c)
+				}
+			}
+			want := make(map[string]bool, len(v.Requires))
+			for _, c := range v.Requires {
+				want[c] = true
+			}
+			if got := deriveRequires(t, v); !sameCaps(got, want) {
+				t.Fatalf("requires mismatch: declared %v, derived from fields %v", want, got)
+			}
+		})
+	}
+	if withRequires == 0 {
+		t.Fatal("no vectors declared requires; expected the suite to exercise the capability tags")
 	}
 }
