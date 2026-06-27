@@ -208,3 +208,10 @@ The named-workload mode exposes `//go:noinline` `run_*` functions so a Callgrind
 harness can toggle collection on `main.run_<workload>` exactly as the C/C++/Rust
 tools do (setup excluded). The `time` mode reports real wall-clock throughput on
 the current machine; numbers vary with CPU speed, load and build flags.
+
+For the Go-native view, the decode path also has `go test` benchmarks
+(`decode_bench_test.go`) covering `Accept` and the zero-copy `AcceptBytes`:
+
+```bash
+go test -run '^$' -bench BenchmarkDecode -benchmem -count=8 -cpu=1 -benchtime=300ms
+```

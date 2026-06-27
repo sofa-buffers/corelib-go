@@ -15,14 +15,26 @@ import (
 // scalar value for convenience. Next returns io.EOF at the clean end of the
 // top-level stream.
 type Decoder struct {
-	r           *bufio.Reader
+	src         io.Reader     // original source; Accept slurps directly from it
+	r           *bufio.Reader // pull-parser buffer, created lazily on first Next
 	cur         Field
 	needConsume bool // a value-bearing field header is read but not yet consumed
 }
 
-// NewDecoder returns a Decoder reading from r.
+// NewDecoder returns a Decoder reading from r. The internal buffer for the
+// pull-parser path is allocated lazily on first use, so the visitor path
+// (Accept) — which reads the message into one contiguous buffer itself — does
+// not pay for it.
 func NewDecoder(r io.Reader) *Decoder {
-	return &Decoder{r: bufio.NewReader(r)}
+	return &Decoder{src: r}
+}
+
+// asBufio reuses an existing *bufio.Reader source, otherwise wraps it once.
+func asBufio(r io.Reader) *bufio.Reader {
+	if br, ok := r.(*bufio.Reader); ok {
+		return br
+	}
+	return bufio.NewReader(r)
 }
 
 // Next reads the next field header. After a value-bearing field it returns, the
@@ -30,6 +42,9 @@ func NewDecoder(r io.Reader) *Decoder {
 // Next; an unconsumed scalar/array/fixlen value is auto-skipped. Sequence
 // start/end markers carry no value. Returns io.EOF at the end of the stream.
 func (d *Decoder) Next() (Field, error) {
+	if d.r == nil {
+		d.r = asBufio(d.src)
+	}
 	if d.needConsume {
 		if err := d.skipValue(); err != nil {
 			return Field{}, err

@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"strings"
 	"testing"
@@ -191,6 +192,28 @@ func TestVisitorDecodesAllVectors(t *testing.T) {
 	}
 }
 
+// TestAcceptBytesMatchesAccept proves the zero-copy buffer entry point produces
+// the exact same event stream as the reader-backed Accept for every vector.
+func TestAcceptBytesMatchesAccept(t *testing.T) {
+	vf := loadVectors(t)
+	for _, v := range vf.Vectors {
+		t.Run(v.Name, func(t *testing.T) {
+			raw, err := hex.DecodeString(v.Serialized.Hex)
+			if err != nil {
+				t.Fatalf("hex: %v", err)
+			}
+			var got []string
+			if err := sofab.AcceptBytes(raw, recorder{&got}); err != nil {
+				t.Fatalf("AcceptBytes: %v", err)
+			}
+			want := expectLog(t, v.Fields)
+			if strings.Join(got, "|") != strings.Join(want, "|") {
+				t.Fatalf("event mismatch\n got: %v\nwant: %v", got, want)
+			}
+		})
+	}
+}
+
 // failOn returns its sentinel error from the named visitor method, so we can
 // prove Accept surfaces a visitor error from every callback verbatim.
 type failOn struct {
@@ -283,6 +306,13 @@ func TestVisitorMalformed(t *testing.T) {
 		"fixlen array count":    append(vhdr(1, sofab.TypeFixlenArray), 0x80),
 		"fixlen array header":   append(vhdr(1, sofab.TypeFixlenArray), append(vbytes(1), 0x80)...),
 		"fp64 array payload":    append(vhdr(1, sofab.TypeFixlenArray), append(vbytes(1), append(vbytes((8<<3)|0x1), 0, 0, 0, 0, 0, 0, 0)...)...),
+		// cursor-specific boundaries: a value expected exactly at end-of-buffer,
+		// a varint that overflows 64 bits while reading the next header, a fixlen
+		// length past the cap, and a zero-count array.
+		"value at buffer end":    vhdr(1, sofab.TypeVarintUnsigned),
+		"header varint overflow": bytes.Repeat([]byte{0x80}, 11),
+		"fixlen length over max": append(vhdr(1, sofab.TypeFixlen), vbytes((uint64(sofab.IDMax+1)<<3)|subStr)...),
+		"array count zero":       append(vhdr(1, sofab.TypeVarintArrayUnsigned), vbytes(0)...),
 	}
 	for name, in := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -291,6 +321,33 @@ func TestVisitorMalformed(t *testing.T) {
 				t.Fatalf("Accept = %v, want ErrInvalidMsg", err)
 			}
 		})
+	}
+}
+
+// lenReader reports a remaining length but never delivers those bytes, so
+// Accept's sized slurp (the Len-aware fast path) hits a short read.
+type lenReader struct{ n int }
+
+func (r lenReader) Len() int               { return r.n }
+func (lenReader) Read([]byte) (int, error) { return 0, io.EOF }
+
+func TestVisitorSlurpShortRead(t *testing.T) {
+	if err := sofab.NewDecoder(lenReader{4}).Accept(recorder{new([]string)}); err == nil {
+		t.Fatal("Accept = nil, want error from truncated sized slurp")
+	}
+}
+
+func TestVisitorAcceptAfterPullParser(t *testing.T) {
+	// Touch the reader through the pull parser first (sets up its buffer), then
+	// decode the remainder via the visitor: Accept must slurp from the already
+	// in-use reader rather than the raw source. An empty stream is the clean,
+	// well-defined case (Next reports EOF, Accept then sees nothing).
+	d := sofab.NewDecoder(bytes.NewReader(nil))
+	if _, err := d.Next(); err == nil {
+		t.Fatal("Next on empty = nil, want io.EOF")
+	}
+	if err := d.Accept(recorder{new([]string)}); err != nil {
+		t.Fatalf("Accept after pull parser = %v, want nil", err)
 	}
 }
 

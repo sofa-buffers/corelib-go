@@ -1,10 +1,6 @@
 package sofab
 
-import (
-	"encoding/binary"
-	"io"
-	"math"
-)
+import "io"
 
 // Visitor is the push/visitor counterpart to the pull parser (Decoder.Next):
 // the decoder drives, calling a typed method per field. Generated code
@@ -34,181 +30,46 @@ type Visitor interface {
 	EndSequence() error
 }
 
-// Accept drives the decoder over the entire top-level stream, dispatching each
-// field to v. It returns nil at a clean end of stream, or a malformed-message
-// error on bad input.
+// Accept decodes the entire top-level stream into v. It slurps the remaining
+// input into one contiguous buffer and advances a cursor over it (see cursor),
+// so dispatch never re-enters the io.Reader per byte. It returns nil at a clean
+// end of stream, or a malformed-message error on bad input. A non-EOF reader
+// error surfaces verbatim.
 func (d *Decoder) Accept(v Visitor) error {
-	return d.accept(v, false)
-}
-
-func (d *Decoder) accept(v Visitor, nested bool) error {
-	for {
-		h, err := d.readVarint(true)
-		if err != nil {
-			if err == io.EOF {
-				if nested {
-					return ErrInvalidMsg // missing sequence end
-				}
-				return nil
-			}
-			return err
-		}
-		t := WireType(h & 0x07)
-		id := ID(h >> 3)
-		if t != TypeSequenceEnd && (h>>3) > uint64(IDMax) {
-			return ErrInvalidMsg
-		}
-		switch t {
-		case TypeVarintUnsigned:
-			x, err := d.readVarint(false)
-			if err != nil {
-				return err
-			}
-			if err := v.Unsigned(id, x); err != nil {
-				return err
-			}
-		case TypeVarintSigned:
-			x, err := d.readVarint(false)
-			if err != nil {
-				return err
-			}
-			if err := v.Signed(id, zigzagDecode(x)); err != nil {
-				return err
-			}
-		case TypeFixlen:
-			if err := d.acceptFixlen(v, id); err != nil {
-				return err
-			}
-		case TypeVarintArrayUnsigned:
-			n, err := d.arrayCount()
-			if err != nil {
-				return err
-			}
-			out := make([]uint64, n)
-			for i := range out {
-				if out[i], err = d.readVarint(false); err != nil {
-					return err
-				}
-			}
-			if err := v.UnsignedArray(id, out); err != nil {
-				return err
-			}
-		case TypeVarintArraySigned:
-			n, err := d.arrayCount()
-			if err != nil {
-				return err
-			}
-			out := make([]int64, n)
-			for i := range out {
-				x, err := d.readVarint(false)
-				if err != nil {
-					return err
-				}
-				out[i] = zigzagDecode(x)
-			}
-			if err := v.SignedArray(id, out); err != nil {
-				return err
-			}
-		case TypeFixlenArray:
-			if err := d.acceptFixlenArray(v, id); err != nil {
-				return err
-			}
-		case TypeSequenceStart:
-			child, err := v.BeginSequence(id)
-			if err != nil {
-				return err
-			}
-			if err := d.accept(child, true); err != nil {
-				return err
-			}
-			if err := child.EndSequence(); err != nil {
-				return err
-			}
-		case TypeSequenceEnd:
-			if nested {
-				return nil
-			}
-			return ErrInvalidMsg // dangling end at top level
-		default:
-			return ErrInvalidMsg
-		}
-	}
-}
-
-func (d *Decoder) acceptFixlen(v Visitor, id ID) error {
-	n, sub, err := d.readFixlenHeader()
+	buf, err := d.slurp()
 	if err != nil {
 		return err
 	}
-	switch sub {
-	case fixFp32:
-		if n != 4 {
-			return ErrInvalidMsg
-		}
-		buf, err := d.readRaw(4)
-		if err != nil {
-			return err
-		}
-		return v.Float32(id, math.Float32frombits(binary.LittleEndian.Uint32(buf)))
-	case fixFp64:
-		if n != 8 {
-			return ErrInvalidMsg
-		}
-		buf, err := d.readRaw(8)
-		if err != nil {
-			return err
-		}
-		return v.Float64(id, math.Float64frombits(binary.LittleEndian.Uint64(buf)))
-	case fixStr:
-		buf, err := d.readRaw(n)
-		if err != nil {
-			return err
-		}
-		return v.String(id, string(buf))
-	case fixBlob:
-		buf, err := d.readRaw(n)
-		if err != nil {
-			return err
-		}
-		return v.Bytes(id, buf)
-	default:
-		return ErrInvalidMsg
-	}
+	c := cursor{buf: buf}
+	return c.accept(v, false)
 }
 
-func (d *Decoder) acceptFixlenArray(v Visitor, id ID) error {
-	n, err := d.arrayCount()
-	if err != nil {
-		return err
+// AcceptBytes decodes a complete message already held in one contiguous buffer,
+// dispatching each field to v. It is the zero-copy form of Accept: the cursor
+// advances directly over buf with no input slurp, so it is the fastest entry
+// point when the message is already in memory (e.g. generated Unmarshal code).
+// buf is not retained, but byte/blob fields handed to v alias it, so the visitor
+// must copy any it keeps past the call.
+func AcceptBytes(buf []byte, v Visitor) error {
+	c := cursor{buf: buf}
+	return c.accept(v, false)
+}
+
+// slurp reads everything still pending into a single buffer. When the source
+// reports its remaining length (bytes.Reader, bytes.Buffer, strings.Reader) the
+// buffer is sized and filled in one shot; otherwise it falls back to io.ReadAll.
+// Anything already buffered by a prior Next is honored.
+func (d *Decoder) slurp() ([]byte, error) {
+	var r io.Reader = d.src
+	if d.r != nil {
+		r = d.r
 	}
-	h, err := d.readVarint(false)
-	if err != nil {
-		return err
-	}
-	sub := h & 0x07
-	size := h >> 3
-	switch {
-	case sub == fixFp32 && size == 4:
-		out := make([]float32, n)
-		for i := range out {
-			buf, err := d.readRaw(4)
-			if err != nil {
-				return err
-			}
-			out[i] = math.Float32frombits(binary.LittleEndian.Uint32(buf))
+	if l, ok := r.(interface{ Len() int }); ok {
+		buf := make([]byte, l.Len())
+		if _, err := io.ReadFull(r, buf); err != nil {
+			return nil, err
 		}
-		return v.Float32Array(id, out)
-	case sub == fixFp64 && size == 8:
-		out := make([]float64, n)
-		for i := range out {
-			buf, err := d.readRaw(8)
-			if err != nil {
-				return err
-			}
-			out[i] = math.Float64frombits(binary.LittleEndian.Uint64(buf))
-		}
-		return v.Float64Array(id, out)
-	default:
-		return ErrInvalidMsg
+		return buf, nil
 	}
+	return io.ReadAll(r)
 }
