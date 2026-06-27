@@ -9,10 +9,12 @@ import (
 	"bytes"
 	"encoding/hex"
 	"encoding/json"
+	"io"
 	"math"
 	"os"
 	"strconv"
 	"testing"
+	"testing/iotest"
 
 	sofab "github.com/sofa-buffers/corelib-go"
 )
@@ -30,6 +32,7 @@ type vector struct {
 	Name       string     `json:"name"`
 	Group      string     `json:"group"`
 	Offset     int        `json:"offset"`
+	SkipIDs    []uint32   `json:"skip_ids"`
 	Fields     []vecField `json:"fields"`
 	Serialized struct {
 		Length int    `json:"length"`
@@ -397,5 +400,97 @@ func TestVectorDecode(t *testing.T) {
 				decodeField(t, d, f)
 			}
 		})
+	}
+}
+
+// --- skip-ids scenario -------------------------------------------------------
+
+// advancePastSequence returns the index just after the sequence_end that matches
+// the sequence_begin at fields[start], accounting for nested sequences. Used to
+// jump over a whole sub-sequence in the flat field list once the decoder has
+// skipped it wholesale.
+func advancePastSequence(fields []vecField, start int) int {
+	depth := 0
+	for i := start; i < len(fields); i++ {
+		switch fields[i].Op {
+		case "sequence_begin":
+			depth++
+		case "sequence_end":
+			depth--
+		}
+		if depth == 0 {
+			return i + 1
+		}
+	}
+	return len(fields)
+}
+
+// decodeSkipping replays the message but leaves every id in skip unread, letting
+// the decoder skip the field — and, when the id names a sequence, the whole
+// nested sub-sequence at any depth. Non-skipped fields are still verified, and
+// the stream must end exactly (io.EOF) once the structure is exhausted.
+func decodeSkipping(t *testing.T, d *sofab.Decoder, v vector, skip map[uint32]bool) {
+	t.Helper()
+	fields := v.Fields
+	for i := 0; i < len(fields); {
+		f := fields[i]
+		if f.Op != "sequence_end" && skip[f.ID] {
+			fd, err := d.Next()
+			if err != nil {
+				t.Fatalf("Next (skip id %d): %v", f.ID, err)
+			}
+			if fd.ID != sofab.ID(f.ID) {
+				t.Fatalf("skip: id = %d, want %d", fd.ID, f.ID)
+			}
+			if err := d.Skip(); err != nil {
+				t.Fatalf("Skip id %d: %v", f.ID, err)
+			}
+			if f.Op == "sequence_begin" {
+				i = advancePastSequence(fields, i)
+			} else {
+				i++
+			}
+			continue
+		}
+		decodeField(t, d, f)
+		i++
+	}
+	if _, err := d.Next(); err != io.EOF {
+		t.Fatalf("message not fully consumed after skip-ids: Next = %v, want io.EOF", err)
+	}
+}
+
+// TestVectorSkipIDs drives the skip-ids decode scenario: for every vector that
+// carries skip_ids, the listed field ids are skipped (at every nesting level)
+// while the rest decode normally. Run all-at-once and one-byte-at-a-time to prove
+// skipping resumes across any read boundary (the chunked variant).
+func TestVectorSkipIDs(t *testing.T) {
+	vf := loadVectors(t)
+	ran := 0
+	for _, v := range vf.Vectors {
+		if len(v.SkipIDs) == 0 {
+			continue
+		}
+		ran++
+		skip := make(map[uint32]bool, len(v.SkipIDs))
+		for _, id := range v.SkipIDs {
+			skip[id] = true
+		}
+		raw, err := hex.DecodeString(v.Serialized.Hex)
+		if err != nil {
+			t.Fatalf("%s: hex: %v", v.Name, err)
+		}
+		readers := map[string]func() io.Reader{
+			"all-at-once": func() io.Reader { return bytes.NewReader(raw) },
+			"one-byte":    func() io.Reader { return iotest.OneByteReader(bytes.NewReader(raw)) },
+		}
+		for name, mk := range readers {
+			t.Run(v.Name+"/"+name, func(t *testing.T) {
+				decodeSkipping(t, sofab.NewDecoder(mk()), v, skip)
+			})
+		}
+	}
+	if ran == 0 {
+		t.Fatal("no vectors carried skip_ids; expected the suite to exercise the skip-ids scenario")
 	}
 }
