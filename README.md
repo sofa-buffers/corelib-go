@@ -41,7 +41,7 @@ go get github.com/sofa-buffers/corelib-go
 |------|-----|
 | Streaming **out** | [`Encoder`] writes to any `io.Writer` (buffered), so a message can exceed RAM and stream straight to a socket or file. |
 | Streaming **in** | [`Decoder`] is a pull parser over any `io.Reader`; `Next()` returns one field header at a time, never materializing the whole message. |
-| Two decode styles | Pull with `Decoder.Next` (power users), or implement [`Visitor`] and call `Decoder.Accept` — the visitor binds each field straight into a struct member, which is what generated `Unmarshal` code uses. Both are equivalent in throughput. |
+| Two decode styles | Pull with `Decoder.Next` (power users, true streaming), or implement [`Visitor`] and call `Decoder.Accept` — the visitor binds each field straight into a struct member, which is what generated `Unmarshal` code uses. `Accept` parses over one contiguous buffer (faster, but reads the whole message in); `AcceptBytes` is the zero-copy form for an in-memory `[]byte`. |
 | No dependencies | Standard library only (`bufio`, `encoding/binary`, `io`, `math`, `errors`). No third-party modules, no `cgo`. |
 | Sticky errors | The encoder records the first failure and turns later writes into no-ops, so generated `Marshal` code can issue a run of writes and check once at `Flush`. |
 | Generics for arrays | `WriteUnsignedArray[T]` / `ReadUnsignedArray[T]` (and signed variants) accept any `~uint8..~uint64` / `~int8..~int64` element type; float arrays have dedicated methods. |
@@ -118,8 +118,12 @@ var s sensor
 err := sofab.NewDecoder(r).Accept(&s)
 ```
 
-The pull (`Next`) and visitor (`Accept`) paths share the same primitives and are
-equivalent in throughput; pick by ergonomics.
+The pull (`Next`) path streams one field at a time without holding the message
+in memory. The visitor (`Accept`) path instead reads the message into one
+contiguous buffer and advances a cursor over it (the protobuf-style decode
+kernel), so it is faster for in-memory sources at the cost of buffering the whole
+message. When the message is already a `[]byte`, `sofab.AcceptBytes(buf, v)`
+skips that copy entirely — the zero-copy path generated `Unmarshal` code uses.
 
 ## API summary
 
@@ -132,7 +136,8 @@ equivalent in throughput; pick by ergonomics.
 **Decoder** — pull: `Next`, `Field`, `Unsigned`, `Signed`, `Bool`, `Float32`,
 `Float64`, `String`, `Bytes`, `ReadFloat32Array`, `ReadFloat64Array`, `Skip`;
 package functions `ReadUnsignedArray[T]`, `ReadSignedArray[T]`. Visitor:
-`Accept(Visitor)` with the [`Visitor`] interface (`Unsigned`, `Signed`,
+`Accept(Visitor)` and the zero-copy `AcceptBytes([]byte, Visitor)`, with the
+[`Visitor`] interface (`Unsigned`, `Signed`,
 `Float32`, `Float64`, `String`, `Bytes`, `UnsignedArray`, `SignedArray`,
 `Float32Array`, `Float64Array`, `BeginSequence`, `EndSequence`).
 
