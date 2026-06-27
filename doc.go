@@ -14,17 +14,22 @@
 //
 // # Streaming
 //
-// Encoding targets an io.Writer and decoding reads from an io.Reader, so neither
-// side needs to hold the whole message in memory — messages larger than RAM can
-// be streamed. The decoder offers two equivalent styles:
+// Encoding targets an io.Writer, so the encoder never holds the whole message in
+// memory — messages larger than RAM can be streamed straight to a socket or
+// file. The decoder offers two styles:
 //
 //   - Pull: call Decoder.Next to get the next field header, then a typed reader
-//     (or Skip) to consume its value. Best for hand-written, power-user code.
+//     (or Skip) to consume its value. It streams one field at a time, never
+//     materializing the whole message. Best for hand-written, power-user code.
 //   - Visitor: implement Visitor on the target type and call Decoder.Accept; the
 //     decoder drives, binding each field straight into a struct member. This is
 //     what generated Unmarshal code uses. See the Decoding example below.
 //
-// Both share the same low-level primitives and perform the same.
+// The visitor path reads the message into one contiguous buffer and parses it by
+// advancing a cursor over it (the protobuf-style decode kernel), so for an
+// in-memory source it is faster than the pull parser but does buffer the whole
+// message. AcceptBytes is the zero-copy form when the message is already a
+// []byte (e.g. generated Unmarshal).
 //
 // # Encoding example (what generated Marshal code looks like)
 //
