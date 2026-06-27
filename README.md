@@ -41,6 +41,7 @@ go get github.com/sofa-buffers/corelib-go
 |------|-----|
 | Streaming **out** | [`Encoder`] writes to any `io.Writer` (buffered), so a message can exceed RAM and stream straight to a socket or file. |
 | Streaming **in** | [`Decoder`] is a pull parser over any `io.Reader`; `Next()` returns one field header at a time, never materializing the whole message. |
+| Two decode styles | Pull with `Decoder.Next` (power users), or implement [`Visitor`] and call `Decoder.Accept` — the visitor binds each field straight into a struct member, which is what generated `Unmarshal` code uses. Both are equivalent in throughput. |
 | No dependencies | Standard library only (`bufio`, `encoding/binary`, `io`, `math`, `errors`). No third-party modules, no `cgo`. |
 | Sticky errors | The encoder records the first failure and turns later writes into no-ops, so generated `Marshal` code can issue a run of writes and check once at `Flush`. |
 | Generics for arrays | `WriteUnsignedArray[T]` / `ReadUnsignedArray[T]` (and signed variants) accept any `~uint8..~uint64` / `~int8..~int64` element type; float arrays have dedicated methods. |
@@ -99,6 +100,27 @@ e.Flush()                              // push the tail
 The decoder is symmetric: hand `NewDecoder` an `io.Reader` (socket, `os.Stdin`,
 `gzip.Reader`, ...) and pull fields with `Next()` as they arrive.
 
+### Decoding with a visitor
+
+Generated `Unmarshal` code doesn't write a `Next` loop — it implements
+[`Visitor`] and lets `Decoder.Accept` drive, binding each field straight into a
+struct member. Nested sequences descend into the visitor returned by
+`BeginSequence`:
+
+```go
+type sensor struct{ ID uint64; Name string }
+
+func (s *sensor) Unsigned(id sofab.ID, v uint64) error { if id == 1 { s.ID = v }; return nil }
+func (s *sensor) String(id sofab.ID, v string) error   { if id == 2 { s.Name = v }; return nil }
+// ... other Visitor methods (no-ops for fields this type ignores) ...
+
+var s sensor
+err := sofab.NewDecoder(r).Accept(&s)
+```
+
+The pull (`Next`) and visitor (`Accept`) paths share the same primitives and are
+equivalent in throughput; pick by ergonomics.
+
 ## API summary
 
 **Encoder** — methods: `WriteUnsigned`, `WriteSigned`, `WriteBool`,
@@ -107,9 +129,12 @@ The decoder is symmetric: hand `NewDecoder` an `io.Reader` (socket, `os.Stdin`,
 `WriteFloat64Array`, `Flush`, `Err`; package functions `WriteUnsignedArray[T]`,
 `WriteSignedArray[T]`.
 
-**Decoder** — methods: `Next`, `Field`, `Unsigned`, `Signed`, `Bool`,
-`Float32`, `Float64`, `String`, `Bytes`, `ReadFloat32Array`, `ReadFloat64Array`,
-`Skip`; package functions `ReadUnsignedArray[T]`, `ReadSignedArray[T]`.
+**Decoder** — pull: `Next`, `Field`, `Unsigned`, `Signed`, `Bool`, `Float32`,
+`Float64`, `String`, `Bytes`, `ReadFloat32Array`, `ReadFloat64Array`, `Skip`;
+package functions `ReadUnsignedArray[T]`, `ReadSignedArray[T]`. Visitor:
+`Accept(Visitor)` with the [`Visitor`] interface (`Unsigned`, `Signed`,
+`Float32`, `Float64`, `String`, `Bytes`, `UnsignedArray`, `SignedArray`,
+`Float32Array`, `Float64Array`, `BeginSequence`, `EndSequence`).
 
 > **Note on value width:** like the C default configuration, the scalar value
 > type is 64-bit (`uint64` / `int64`), so varint encodings match byte-for-byte
@@ -136,7 +161,7 @@ configuration so the wire image and varint lengths are identical across ports.
 |--------|---------|--------|
 | `sofab.h` (types/constants) | `types.go` (`WireType`, `ID`, errors, zigzag) | ported |
 | `ostream.c` | `encoder.go` ([`Encoder`]) | ported |
-| `istream.c` | `decoder.go` ([`Decoder`]) | ported (pull-parser model instead of bind-target callbacks) |
+| `istream.c` | `decoder.go` ([`Decoder`]) + `visitor.go` ([`Visitor`]) | ported (both a pull parser and a visitor/push model) |
 | `object.c` (descriptor transcoder) | — | not ported. The idiomatic Go equivalent is generated `Marshal` / `Unmarshal` code from a schema-driven generator; the streaming core above already covers serialize/deserialize. |
 
 See `example_test.go` for a full generated-code-style `Marshal` / `Unmarshal`

@@ -16,8 +16,15 @@
 //
 // Encoding targets an io.Writer and decoding reads from an io.Reader, so neither
 // side needs to hold the whole message in memory — messages larger than RAM can
-// be streamed. The decoder is a pull parser: call Decoder.Next to get the next
-// field header, then a typed reader (or Skip) to consume its value.
+// be streamed. The decoder offers two equivalent styles:
+//
+//   - Pull: call Decoder.Next to get the next field header, then a typed reader
+//     (or Skip) to consume its value. Best for hand-written, power-user code.
+//   - Visitor: implement Visitor on the target type and call Decoder.Accept; the
+//     decoder drives, binding each field straight into a struct member. This is
+//     what generated Unmarshal code uses. See the Decoding example below.
+//
+// Both share the same low-level primitives and perform the same.
 //
 // # Encoding example (what generated Marshal code looks like)
 //
