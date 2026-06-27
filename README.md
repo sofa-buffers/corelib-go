@@ -1,9 +1,9 @@
-<p align="center"><img src="assets/sofabuffers_logo.png" alt="SofaBuffers Logo" height="140"></p>
+<p align="center"><img src="assets/sofabuffers_logo.png" alt="SofaBuffers" height="140"></p>
 
 # SofaBuffers
 
-<b>Structured Objects For Anyone</b><br>
-<i>... so optimized, feels amazing.</i>
+**Structured Objects For Anyone** \
+*... so optimized, feels amazing.*
 
 [Would you like to know more?](https://github.com/sofa-buffers)
 
@@ -115,6 +115,21 @@ The decoder is symmetric: hand `NewDecoder` an `io.Reader` (socket, `os.Stdin`,
 > type is 64-bit (`uint64` / `int64`), so varint encodings match byte-for-byte
 > across the C, C++, Rust and Go implementations.
 
+## Feature flags
+
+Go always ships the full format — there are no build toggles, because the desktop
+and server targets it is built for are not code-size constrained.
+
+| Feature | State |
+|---------|-------|
+| `fixlen` (fp32 / fp64, string, blob) | always on |
+| `array` (unsigned / signed / fixlen arrays) | always on |
+| `sequence` (nested scopes) | always on |
+| `fp64` | always on |
+
+The scalar value type is 64-bit (`uint64` / `int64`), matching the C default
+configuration so the wire image and varint lengths are identical across ports.
+
 ## Layering vs. the C library
 
 | C file | Go file | Status |
@@ -128,13 +143,14 @@ See `example_test.go` for a full generated-code-style `Marshal` / `Unmarshal`
 example including a nested message (wire sequence), and `doc.go` for the
 package-level documentation.
 
-## Testing & coverage
+## Build & test
 
 ```bash
+go build ./...           # build
+go vet ./...             # static analysis
 go test ./...            # unit + roundtrip + example tests
 go test ./... -race      # with the race detector
 go test ./... -cover     # with coverage
-go test ./... -v         # verbose
 ```
 
 Tests are split by concern:
