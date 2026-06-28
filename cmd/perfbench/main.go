@@ -1,17 +1,23 @@
-// Command perfbench is the Go side of the SofaBuffers CPU-cost comparison.
+// Command perfbench is the Go side of the SofaBuffers cross-language comparison.
 //
-// It mirrors test/perf/bench.c, bench.cpp and corelib-rs/benches/perf.rs: same
-// workloads, data, ids and values, measured the same way (Callgrind
-// --toggle-collect on the noinline run_* functions, setup excluded). Function
-// names use underscores so the harness can toggle on "main.run_<workload>",
-// matching the C/C++/Rust toggle names.
+// It mirrors bench/{c,cpp}/{bench,perf}.* and corelib-rs/benches/{bench,perf}.rs:
+// same workloads, data, ids and values, printed in the same shared format so the
+// implementations can be compared directly. Subcommands:
+//
+//	bench   throughput (MB/s) table over a ~1s process-CPU-time loop
+//	perf    per-op cost (CPU time/op ns + MB/s) for the 12-field perf message
+//
+// The single-workload subcommands (encode_u64_array, …) run one noinline run_*
+// function once (setup excluded) for the Callgrind harness, which toggles
+// collection on "main.run_<workload>" to match the C/C++/Rust toggle names.
 package main
 
 import (
 	"bytes"
 	"fmt"
+	"math"
 	"os"
-	"time"
+	"syscall"
 
 	sofab "github.com/sofa-buffers/corelib-go"
 )
@@ -186,28 +192,42 @@ func run_decode_typical() {
 	_ = dec.Accept(typicalVisitor{})
 }
 
-// timeLoop runs fn for ~1s and returns throughput in MB/s for messages of the
-// given byte size.
+// cpuNow returns process CPU time in seconds (user + system), not wall-clock —
+// the Go analogue of the C tool's clock() / Rust's CLOCK_PROCESS_CPUTIME_ID, so
+// throughput is measured on the same basis as every other corelib.
+func cpuNow() float64 {
+	var ru syscall.Rusage
+	if err := syscall.Getrusage(syscall.RUSAGE_SELF, &ru); err != nil {
+		return 0
+	}
+	sec := float64(ru.Utime.Sec) + float64(ru.Stime.Sec)
+	usec := float64(ru.Utime.Usec) + float64(ru.Stime.Usec)
+	return sec + usec/1e6
+}
+
+// timeLoop runs fn for ~1s of CPU time (after a warmup) and returns throughput
+// in MB/s (MB = 1e6 bytes) for messages of the given byte size.
 func timeLoop(fn func(), msgBytes int) float64 {
 	fn() // warmup
-	start := time.Now()
+	t0 := cpuNow()
 	iters := 0
-	var el time.Duration
+	var el float64
 	for {
 		fn()
 		iters++
-		el = time.Since(start)
-		if el >= time.Second {
+		el = cpuNow() - t0
+		if el >= 1.0 {
 			break
 		}
 	}
-	return float64(msgBytes) * float64(iters) / el.Seconds() / 1e6
+	return float64(msgBytes) * float64(iters) / el / 1e6
 }
 
-// runTimed reports real wall-clock throughput (MB/s) for each workload. Encode
-// constructs a fresh encoder per message (idiomatic Go); decode reuses a
-// pre-encoded buffer and constructs a fresh decoder per message.
-func runTimed() {
+// runBench reports throughput (MB/s) for each workload in the shared
+// cross-language table format. Encode constructs a fresh encoder per message
+// (idiomatic Go); decode reuses a pre-encoded buffer and constructs a fresh
+// decoder per message.
+func runBench() {
 	makeSrc()
 
 	// pre-encode the two messages once for the decode loops.
@@ -218,37 +238,188 @@ func runTimed() {
 	run_encode_typical()
 	decTyp := append([]byte(nil), sw.buf...)
 
-	fmt.Printf("encode_u64_array %.2f\n", timeLoop(func() {
+	encU64 := timeLoop(func() {
 		sw = &sliceWriter{buf: make([]byte, 0, 16*1024)}
 		enc = sofab.NewEncoder(sw)
 		sofab.WriteUnsignedArray(enc, 1, src[:])
 		enc.Flush()
-	}, len(decU64)))
+	}, len(decU64))
 
-	fmt.Printf("encode_typical %.2f\n", timeLoop(func() {
+	encTyp := timeLoop(func() {
 		sw = &sliceWriter{buf: make([]byte, 0, 256)}
 		enc = sofab.NewEncoder(sw)
 		encodeTypical(enc)
 		enc.Flush()
-	}, len(decTyp)))
+	}, len(decTyp))
 
-	fmt.Printf("decode_u64_array %.2f\n", timeLoop(func() {
+	decU64MBs := timeLoop(func() {
 		dec = sofab.NewDecoder(bytes.NewReader(decU64))
 		run_decode_u64_array()
-	}, len(decU64)))
+	}, len(decU64))
 
-	fmt.Printf("decode_typical %.2f\n", timeLoop(func() {
+	decTypMBs := timeLoop(func() {
 		dec = sofab.NewDecoder(bytes.NewReader(decTyp))
 		run_decode_typical()
-	}, len(decTyp)))
+	}, len(decTyp))
+
+	fmt.Println("=== SofaBuffers Go throughput (CPU time, MB/s) ===")
+	fmt.Printf("%-26s %12s\n", "Workload", "MB/s")
+	fmt.Printf("%-26s %12s\n", "--------", "----")
+	fmt.Printf("%-26s %12.2f\n", "encode: u64 array (1000)", encU64)
+	fmt.Printf("%-26s %12.2f\n", "encode: typical message", encTyp)
+	fmt.Printf("%-26s %12.2f\n", "decode: u64 array (1000)", decU64MBs)
+	fmt.Printf("%-26s %12.2f\n", "decode: typical message", decTypMBs)
+	fmt.Println("\nMB = 1e6 bytes. ~1s CPU-time loop per workload.")
+}
+
+// ---- per-op (perf) -----------------------------------------------------------
+//
+// Mirrors corelib-rs/benches/perf.rs and bench/{c,cpp}/perf.*: the identical
+// 12-field message (same ids, types and values), measured over a ~1s CPU-time
+// loop and printed in the shared per-op format. Go has no portable hardware
+// cycle counter, so cycles/op is reported unavailable (like Java/C#/TS).
+
+const perfString = "perf-benchmark-message"
+
+var (
+	perfSamples = [8]uint32{1000000, 2000000, 3000000, 4000000, 5000000, 6000000, 7000000, 8000000}
+	perfDeltas  = [8]int32{-100000, -200000, -300000, -400000, -500000, -600000, -700000, -800000}
+	perfFp64    = [4]float64{3.14159265, 6.28318530, 9.42477795, 12.56637060}
+)
+
+func perfEncode(e *sofab.Encoder) {
+	e.WriteUnsigned(1, 0xDEADBEEF)
+	e.WriteSigned(2, -12345)
+	e.WriteUnsigned(3, 0x0123456789ABCDEF)
+	e.WriteSigned(4, -5000000000000)
+	e.WriteBool(5, true)
+	e.WriteFloat32(6, 3.14159)
+	e.WriteFloat64(7, 2.718281828459045)
+	e.WriteString(8, perfString)
+	sofab.WriteUnsignedArray(e, 9, perfSamples[:])
+	sofab.WriteSignedArray(e, 10, perfDeltas[:])
+	e.WriteFloat64Array(11, perfFp64[:])
+	e.WriteSequenceBegin(12)
+	e.WriteUnsigned(1, 99)
+	e.WriteSigned(2, -7)
+	e.WriteSequenceEnd()
+}
+
+// perfVisitor folds every value into the global sink so nothing is elided; it
+// returns itself for nested sequences so nested fields are folded too.
+type perfVisitor struct{ baseVisitor }
+
+func (perfVisitor) Unsigned(id sofab.ID, v uint64) error { sink += v ^ uint64(id); return nil }
+func (perfVisitor) Signed(id sofab.ID, v int64) error    { sink += uint64(v) ^ uint64(id); return nil }
+func (perfVisitor) Float32(_ sofab.ID, v float32) error {
+	sink += uint64(math.Float32bits(v))
+	return nil
+}
+func (perfVisitor) Float64(_ sofab.ID, v float64) error { sink += math.Float64bits(v); return nil }
+func (perfVisitor) String(_ sofab.ID, s string) error   { sink += uint64(len(s)); return nil }
+func (perfVisitor) UnsignedArray(_ sofab.ID, a []uint64) error {
+	sink += uint64(len(a))
+	if len(a) > 0 {
+		sink += a[0] + a[len(a)-1]
+	}
+	return nil
+}
+func (perfVisitor) SignedArray(_ sofab.ID, a []int64) error         { sink += uint64(len(a)); return nil }
+func (perfVisitor) Float64Array(_ sofab.ID, a []float64) error      { sink += uint64(len(a)); return nil }
+func (v perfVisitor) BeginSequence(sofab.ID) (sofab.Visitor, error) { return v, nil }
+
+type perfResult struct {
+	iters     uint64
+	nsOp, mbS float64
+}
+
+func perfReport(what string, r perfResult, msgBytes int) {
+	fmt.Printf("\n--- perf: %s ---\n", what)
+	fmt.Printf("  iterations    : %d\n", r.iters)
+	fmt.Printf("  message size  : %d bytes\n", msgBytes)
+	fmt.Printf("  cycles/op     : (hardware cycle counter unavailable on this platform)\n")
+	fmt.Printf("  CPU time/op   : %.1f ns  (process CPU time, not wall-clock)\n", r.nsOp)
+	fmt.Printf("  throughput    : %.1f MB/s  (speedtest, MB = 1e6 bytes)\n", r.mbS)
+}
+
+func perfMeasureEncode() (perfResult, int) {
+	sw = &sliceWriter{buf: make([]byte, 0, 512)}
+	enc = sofab.NewEncoder(sw)
+	perfEncode(enc)
+	enc.Flush()
+	msg := len(sw.buf)
+
+	for i := 0; i < 1000; i++ { // warmup
+		sw.buf = sw.buf[:0]
+		enc = sofab.NewEncoder(sw)
+		perfEncode(enc)
+		enc.Flush()
+	}
+
+	var it uint64
+	t0 := cpuNow()
+	var el float64
+	for {
+		sw.buf = sw.buf[:0]
+		enc = sofab.NewEncoder(sw)
+		perfEncode(enc)
+		enc.Flush()
+		it++
+		el = cpuNow() - t0
+		if el >= 1.0 {
+			break
+		}
+	}
+	return perfResult{it, el / float64(it) * 1e9, float64(msg) * float64(it) / el / 1e6}, msg
+}
+
+func perfMeasureDecode(buf []byte) perfResult {
+	for i := 0; i < 1000; i++ { // warmup
+		_ = sofab.NewDecoder(bytes.NewReader(buf)).Accept(perfVisitor{})
+	}
+	var it uint64
+	t0 := cpuNow()
+	var el float64
+	for {
+		_ = sofab.NewDecoder(bytes.NewReader(buf)).Accept(perfVisitor{})
+		it++
+		el = cpuNow() - t0
+		if el >= 1.0 {
+			break
+		}
+	}
+	return perfResult{it, el / float64(it) * 1e9, float64(len(buf)) * float64(it) / el / 1e6}
+}
+
+func runPerf() {
+	fmt.Println("=== SofaBuffers Go per-op cost (cycles/op + throughput MB/s) ===")
+
+	encR, msg := perfMeasureEncode()
+	perfReport("serialize (stream API)", encR, msg)
+
+	// pre-encode once as decode input.
+	sw = &sliceWriter{buf: make([]byte, 0, 512)}
+	pe := sofab.NewEncoder(sw)
+	perfEncode(pe)
+	pe.Flush()
+	buf := append([]byte(nil), sw.buf...)
+
+	decR := perfMeasureDecode(buf)
+	perfReport("deserialize (stream API)", decR, len(buf))
+
+	fmt.Println("\ncycles/op tracks code cost; MB/s is this machine's throughput.")
 }
 
 func main() {
 	if len(os.Args) < 2 {
 		os.Exit(1)
 	}
-	if os.Args[1] == "time" {
-		runTimed()
+	switch os.Args[1] {
+	case "bench", "time": // "time" kept as an alias for older callers
+		runBench()
+		return
+	case "perf":
+		runPerf()
 		return
 	}
 	switch os.Args[1] {
