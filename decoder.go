@@ -103,6 +103,9 @@ func (d *Decoder) readVarint(firstEOFok bool) (uint64, error) {
 	}
 }
 
+// readFixlenHeader reads a fixed-length field's length-and-subtype varint,
+// splitting it into the byte length (h>>3) and the 3-bit subtype (h&0x07). A
+// length past arrayMax is rejected as a malformed message.
 func (d *Decoder) readFixlenHeader() (length uint64, sub uint64, err error) {
 	h, err := d.readVarint(false)
 	if err != nil {
@@ -116,6 +119,8 @@ func (d *Decoder) readFixlenHeader() (length uint64, sub uint64, err error) {
 	return length, sub, nil
 }
 
+// readRaw reads exactly n bytes into a freshly allocated buffer. A short read
+// (the stream ending early) is reported as ErrInvalidMsg.
 func (d *Decoder) readRaw(n uint64) ([]byte, error) {
 	buf := make([]byte, n)
 	if _, err := io.ReadFull(d.r, buf); err != nil {
@@ -210,6 +215,9 @@ func (d *Decoder) Bytes() ([]byte, error) {
 	return d.fixlenBytes(fixBlob)
 }
 
+// fixlenBytes consumes the current fixlen field, requiring its subtype to equal
+// want (fixStr or fixBlob), and returns the raw payload. It backs String and
+// Bytes. A wrong field type is ErrUsage; a mismatched subtype is ErrInvalidMsg.
 func (d *Decoder) fixlenBytes(want uint64) ([]byte, error) {
 	if !d.needConsume || d.cur.Type != TypeFixlen {
 		return nil, ErrUsage
@@ -262,6 +270,9 @@ func (d *Decoder) Skip() error {
 	}
 }
 
+// skipValue consumes and discards the current scalar, array, or fixlen value
+// (everything except sequence markers, which carry no value) so the next Next
+// starts at a field boundary. Sequence skipping is handled by Skip.
 func (d *Decoder) skipValue() error {
 	d.needConsume = false
 	switch d.cur.Type {
@@ -302,6 +313,8 @@ func (d *Decoder) skipValue() error {
 	return nil
 }
 
+// arrayCount reads an array's leading element count. Zero (arrays are never
+// empty on the wire) or a count past arrayMax is rejected as ErrInvalidMsg.
 func (d *Decoder) arrayCount() (uint64, error) {
 	n, err := d.readVarint(false)
 	if err != nil {
@@ -411,6 +424,8 @@ func (d *Decoder) ReadFloat64Array() ([]float64, error) {
 	return out, nil
 }
 
+// eofToInvalid maps an end-of-stream error hit mid-value to ErrInvalidMsg (the
+// message was truncated), passing any other error through unchanged.
 func eofToInvalid(err error) error {
 	if err == io.EOF || err == io.ErrUnexpectedEOF {
 		return ErrInvalidMsg
