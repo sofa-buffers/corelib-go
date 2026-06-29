@@ -41,7 +41,7 @@ go get github.com/sofa-buffers/corelib-go
 |------|-----|
 | Streaming **out** | [`Encoder`] writes to any `io.Writer` (buffered), so a message can exceed RAM and stream straight to a socket or file. |
 | Streaming **in** | [`Decoder`] is a pull parser over any `io.Reader`; `Next()` returns one field header at a time, never materializing the whole message. |
-| Two decode styles | Pull with `Decoder.Next` (power users, true streaming), or implement [`Visitor`] and call `Decoder.Accept` — the visitor binds each field straight into a struct member, which is what generated `Unmarshal` code uses. `Accept` parses over one contiguous buffer (faster, but reads the whole message in); `AcceptBytes` is the zero-copy form for an in-memory `[]byte`. |
+| Two decode styles | Pull with `Decoder.Next` (power users, true streaming), or implement [`Visitor`] and call `Decoder.Accept` — the visitor binds each field straight into a struct member, which is what generated `Unmarshal` code uses. `Accept` is also fully streaming: it walks a small refillable window and never holds the whole message. `AcceptBytes` is the zero-copy form for a message already in an in-memory `[]byte`. |
 | No dependencies | Standard library only (`bufio`, `encoding/binary`, `io`, `math`, `errors`). No third-party modules, no `cgo`. |
 | Sticky errors | The encoder records the first failure and turns later writes into no-ops, so generated `Marshal` code can issue a run of writes and check once at `Flush`. |
 | Generics for arrays | `WriteUnsignedArray[T]` / `ReadUnsignedArray[T]` (and signed variants) accept any `~uint8..~uint64` / `~int8..~int64` element type; float arrays have dedicated methods. |
@@ -118,28 +118,127 @@ var s sensor
 err := sofab.NewDecoder(r).Accept(&s)
 ```
 
-The pull (`Next`) path streams one field at a time without holding the message
-in memory. The visitor (`Accept`) path instead reads the message into one
-contiguous buffer and advances a cursor over it (the protobuf-style decode
-kernel), so it is faster for in-memory sources at the cost of buffering the whole
-message. When the message is already a `[]byte`, `sofab.AcceptBytes(buf, v)`
-skips that copy entirely — the zero-copy path generated `Unmarshal` code uses.
+Both the pull (`Next`) and visitor (`Accept`) paths stream: they hold only a
+small window plus the value of the field currently being delivered — never the
+whole message — so either can decode a source larger than RAM and suspend/resume
+at any byte boundary. `Accept` drives the decode kernel over a refillable window
+(recycled across calls via a `sync.Pool`); `Next` instead returns control to the
+caller between fields. When the message is already a `[]byte`,
+`sofab.AcceptBytes(buf, v)` parses it in place with no copy and no refill — the
+zero-copy path generated `Unmarshal` code uses (see **Memory handling** below).
 
 ## API summary
 
-**Encoder** — methods: `WriteUnsigned`, `WriteSigned`, `WriteBool`,
-`WriteFloat32`, `WriteFloat64`, `WriteString`, `WriteBytes`,
-`WriteSequenceBegin` / `WriteSequenceEnd`, `WriteFloat32Array`,
+### Write operations
+
+[`Encoder`] (`sofab.NewEncoder(io.Writer)`) — methods: `WriteUnsigned`,
+`WriteSigned`, `WriteBool`, `WriteFloat32`, `WriteFloat64`, `WriteString`,
+`WriteBytes`, `WriteSequenceBegin` / `WriteSequenceEnd`, `WriteFloat32Array`,
 `WriteFloat64Array`, `Flush`, `Err`; package functions `WriteUnsignedArray[T]`,
 `WriteSignedArray[T]`.
 
-**Decoder** — pull: `Next`, `Field`, `Unsigned`, `Signed`, `Bool`, `Float32`,
-`Float64`, `String`, `Bytes`, `ReadFloat32Array`, `ReadFloat64Array`, `Skip`;
-package functions `ReadUnsignedArray[T]`, `ReadSignedArray[T]`. Visitor:
-`Accept(Visitor)` and the zero-copy `AcceptBytes([]byte, Visitor)`, with the
-[`Visitor`] interface (`Unsigned`, `Signed`,
-`Float32`, `Float64`, `String`, `Bytes`, `UnsignedArray`, `SignedArray`,
-`Float32Array`, `Float64Array`, `BeginSequence`, `EndSequence`).
+| Wire kind | Encoder call | Source type |
+|-----------|--------------|-------------|
+| unsigned int | `WriteUnsigned(id, v)` | `uint64` |
+| signed int | `WriteSigned(id, v)` | `int64` (zigzag) |
+| bool | `WriteBool(id, b)` | `bool` (as `0`/`1` unsigned) |
+| fp32 / fp64 | `WriteFloat32` / `WriteFloat64` | `float32` / `float64` |
+| string | `WriteString(id, s)` | `string` |
+| blob | `WriteBytes(id, data)` | `[]byte` |
+| unsigned array | `WriteUnsignedArray(e, id, a)` | `[]T`, `T` any `~uint8..~uint64` |
+| signed array | `WriteSignedArray(e, id, a)` | `[]T`, `T` any `~int8..~int64` |
+| fp32 / fp64 array | `WriteFloat32Array` / `WriteFloat64Array` | `[]float32` / `[]float64` |
+| nested sequence | `WriteSequenceBegin(id)` … `WriteSequenceEnd()` | — |
+
+Array writers reject an empty slice with `ErrArgument`; the float arrays are
+methods (no generic element type), the integer arrays are package functions.
+
+### Read operations
+
+Two decode styles share the same wire grammar. The **pull** style ([`Decoder`],
+`sofab.NewDecoder(io.Reader)`): call `Next` for the next [`Field`] header, then
+exactly one typed reader (or `Skip`) to consume its value. The **visitor** style:
+implement [`Visitor`] and call `Accept` / `AcceptBytes`; the decoder drives,
+calling one typed method per field.
+
+| Wire kind | Pull reader → destination | Visitor method → destination |
+|-----------|---------------------------|------------------------------|
+| header | `Next() (Field, error)`, `Field() Field` | (driven internally) |
+| unsigned int | `Unsigned() (uint64, …)` | `Unsigned(id, uint64)` |
+| signed int | `Signed() (int64, …)` | `Signed(id, int64)` |
+| bool | `Bool() (bool, …)` | (via `Unsigned`, `0`/`1`) |
+| fp32 / fp64 | `Float32()` / `Float64()` → `float32` / `float64` | `Float32(id, float32)` / `Float64(id, float64)` |
+| string | `String() (string, …)` | `String(id, string)` |
+| blob | `Bytes() ([]byte, …)` | `Bytes(id, []byte)` |
+| unsigned array | `ReadUnsignedArray[T](d) ([]T, …)` | `UnsignedArray(id, []uint64)` |
+| signed array | `ReadSignedArray[T](d) ([]T, …)` | `SignedArray(id, []int64)` |
+| fp32 / fp64 array | `ReadFloat32Array()` / `ReadFloat64Array()` → `[]float32` / `[]float64` | `Float32Array(id, []float32)` / `Float64Array(id, []float64)` |
+| sequence descend | `Next` returns a `TypeSequenceStart`/`End` header | `BeginSequence(id) (Visitor, …)` / `EndSequence()` |
+| skip unknown | `Skip()` (descends a whole nested sequence) | return a no-op from the relevant method |
+
+Visitor array methods always receive the value widened to the 64-bit domain
+(`[]uint64` / `[]int64`) or the concrete float slice; generated code narrows to
+its declared element width. The pull array helpers narrow during the read via the
+generic `T`. Entry points: `Accept(v Visitor) error` (streams from the
+`Decoder`'s `io.Reader`) and the package function `AcceptBytes(buf []byte, v
+Visitor) error` (zero-copy over an in-memory message).
+
+### Allowed types
+
+The array helpers are generic over the element width; everything else is a fixed
+typed method.
+
+| Family | Constraint / type | Allowed widths |
+|--------|-------------------|----------------|
+| unsigned int + arrays | `Unsigned` = `~uint8 \| ~uint16 \| ~uint32 \| ~uint64` | u8, u16, u32, u64 |
+| signed int + arrays | `Signed` = `~int8 \| ~int16 \| ~int32 \| ~int64` | i8, i16, i32, i64 |
+| floats + float arrays | concrete `float32` / `float64` | fp32, fp64 |
+| string | concrete `string` | — |
+| blob | concrete `[]byte` | — |
+
+The generic constraints use `~`, so named types with those underlying kinds
+(e.g. `type Celsius int32`) are accepted. **Disallowed:** a fixlen *array* may
+only carry the `fp32` (4-byte) or `fp64` (8-byte) subtype — string- and
+blob-element (dynamic-subtype) fixlen arrays are not part of the format and a
+fixlen-array header with any other subtype/size decodes to `ErrInvalidMsg`.
+Scalar values are 64-bit (`uint64` / `int64`) to match the C default config, and
+field ids must be `≤ IDMax` (`INT32_MAX`).
+
+### Memory handling
+
+This is the part that most affects how callers wire the library in. There is no
+caller-supplied scratch buffer on either side: the **encoder** owns an internal
+`bufio.Writer` over your sink, and the **decoder** owns its window.
+
+**Encoder (write).** You hand `NewEncoder` an `io.Writer` (a `bytes.Buffer`, a
+socket, a file, `gzip.Writer`, …) — the *sink*, not a fixed output buffer. The
+encoder wraps it in a `bufio.Writer` and streams bytes out as that buffer fills,
+so a message may exceed RAM and flow straight to the wire; the library never
+holds the whole encoded message. Each write copies its bytes into the bufio
+buffer (strings/blobs are not retained after the call returns), so the caller's
+source slices/strings may be reused immediately. Errors are **sticky**: the first
+failure is recorded and later writes become no-ops, so generated `Marshal` code
+issues a run of writes and checks once. You **must call `Flush`** to push the tail
+of the bufio buffer to the sink (and to surface a late write error); `Err`
+returns the first error without flushing.
+
+**Decoder (read).** All three entry points are streaming, but they differ in
+whether returned bytes are copies the caller owns or slices that alias internal
+storage:
+
+| Path | Input | Buffering | string / blob result | array & scalar result |
+|------|-------|-----------|-----------------------|-----------------------|
+| `Decoder.Next` (pull) | any `io.Reader` (lazily wrapped in `bufio.Reader`) | streams one field at a time; whole message never held | **fresh copy** — `String()` and `Bytes()` allocate and the caller owns the result | freshly allocated `[]T` the caller owns |
+| `Decoder.Accept` (visitor) | the `Decoder`'s `io.Reader` | streams over a small refillable window (4 KiB, pooled via `sync.Pool`); whole message never held | `String` → **fresh copy** (safe to keep); `Bytes` → **alias of the transient window**, valid only for the duration of that call — a visitor that keeps it **must copy** | freshly allocated slice the visitor owns |
+| `AcceptBytes` (visitor, zero-copy) | a caller-owned `[]byte` | no copy, no refill — the parser advances directly over your buffer | `String` → **fresh copy**; `Bytes` → **alias into the caller's `[]byte`** — zero-copy, so the input buffer **must stay alive** as long as the blob is referenced | freshly allocated slice the visitor owns |
+
+Takeaways: `Next` is the safe-by-default path — every value is a copy the caller
+owns. `Accept` and `AcceptBytes` are faster but only string values are copied;
+**blob (`Bytes`) values alias** — the transient window (`Accept`) or the caller's
+buffer (`AcceptBytes`) — so a visitor that retains a blob past the call (or past
+the buffer's lifetime) must copy it. Numeric arrays are always freshly allocated
+on every path. For `Accept`, an oversized single value temporarily grows the
+window; windows larger than 64 KiB are dropped rather than returned to the pool.
 
 > **Note on value width:** like the C default configuration, the scalar value
 > type is 64-bit (`uint64` / `int64`), so varint encodings match byte-for-byte
