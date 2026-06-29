@@ -29,7 +29,7 @@ unit tests here use the exact byte vectors from the
 (`test/c/test_ostream.c`) to guarantee byte-for-byte interoperability with the
 C, C++ and Rust implementations.
 
-Module path: `github.com/sofa-buffers/corelib-go` · package `sofab`.
+Module path: `github.com/sofa-buffers/corelib-go` · package `sofab`. Requires Go 1.21+.
 
 ```bash
 go get github.com/sofa-buffers/corelib-go
