@@ -86,17 +86,6 @@ jobs:
           printf '{"schemaVersion":1,"label":"coverage","message":"%s%%","color":"%s"}\n' \
             "$pct" "$color" > badge/coverage.json
 
-      - name: Convert coverage to LCOV
-        run: |
-          go install github.com/jandelgado/gcov2lcov@latest
-          "$(go env GOPATH)/bin/gcov2lcov" -infile=coverage.out -outfile=lcov.info
-
-      - name: Upload coverage to Coveralls
-        uses: coverallsapp/github-action@v2
-        with:
-          file: lcov.info
-          format: lcov
-
       - name: Publish badge to the badges branch
         # Only from CI runs on main itself: PRs (ref refs/pull/*/merge) and runs
         # on any other branch must not move the published badge.
