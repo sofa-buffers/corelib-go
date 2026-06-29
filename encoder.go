@@ -33,12 +33,16 @@ func (e *Encoder) Flush() error {
 	return e.err
 }
 
+// setErr records err as the sticky error, keeping the first one set so the
+// original failure is what Err and Flush report.
 func (e *Encoder) setErr(err error) {
 	if e.err == nil {
 		e.err = err
 	}
 }
 
+// putVarint writes v as a base-128 varint, least-significant 7-bit group first.
+// It is a no-op once the encoder holds a sticky error.
 func (e *Encoder) putVarint(v uint64) {
 	for {
 		b := byte(v & 0x7F)
@@ -55,12 +59,16 @@ func (e *Encoder) putVarint(v uint64) {
 	}
 }
 
+// putRaw writes data verbatim (no length prefix). It is a no-op once the
+// encoder holds a sticky error.
 func (e *Encoder) putRaw(data []byte) {
 	if e.err == nil {
 		_, e.err = e.w.Write(data)
 	}
 }
 
+// writeHeader writes a field header, the varint (id<<3 | type). It sets
+// ErrArgument when id exceeds IDMax and is a no-op once an error is held.
 func (e *Encoder) writeHeader(id ID, t WireType) {
 	if e.err != nil {
 		return
@@ -94,6 +102,8 @@ func (e *Encoder) WriteBool(id ID, b bool) error {
 	return e.WriteUnsigned(id, 0)
 }
 
+// writeFixlen writes a fixed-length field: the header, then a length-and-subtype
+// varint (len(data)<<3 | sub), then the raw bytes. sub selects float/string/blob.
 func (e *Encoder) writeFixlen(id ID, data []byte, sub uint64) {
 	e.writeHeader(id, TypeFixlen)
 	e.putVarint((uint64(len(data)) << 3) | sub)
