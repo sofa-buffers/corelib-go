@@ -1,7 +1,8 @@
 package sofab_test
 
 // Conformance tests driven by the shared, language-agnostic vector suite
-// (assets/test_vectors.json, copied verbatim from the documentation repo).
+// (assets/test_vectors.json, copied verbatim from corelib-c-cpp/assets, which
+// generates the vectors and is their authoritative source of truth).
 // Each vector is replayed through the encoder (bytes must equal serialized.hex)
 // and fed through the decoder (recovered values must equal the fields).
 
