@@ -41,7 +41,7 @@ func (d *Decoder) Accept(v Visitor) error {
 		return err
 	}
 	c := cursor{buf: buf}
-	return c.accept(v, false)
+	return c.accept(v, 0)
 }
 
 // AcceptBytes decodes a complete message already held in one contiguous buffer,
@@ -52,7 +52,7 @@ func (d *Decoder) Accept(v Visitor) error {
 // must copy any it keeps past the call.
 func AcceptBytes(buf []byte, v Visitor) error {
 	c := cursor{buf: buf}
-	return c.accept(v, false)
+	return c.accept(v, 0)
 }
 
 // slurp reads everything still pending into a single buffer. When the source

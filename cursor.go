@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"io"
 	"math"
+	"unicode/utf8"
 )
 
 // cursor parses a Sofab message by advancing an index over a single contiguous
@@ -68,20 +69,26 @@ func (c *cursor) fixlenHeader() (length, sub uint64, err error) {
 	return length, sub, nil
 }
 
+// arrayCount reads an array's leading element count. Zero is valid — an empty
+// array (§4.7/§4.8); only a count past arrayMax is rejected as ErrInvalidMsg.
 func (c *cursor) arrayCount() (uint64, error) {
 	n, err := c.uvarint(false)
 	if err != nil {
 		return 0, err
 	}
-	if n == 0 || n > arrayMax {
+	if n > arrayMax {
 		return 0, ErrInvalidMsg
 	}
 	return n, nil
 }
 
-// accept drives v over the buffer. nested reports whether we are inside a
-// sequence (so a clean end-of-buffer is an error, and a sequence-end returns).
-func (c *cursor) accept(v Visitor, nested bool) error {
+// accept drives v over the buffer. depth is the number of sequences currently
+// open (0 at the top level); when depth > 0 we are nested, so a clean
+// end-of-buffer is an error and a sequence-end returns. Recursion is bounded by
+// MaxDepth so a hostile, deeply nested message is rejected rather than
+// overflowing the Go stack (§4.9).
+func (c *cursor) accept(v Visitor, depth int) error {
+	nested := depth > 0
 	for {
 		h, err := c.uvarint(true)
 		if err != nil {
@@ -154,11 +161,14 @@ func (c *cursor) accept(v Visitor, nested bool) error {
 				return err
 			}
 		case TypeSequenceStart:
+			if depth >= MaxDepth {
+				return ErrInvalidMsg // nesting past MaxDepth (§4.9)
+			}
 			child, err := v.BeginSequence(id)
 			if err != nil {
 				return err
 			}
-			if err := c.accept(child, true); err != nil {
+			if err := c.accept(child, depth+1); err != nil {
 				return err
 			}
 			if err := child.EndSequence(); err != nil {
@@ -204,6 +214,9 @@ func (c *cursor) acceptFixlen(v Visitor, id ID) error {
 		if err != nil {
 			return err
 		}
+		if !utf8.Valid(b) {
+			return ErrInvalidMsg // invalid UTF-8 (§6.3)
+		}
 		return v.String(id, string(b))
 	case fixBlob:
 		b, err := c.take(n)
@@ -220,6 +233,14 @@ func (c *cursor) acceptFixlenArray(v Visitor, id ID) error {
 	n, err := c.arrayCount()
 	if err != nil {
 		return err
+	}
+	if n == 0 {
+		// A zero-count fixlen array carries no fixlen_word (§4.8), so the
+		// element subtype is absent from the wire — an empty fp32 array and an
+		// empty fp64 array are byte-identical. Generated code keys on the field
+		// id, not the visitor method, so the empty slice is delivered as
+		// Float32Array by convention.
+		return v.Float32Array(id, []float32{})
 	}
 	h, err := c.uvarint(false)
 	if err != nil {

@@ -12,8 +12,9 @@ import (
 // no-ops and the same error is returned, so generated Marshal code can issue a
 // run of writes and check only the final Flush.
 type Encoder struct {
-	w   *bufio.Writer
-	err error
+	w     *bufio.Writer
+	err   error
+	depth int
 }
 
 // NewEncoder returns an Encoder writing to w.
@@ -138,24 +139,36 @@ func (e *Encoder) WriteBytes(id ID, data []byte) error {
 	return e.err
 }
 
-// WriteSequenceBegin opens a nested sequence with the given field id.
+// WriteSequenceBegin opens a nested sequence with the given field id. Opening
+// would-be sequence number MaxDepth+1 is rejected with ErrArgument and writes no
+// bytes, so the wire never nests deeper than MaxDepth (§4.9).
 func (e *Encoder) WriteSequenceBegin(id ID) error {
+	if e.err != nil {
+		return e.err
+	}
+	if e.depth >= MaxDepth {
+		e.setErr(ErrArgument)
+		return e.err
+	}
 	e.writeHeader(id, TypeSequenceStart)
+	if e.err == nil {
+		e.depth++
+	}
 	return e.err
 }
 
 // WriteSequenceEnd closes the most recently opened nested sequence.
 func (e *Encoder) WriteSequenceEnd() error {
 	e.writeHeader(0, TypeSequenceEnd)
+	if e.err == nil && e.depth > 0 {
+		e.depth--
+	}
 	return e.err
 }
 
-// WriteUnsignedArray writes an array of unsigned integers.
+// WriteUnsignedArray writes an array of unsigned integers. An empty array is
+// valid and emits exactly [header][count=0] (§4.7).
 func WriteUnsignedArray[T Unsigned](e *Encoder, id ID, a []T) error {
-	if len(a) == 0 {
-		e.setErr(ErrArgument)
-		return e.err
-	}
 	e.writeHeader(id, TypeVarintArrayUnsigned)
 	e.putVarint(uint64(len(a)))
 	for _, x := range a {
@@ -164,12 +177,9 @@ func WriteUnsignedArray[T Unsigned](e *Encoder, id ID, a []T) error {
 	return e.err
 }
 
-// WriteSignedArray writes an array of signed integers.
+// WriteSignedArray writes an array of signed integers. An empty array is valid
+// and emits exactly [header][count=0] (§4.7).
 func WriteSignedArray[T Signed](e *Encoder, id ID, a []T) error {
-	if len(a) == 0 {
-		e.setErr(ErrArgument)
-		return e.err
-	}
 	e.writeHeader(id, TypeVarintArraySigned)
 	e.putVarint(uint64(len(a)))
 	for _, x := range a {
@@ -178,14 +188,14 @@ func WriteSignedArray[T Signed](e *Encoder, id ID, a []T) error {
 	return e.err
 }
 
-// WriteFloat32Array writes an array of 32-bit floats.
+// WriteFloat32Array writes an array of 32-bit floats. An empty array is valid
+// and emits exactly [header][count=0] — no fixlen_word, no payload (§4.8).
 func (e *Encoder) WriteFloat32Array(id ID, a []float32) error {
-	if len(a) == 0 {
-		e.setErr(ErrArgument)
-		return e.err
-	}
 	e.writeHeader(id, TypeFixlenArray)
 	e.putVarint(uint64(len(a)))
+	if len(a) == 0 {
+		return e.err
+	}
 	e.putVarint((4 << 3) | fixFp32)
 	var b [4]byte
 	for _, f := range a {
@@ -195,14 +205,14 @@ func (e *Encoder) WriteFloat32Array(id ID, a []float32) error {
 	return e.err
 }
 
-// WriteFloat64Array writes an array of 64-bit floats.
+// WriteFloat64Array writes an array of 64-bit floats. An empty array is valid
+// and emits exactly [header][count=0] — no fixlen_word, no payload (§4.8).
 func (e *Encoder) WriteFloat64Array(id ID, a []float64) error {
-	if len(a) == 0 {
-		e.setErr(ErrArgument)
-		return e.err
-	}
 	e.writeHeader(id, TypeFixlenArray)
 	e.putVarint(uint64(len(a)))
+	if len(a) == 0 {
+		return e.err
+	}
 	e.putVarint((8 << 3) | fixFp64)
 	var b [8]byte
 	for _, f := range a {
