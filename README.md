@@ -24,10 +24,11 @@ primitives here, the same way protobuf-go's generated code calls its runtime.
 
 The wire format is specified, language-neutrally, in the
 [SofaBuffers documentation](https://github.com/sofa-buffers/documentation). The
-unit tests here use the exact byte vectors from the
-[C corelib](https://github.com/sofa-buffers/corelib-c-cpp)'s reference suite
-(`test/c/test_ostream.c`) to guarantee byte-for-byte interoperability with the
-C, C++ and Rust implementations.
+unit tests here use the exact byte vectors from `assets/test_vectors.json`,
+copied verbatim from the
+[C corelib](https://github.com/sofa-buffers/corelib-c-cpp)'s `assets/` folder
+(which generates them and is their authoritative source) to guarantee
+byte-for-byte interoperability with the C, C++ and Rust implementations.
 
 Module path: `github.com/sofa-buffers/corelib-go` · package `sofab`. Requires Go 1.21+.
 
@@ -41,7 +42,7 @@ go get github.com/sofa-buffers/corelib-go
 |------|-----|
 | Streaming **out** | [`Encoder`] writes to any `io.Writer` (buffered), so a message can exceed RAM and stream straight to a socket or file. |
 | Streaming **in** | [`Decoder`] is a pull parser over any `io.Reader`; `Next()` returns one field header at a time, never materializing the whole message. |
-| Two decode styles | Pull with `Decoder.Next` (power users, true streaming), or implement [`Visitor`] and call `Decoder.Accept` — the visitor binds each field straight into a struct member, which is what generated `Unmarshal` code uses. `Accept` is also fully streaming: it walks a small refillable window and never holds the whole message. `AcceptBytes` is the zero-copy form for a message already in an in-memory `[]byte`. |
+| Two decode styles | Pull with `Decoder.Next` (power users, true streaming — holds only one field at a time), or implement [`Visitor`] and call `Decoder.Accept` — the visitor binds each field straight into a struct member, which is what generated `Unmarshal` code uses. `Accept` reads the message into one contiguous buffer and runs a cursor over it (the throughput path), so it does hold the whole message; `AcceptBytes` is the zero-copy form for a message already in an in-memory `[]byte`. For decoding a source larger than RAM, use the pull parser. |
 | No dependencies | Standard library only (`bufio`, `encoding/binary`, `io`, `math`, `errors`). No third-party modules, no `cgo`. |
 | Sticky errors | The encoder records the first failure and turns later writes into no-ops, so generated `Marshal` code can issue a run of writes and check once at `Flush`. |
 | Generics for arrays | `WriteUnsignedArray[T]` / `ReadUnsignedArray[T]` (and signed variants) accept any `~uint8..~uint64` / `~int8..~int64` element type; float arrays have dedicated methods. |
@@ -118,14 +119,14 @@ var s sensor
 err := sofab.NewDecoder(r).Accept(&s)
 ```
 
-Both the pull (`Next`) and visitor (`Accept`) paths stream: they hold only a
-small window plus the value of the field currently being delivered — never the
-whole message — so either can decode a source larger than RAM and suspend/resume
-at any byte boundary. `Accept` drives the decode kernel over a refillable window
-(recycled across calls via a `sync.Pool`); `Next` instead returns control to the
-caller between fields. When the message is already a `[]byte`,
-`sofab.AcceptBytes(buf, v)` parses it in place with no copy and no refill — the
-zero-copy path generated `Unmarshal` code uses (see **Memory handling** below).
+The pull parser (`Next`) is the streaming decode path: it holds only the value
+of the field currently being delivered — never the whole message — so it can
+decode a source larger than RAM and suspend/resume at any byte boundary. The
+visitor path is the throughput path: `Accept` reads the whole message into one
+contiguous buffer and advances the decode kernel (a cursor) over it, so it does
+buffer the entire message in memory. When the message is already a `[]byte`,
+`sofab.AcceptBytes(buf, v)` parses it in place with no copy — the zero-copy path
+generated `Unmarshal` code uses (see **Memory handling** below).
 
 ## API summary
 
@@ -179,9 +180,10 @@ calling one typed method per field.
 Visitor array methods always receive the value widened to the 64-bit domain
 (`[]uint64` / `[]int64`) or the concrete float slice; generated code narrows to
 its declared element width. The pull array helpers narrow during the read via the
-generic `T`. Entry points: `Accept(v Visitor) error` (streams from the
-`Decoder`'s `io.Reader`) and the package function `AcceptBytes(buf []byte, v
-Visitor) error` (zero-copy over an in-memory message).
+generic `T`. Entry points: `Accept(v Visitor) error` (reads the whole message
+from the `Decoder`'s `io.Reader` into one buffer, then dispatches) and the
+package function `AcceptBytes(buf []byte, v Visitor) error` (zero-copy over an
+in-memory message).
 
 ### Allowed types
 
@@ -222,23 +224,24 @@ issues a run of writes and checks once. You **must call `Flush`** to push the ta
 of the bufio buffer to the sink (and to surface a late write error); `Err`
 returns the first error without flushing.
 
-**Decoder (read).** All three entry points are streaming, but they differ in
-whether returned bytes are copies the caller owns or slices that alias internal
-storage:
+**Decoder (read).** The pull path streams; the visitor entry points buffer the
+message for throughput. They also differ in whether returned bytes are copies the
+caller owns or slices that alias internal storage:
 
 | Path | Input | Buffering | string / blob result | array & scalar result |
 |------|-------|-----------|-----------------------|-----------------------|
-| `Decoder.Next` (pull) | any `io.Reader` (lazily wrapped in `bufio.Reader`) | streams one field at a time; whole message never held | **fresh copy** — `String()` and `Bytes()` allocate and the caller owns the result | freshly allocated `[]T` the caller owns |
-| `Decoder.Accept` (visitor) | the `Decoder`'s `io.Reader` | streams over a small refillable window (4 KiB, pooled via `sync.Pool`); whole message never held | `String` → **fresh copy** (safe to keep); `Bytes` → **alias of the transient window**, valid only for the duration of that call — a visitor that keeps it **must copy** | freshly allocated slice the visitor owns |
-| `AcceptBytes` (visitor, zero-copy) | a caller-owned `[]byte` | no copy, no refill — the parser advances directly over your buffer | `String` → **fresh copy**; `Bytes` → **alias into the caller's `[]byte`** — zero-copy, so the input buffer **must stay alive** as long as the blob is referenced | freshly allocated slice the visitor owns |
+| `Decoder.Next` (pull) | any `io.Reader` (lazily wrapped in `bufio.Reader`) | streams one field at a time; whole message never held — decodes sources larger than RAM | **fresh copy** — `String()` and `Bytes()` allocate and the caller owns the result | freshly allocated `[]T` the caller owns |
+| `Decoder.Accept` (visitor) | the `Decoder`'s `io.Reader` | reads the whole message into one contiguous buffer, then runs a cursor over it — the whole message is held in memory | `String` → **fresh copy** (safe to keep); `Bytes` → **alias of the read buffer**, valid only for the duration of that call — a visitor that keeps it **must copy** | freshly allocated slice the visitor owns |
+| `AcceptBytes` (visitor, zero-copy) | a caller-owned `[]byte` | no copy — the parser advances directly over your buffer | `String` → **fresh copy**; `Bytes` → **alias into the caller's `[]byte`** — zero-copy, so the input buffer **must stay alive** as long as the blob is referenced | freshly allocated slice the visitor owns |
 
-Takeaways: `Next` is the safe-by-default path — every value is a copy the caller
-owns. `Accept` and `AcceptBytes` are faster but only string values are copied;
-**blob (`Bytes`) values alias** — the transient window (`Accept`) or the caller's
-buffer (`AcceptBytes`) — so a visitor that retains a blob past the call (or past
-the buffer's lifetime) must copy it. Numeric arrays are always freshly allocated
-on every path. For `Accept`, an oversized single value temporarily grows the
-window; windows larger than 64 KiB are dropped rather than returned to the pool.
+Takeaways: `Next` is the safe-by-default *and* streaming path — every value is a
+copy the caller owns and the whole message is never held. `Accept` and
+`AcceptBytes` are faster but buffer the whole message (`Accept` slurps it;
+`AcceptBytes` requires it up front) and only string values are copied; **blob
+(`Bytes`) values alias** — the read buffer (`Accept`) or the caller's buffer
+(`AcceptBytes`) — so a visitor that retains a blob past the call (or past the
+buffer's lifetime) must copy it. Numeric arrays are always freshly allocated on
+every path.
 
 > **Note on value width:** like the C default configuration, the scalar value
 > type is 64-bit (`uint64` / `int64`), so varint encodings match byte-for-byte

@@ -104,16 +104,60 @@ func TestWriteBoolFalse(t *testing.T) {
 	}
 }
 
-func TestEmptyArraysAreArgumentErrors(t *testing.T) {
-	e := sofab.NewEncoder(io.Discard)
-	if err := sofab.WriteSignedArray(e, 1, []int32{}); !errors.Is(err, sofab.ErrArgument) {
-		t.Fatalf("signed empty = %v", err)
+// TestEmptyArraysRoundTripPull confirms zero-count arrays (now legal, §4.7/§4.8)
+// decode back to empty slices on the pull path, and that skipping them resyncs
+// onto the following field.
+func TestEmptyArraysRoundTripPull(t *testing.T) {
+	got := encode(t, func(e *sofab.Encoder) {
+		sofab.WriteUnsignedArray(e, 1, []uint32{})
+		sofab.WriteSignedArray(e, 2, []int32{})
+		e.WriteFloat32Array(3, nil)
+		e.WriteFloat64Array(4, nil)
+	})
+
+	d := newDec(got)
+	mustNext(t, d)
+	if a, err := sofab.ReadUnsignedArray[uint32](d); err != nil || len(a) != 0 {
+		t.Fatalf("unsigned empty = %v %v, want [] nil", a, err)
 	}
-	if err := e.WriteFloat32Array(2, nil); !errors.Is(err, sofab.ErrArgument) {
-		t.Fatalf("float32 empty = %v", err)
+	mustNext(t, d)
+	if a, err := sofab.ReadSignedArray[int32](d); err != nil || len(a) != 0 {
+		t.Fatalf("signed empty = %v %v, want [] nil", a, err)
 	}
-	if err := e.WriteFloat64Array(3, nil); !errors.Is(err, sofab.ErrArgument) {
-		t.Fatalf("float64 empty = %v", err)
+	mustNext(t, d)
+	if a, err := d.ReadFloat32Array(); err != nil || len(a) != 0 {
+		t.Fatalf("fp32 empty = %v %v, want [] nil", a, err)
+	}
+	mustNext(t, d)
+	if a, err := d.ReadFloat64Array(); err != nil || len(a) != 0 {
+		t.Fatalf("fp64 empty = %v %v, want [] nil", a, err)
+	}
+
+	// Skipping all four (via Next's auto-skip) must resync to a clean EOF.
+	d2 := newDec(got)
+	for {
+		_, err := d2.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("skip-walk over empty arrays: %v", err)
+		}
+	}
+
+	// A trailing field after the empty arrays must still be reachable after skip.
+	got2 := encode(t, func(e *sofab.Encoder) {
+		e.WriteFloat32Array(3, nil)
+		e.WriteUnsigned(5, 42)
+	})
+	d3 := newDec(got2)
+	mustNext(t, d3) // the empty fp32 array, left unconsumed
+	f := mustNext(t, d3)
+	if f.ID != 5 || f.Type != sofab.TypeVarintUnsigned {
+		t.Fatalf("resync field = %+v, want id 5 unsigned", f)
+	}
+	if v, err := d3.Unsigned(); err != nil || v != 42 {
+		t.Fatalf("resync value = %v %v, want 42 nil", v, err)
 	}
 }
 

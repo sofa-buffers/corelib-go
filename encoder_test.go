@@ -194,10 +194,25 @@ func TestWriteNestedSequenceWithArray(t *testing.T) {
 	wantBytes(t, got, []byte{0x00, 0x2A, 0x1E, 0x00, 0x2A, 0x1C, 0x03, 0x53, 0x55, 0x57, 0x07, 0x11, 0x53})
 }
 
-func TestEmptyArrayIsArgumentError(t *testing.T) {
-	var buf bytes.Buffer
-	e := sofab.NewEncoder(&buf)
-	if err := sofab.WriteUnsignedArray(e, 0, []uint32{}); !errors.Is(err, sofab.ErrArgument) {
-		t.Fatalf("want ErrArgument, got %v", err)
-	}
+// TestEmptyArraysEncode verifies the §4.7/§4.8 zero-count wire forms: an empty
+// integer array is exactly [header][count=0], and an empty fixlen array carries
+// NO fixlen_word and NO payload — also exactly [header][count=0].
+func TestEmptyArraysEncode(t *testing.T) {
+	// unsigned array, id 0: header (0<<3)|0b011 = 0x03, then count 0x00.
+	wantBytes(t, encode(t, func(e *sofab.Encoder) {
+		sofab.WriteUnsignedArray(e, 0, []uint32{})
+	}), []byte{0x03, 0x00})
+	// signed array, id 0: header (0<<3)|0b100 = 0x04, then count 0x00.
+	wantBytes(t, encode(t, func(e *sofab.Encoder) {
+		sofab.WriteSignedArray(e, 0, []int32{})
+	}), []byte{0x04, 0x00})
+	// fp32 array, id 0: header (0<<3)|0b101 = 0x05, count 0x00, no fixlen_word.
+	wantBytes(t, encode(t, func(e *sofab.Encoder) {
+		e.WriteFloat32Array(0, nil)
+	}), []byte{0x05, 0x00})
+	// fp64 array, id 0: same two bytes — the absent fixlen_word makes empty fp32
+	// and fp64 arrays byte-identical on the wire.
+	wantBytes(t, encode(t, func(e *sofab.Encoder) {
+		e.WriteFloat64Array(0, nil)
+	}), []byte{0x05, 0x00})
 }

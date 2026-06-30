@@ -1,7 +1,8 @@
 // Package sofab is the Go core library for the SofaBuffers (Sofab) serialization
-// format — a compact, streaming, TLV-like binary format. See ARCHITECTURE.md at
-// the repository root for the language-neutral wire-format specification; this
-// package reproduces it byte-for-byte (the tests use the C reference vectors).
+// format — a compact, streaming, TLV-like binary format. See the language-neutral
+// wire-format specification in the SofaBuffers documentation repository
+// (https://github.com/sofa-buffers/documentation); this package reproduces it
+// byte-for-byte (the tests use the shared C-generated reference vectors).
 //
 // # Layers
 //

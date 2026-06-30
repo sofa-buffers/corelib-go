@@ -307,12 +307,12 @@ func TestVisitorMalformed(t *testing.T) {
 		"fixlen array header":   append(vhdr(1, sofab.TypeFixlenArray), append(vbytes(1), 0x80)...),
 		"fp64 array payload":    append(vhdr(1, sofab.TypeFixlenArray), append(vbytes(1), append(vbytes((8<<3)|0x1), 0, 0, 0, 0, 0, 0, 0)...)...),
 		// cursor-specific boundaries: a value expected exactly at end-of-buffer,
-		// a varint that overflows 64 bits while reading the next header, a fixlen
-		// length past the cap, and a zero-count array.
+		// a varint that overflows 64 bits while reading the next header, and a
+		// fixlen length past the cap. (A zero-count array is no longer malformed
+		// — see TestVisitorEmptyArrays — so it is not listed here.)
 		"value at buffer end":    vhdr(1, sofab.TypeVarintUnsigned),
 		"header varint overflow": bytes.Repeat([]byte{0x80}, 11),
 		"fixlen length over max": append(vhdr(1, sofab.TypeFixlen), vbytes((uint64(sofab.IDMax+1)<<3)|subStr)...),
-		"array count zero":       append(vhdr(1, sofab.TypeVarintArrayUnsigned), vbytes(0)...),
 	}
 	for name, in := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -321,6 +321,116 @@ func TestVisitorMalformed(t *testing.T) {
 				t.Fatalf("Accept = %v, want ErrInvalidMsg", err)
 			}
 		})
+	}
+}
+
+// TestVisitorEmptyArrays confirms the visitor path delivers zero-count arrays as
+// empty slices (§4.7/§4.8). An empty fixlen array carries no subtype on the wire,
+// so it is delivered as Float32Array regardless of the encoder's declared kind.
+func TestVisitorEmptyArrays(t *testing.T) {
+	in := encode(t, func(e *sofab.Encoder) {
+		sofab.WriteUnsignedArray(e, 1, []uint32{})
+		sofab.WriteSignedArray(e, 2, []int32{})
+		e.WriteFloat32Array(3, nil)
+		e.WriteFloat64Array(4, nil)
+	})
+	var log []string
+	if err := newDec(in).Accept(recorder{&log}); err != nil {
+		t.Fatalf("Accept = %v", err)
+	}
+	want := []string{evAU(1, nil), evAS(2, nil), evAF32(3, nil), evAF32(4, nil)}
+	if strings.Join(log, "|") != strings.Join(want, "|") {
+		t.Fatalf("events = %v, want %v", log, want)
+	}
+}
+
+// TestDeepNestingRejected covers MAX_DEPTH = 255 (§4.9/§6.2): the encoder refuses
+// a 256th nested sequence, and both decode paths reject an over-deep adversarial
+// message with ErrInvalidMsg rather than overflowing the Go stack.
+func TestDeepNestingRejected(t *testing.T) {
+	// Encoder caps at MaxDepth open sequences.
+	e := sofab.NewEncoder(io.Discard)
+	for i := 0; i < sofab.MaxDepth; i++ {
+		if err := e.WriteSequenceBegin(0); err != nil {
+			t.Fatalf("begin %d = %v", i, err)
+		}
+	}
+	if err := e.WriteSequenceBegin(0); !errors.Is(err, sofab.ErrArgument) {
+		t.Fatalf("256th begin = %v, want ErrArgument", err)
+	}
+
+	// 0x06 = sequence start, id 0; a long run nests far past MaxDepth.
+	deep := bytes.Repeat([]byte{0x06}, 100000)
+	if err := sofab.AcceptBytes(deep, baseV{}); !errors.Is(err, sofab.ErrInvalidMsg) {
+		t.Fatalf("AcceptBytes deep = %v, want ErrInvalidMsg", err)
+	}
+	d := newDec(deep)
+	if _, err := d.Next(); err != nil {
+		t.Fatalf("first Next = %v", err)
+	}
+	if err := d.Skip(); !errors.Is(err, sofab.ErrInvalidMsg) {
+		t.Fatalf("pull Skip deep = %v, want ErrInvalidMsg", err)
+	}
+}
+
+// TestMaxDepthRoundTrip confirms a message nested exactly MaxDepth deep still
+// encodes and decodes on both paths.
+func TestMaxDepthRoundTrip(t *testing.T) {
+	got := encode(t, func(e *sofab.Encoder) {
+		for i := 0; i < sofab.MaxDepth; i++ {
+			e.WriteSequenceBegin(1)
+		}
+		e.WriteUnsigned(2, 7)
+		for i := 0; i < sofab.MaxDepth; i++ {
+			e.WriteSequenceEnd()
+		}
+	})
+	if err := sofab.AcceptBytes(got, baseV{}); err != nil {
+		t.Fatalf("AcceptBytes 255-deep = %v", err)
+	}
+	d := newDec(got)
+	depth := 0
+	for {
+		f, err := d.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("Next = %v", err)
+		}
+		switch f.Type {
+		case sofab.TypeSequenceStart:
+			depth++
+		case sofab.TypeSequenceEnd:
+			depth--
+		case sofab.TypeVarintUnsigned:
+			if v, _ := d.Unsigned(); v != 7 {
+				t.Fatalf("inner unsigned = %d, want 7", v)
+			}
+		}
+	}
+	if depth != 0 {
+		t.Fatalf("unbalanced sequence depth = %d", depth)
+	}
+}
+
+// TestInvalidUTF8Rejected covers §6.3: a string field whose payload is not valid
+// UTF-8 is rejected as ErrInvalidMsg on both decode paths (blobs stay unchecked).
+func TestInvalidUTF8Rejected(t *testing.T) {
+	// fixlen string, length 1, payload 0xFF (an invalid UTF-8 byte).
+	in := append(vhdr(1, sofab.TypeFixlen), append(vbytes((1<<3)|subStr), 0xFF)...)
+	d := newDec(in)
+	mustNext(t, d)
+	if _, err := d.String(); !errors.Is(err, sofab.ErrInvalidMsg) {
+		t.Fatalf("pull String invalid utf8 = %v, want ErrInvalidMsg", err)
+	}
+	if err := sofab.AcceptBytes(in, baseV{}); !errors.Is(err, sofab.ErrInvalidMsg) {
+		t.Fatalf("visitor invalid utf8 = %v, want ErrInvalidMsg", err)
+	}
+	// A blob with the same payload is fine (blobs are opaque).
+	blob := append(vhdr(1, sofab.TypeFixlen), append(vbytes((1<<3)|subBlob), 0xFF)...)
+	if err := sofab.AcceptBytes(blob, baseV{}); err != nil {
+		t.Fatalf("visitor blob 0xFF = %v, want nil", err)
 	}
 }
 

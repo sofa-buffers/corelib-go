@@ -164,11 +164,13 @@ func TestDecodeNestedSequence(t *testing.T) {
 
 // --- error cases ------------------------------------------------------------
 
-func TestArrayCountZeroInvalid(t *testing.T) {
-	d := newDec([]byte{0x03, 0x00})
+// TestArrayCountZeroIsEmpty confirms a zero-count array is now valid (§4.7) and
+// decodes to an empty, non-error slice — exactly the bytes [header][count=0].
+func TestArrayCountZeroIsEmpty(t *testing.T) {
+	d := newDec([]byte{0x03, 0x00}) // id 0, unsigned array, count 0
 	d.Next()
-	if _, err := sofab.ReadUnsignedArray[uint32](d); !errors.Is(err, sofab.ErrInvalidMsg) {
-		t.Fatalf("want ErrInvalidMsg, got %v", err)
+	if a, err := sofab.ReadUnsignedArray[uint32](d); err != nil || len(a) != 0 {
+		t.Fatalf("want [] nil, got %v %v", a, err)
 	}
 }
 

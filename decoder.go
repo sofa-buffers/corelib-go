@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"io"
 	"math"
+	"unicode/utf8"
 )
 
 // Decoder is a pull parser for a Sofab byte stream read from an io.Reader.
@@ -201,11 +202,15 @@ func (d *Decoder) Float64() (float64, error) {
 	return math.Float64frombits(binary.LittleEndian.Uint64(buf)), nil
 }
 
-// String consumes the current field as a string.
+// String consumes the current field as a string. A payload that is not valid
+// UTF-8 is rejected as ErrInvalidMsg (§6.3).
 func (d *Decoder) String() (string, error) {
 	b, err := d.fixlenBytes(fixStr)
 	if err != nil {
 		return "", err
+	}
+	if !utf8.Valid(b) {
+		return "", ErrInvalidMsg
 	}
 	return string(b), nil
 }
@@ -254,6 +259,9 @@ func (d *Decoder) Skip() error {
 			switch f.Type {
 			case TypeSequenceStart:
 				depth++
+				if depth > MaxDepth {
+					return ErrInvalidMsg
+				}
 			case TypeSequenceEnd:
 				depth--
 			default:
@@ -302,6 +310,9 @@ func (d *Decoder) skipValue() error {
 		if err != nil {
 			return err
 		}
+		if n == 0 {
+			return nil // empty fixlen array: no fixlen_word, no payload (§4.8)
+		}
 		h, err := d.readVarint(false)
 		if err != nil {
 			return err
@@ -313,14 +324,14 @@ func (d *Decoder) skipValue() error {
 	return nil
 }
 
-// arrayCount reads an array's leading element count. Zero (arrays are never
-// empty on the wire) or a count past arrayMax is rejected as ErrInvalidMsg.
+// arrayCount reads an array's leading element count. Zero is valid — an empty
+// array (§4.7/§4.8); only a count past arrayMax is rejected as ErrInvalidMsg.
 func (d *Decoder) arrayCount() (uint64, error) {
 	n, err := d.readVarint(false)
 	if err != nil {
 		return 0, err
 	}
-	if n == 0 || n > arrayMax {
+	if n > arrayMax {
 		return 0, ErrInvalidMsg
 	}
 	return n, nil
@@ -377,6 +388,10 @@ func (d *Decoder) ReadFloat32Array() ([]float32, error) {
 	if err != nil {
 		return nil, err
 	}
+	if n == 0 {
+		d.needConsume = false
+		return []float32{}, nil // empty fixlen array: no fixlen_word (§4.8)
+	}
 	h, err := d.readVarint(false)
 	if err != nil {
 		return nil, err
@@ -404,6 +419,10 @@ func (d *Decoder) ReadFloat64Array() ([]float64, error) {
 	n, err := d.arrayCount()
 	if err != nil {
 		return nil, err
+	}
+	if n == 0 {
+		d.needConsume = false
+		return []float64{}, nil // empty fixlen array: no fixlen_word (§4.8)
 	}
 	h, err := d.readVarint(false)
 	if err != nil {

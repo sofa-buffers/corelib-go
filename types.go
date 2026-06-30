@@ -16,6 +16,12 @@ const APIVersion = 1
 // arrayMax bounds array element counts and fixlen byte lengths (INT32_MAX).
 const arrayMax uint64 = 0x7FFF_FFFF
 
+// MaxDepth is the maximum nested-sequence depth (CORELIB_PLAN §4.9/§6.2). An
+// encoder must not open more than MaxDepth nested sequences, and a decoder
+// rejects a message that nests deeper with ErrInvalidMsg rather than risk
+// unbounded recursion / stack growth.
+const MaxDepth = 255
+
 // WireType is the 3-bit field type tag in the low bits of a field header.
 type WireType uint8
 
@@ -58,12 +64,14 @@ type Signed interface {
 // Errors returned by the encoder and decoder. They mirror the C sofab_ret_t
 // codes (write-buffer-full is reported via the underlying io.Writer instead).
 var (
-	// ErrArgument is an invalid caller argument (e.g. id > IDMax, empty array).
+	// ErrArgument is an invalid caller argument (e.g. id > IDMax, or opening a
+	// nested sequence past MaxDepth).
 	ErrArgument = errors.New("sofab: invalid argument")
 	// ErrUsage is invalid API usage (e.g. reading a value as the wrong type).
 	ErrUsage = errors.New("sofab: invalid usage")
 	// ErrInvalidMsg is malformed input (varint overflow, bad type tag,
-	// zero-length array, truncated payload, dangling sequence end, ...).
+	// truncated payload, dangling sequence end, nesting past MaxDepth,
+	// invalid UTF-8 in a string, ...).
 	ErrInvalidMsg = errors.New("sofab: invalid message")
 )
 
