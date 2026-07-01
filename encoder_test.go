@@ -195,8 +195,9 @@ func TestWriteNestedSequenceWithArray(t *testing.T) {
 }
 
 // TestEmptyArraysEncode verifies the §4.7/§4.8 zero-count wire forms: an empty
-// integer array is exactly [header][count=0], and an empty fixlen array carries
-// NO fixlen_word and NO payload — also exactly [header][count=0].
+// integer array is exactly [header][count=0] (no fixlen_word — element width is
+// API-only), while an empty fixlen array still carries its fixlen_word (but no
+// payload), so empty fp32 and fp64 arrays stay distinguishable on the wire.
 func TestEmptyArraysEncode(t *testing.T) {
 	// unsigned array, id 0: header (0<<3)|0b011 = 0x03, then count 0x00.
 	wantBytes(t, encode(t, func(e *sofab.Encoder) {
@@ -206,13 +207,14 @@ func TestEmptyArraysEncode(t *testing.T) {
 	wantBytes(t, encode(t, func(e *sofab.Encoder) {
 		sofab.WriteSignedArray(e, 0, []int32{})
 	}), []byte{0x04, 0x00})
-	// fp32 array, id 0: header (0<<3)|0b101 = 0x05, count 0x00, no fixlen_word.
+	// fp32 array, id 0: header (0<<3)|0b101 = 0x05, count 0x00, fixlen_word
+	// (4<<3)|fp32 = 0x20.
 	wantBytes(t, encode(t, func(e *sofab.Encoder) {
 		e.WriteFloat32Array(0, nil)
-	}), []byte{0x05, 0x00})
-	// fp64 array, id 0: same two bytes — the absent fixlen_word makes empty fp32
-	// and fp64 arrays byte-identical on the wire.
+	}), []byte{0x05, 0x00, 0x20})
+	// fp64 array, id 0: header 0x05, count 0x00, fixlen_word (8<<3)|fp64 = 0x41 —
+	// the fixlen_word keeps empty fp32 and fp64 arrays distinct on the wire.
 	wantBytes(t, encode(t, func(e *sofab.Encoder) {
 		e.WriteFloat64Array(0, nil)
-	}), []byte{0x05, 0x00})
+	}), []byte{0x05, 0x00, 0x41})
 }

@@ -310,9 +310,8 @@ func (d *Decoder) skipValue() error {
 		if err != nil {
 			return err
 		}
-		if n == 0 {
-			return nil // empty fixlen array: no fixlen_word, no payload (§4.8)
-		}
+		// A fixlen array always carries its fixlen_word, even when empty (§4.8);
+		// only the payload is elided for a zero count.
 		h, err := d.readVarint(false)
 		if err != nil {
 			return err
@@ -388,16 +387,18 @@ func (d *Decoder) ReadFloat32Array() ([]float32, error) {
 	if err != nil {
 		return nil, err
 	}
-	if n == 0 {
-		d.needConsume = false
-		return []float32{}, nil // empty fixlen array: no fixlen_word (§4.8)
-	}
+	// The fixlen_word is always present, even for an empty array (§4.8), so read
+	// and validate it before the (possibly zero) payload.
 	h, err := d.readVarint(false)
 	if err != nil {
 		return nil, err
 	}
 	if (h&0x07) != fixFp32 || (h>>3) != 4 {
 		return nil, ErrInvalidMsg
+	}
+	if n == 0 {
+		d.needConsume = false
+		return []float32{}, nil
 	}
 	out := make([]float32, n)
 	for i := range out {
@@ -420,16 +421,18 @@ func (d *Decoder) ReadFloat64Array() ([]float64, error) {
 	if err != nil {
 		return nil, err
 	}
-	if n == 0 {
-		d.needConsume = false
-		return []float64{}, nil // empty fixlen array: no fixlen_word (§4.8)
-	}
+	// The fixlen_word is always present, even for an empty array (§4.8), so read
+	// and validate it before the (possibly zero) payload.
 	h, err := d.readVarint(false)
 	if err != nil {
 		return nil, err
 	}
 	if (h&0x07) != fixFp64 || (h>>3) != 8 {
 		return nil, ErrInvalidMsg
+	}
+	if n == 0 {
+		d.needConsume = false
+		return []float64{}, nil
 	}
 	out := make([]float64, n)
 	for i := range out {
