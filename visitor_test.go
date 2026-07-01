@@ -325,8 +325,9 @@ func TestVisitorMalformed(t *testing.T) {
 }
 
 // TestVisitorEmptyArrays confirms the visitor path delivers zero-count arrays as
-// empty slices (§4.7/§4.8). An empty fixlen array carries no subtype on the wire,
-// so it is delivered as Float32Array regardless of the encoder's declared kind.
+// empty slices (§4.7/§4.8). An empty fixlen array still carries its fixlen_word,
+// so its subtype survives on the wire: an empty fp64 array is delivered as
+// Float64Array, not Float32Array.
 func TestVisitorEmptyArrays(t *testing.T) {
 	in := encode(t, func(e *sofab.Encoder) {
 		sofab.WriteUnsignedArray(e, 1, []uint32{})
@@ -338,7 +339,7 @@ func TestVisitorEmptyArrays(t *testing.T) {
 	if err := newDec(in).Accept(recorder{&log}); err != nil {
 		t.Fatalf("Accept = %v", err)
 	}
-	want := []string{evAU(1, nil), evAS(2, nil), evAF32(3, nil), evAF32(4, nil)}
+	want := []string{evAU(1, nil), evAS(2, nil), evAF32(3, nil), evAF64(4, nil)}
 	if strings.Join(log, "|") != strings.Join(want, "|") {
 		t.Fatalf("events = %v, want %v", log, want)
 	}

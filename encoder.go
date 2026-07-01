@@ -189,13 +189,11 @@ func WriteSignedArray[T Signed](e *Encoder, id ID, a []T) error {
 }
 
 // WriteFloat32Array writes an array of 32-bit floats. An empty array is valid
-// and emits exactly [header][count=0] — no fixlen_word, no payload (§4.8).
+// and emits exactly [header][count=0][fixlen_word] — the fixlen_word is always
+// present (even when empty) so the element subtype is never ambiguous (§4.8).
 func (e *Encoder) WriteFloat32Array(id ID, a []float32) error {
 	e.writeHeader(id, TypeFixlenArray)
 	e.putVarint(uint64(len(a)))
-	if len(a) == 0 {
-		return e.err
-	}
 	e.putVarint((4 << 3) | fixFp32)
 	var b [4]byte
 	for _, f := range a {
@@ -206,13 +204,11 @@ func (e *Encoder) WriteFloat32Array(id ID, a []float32) error {
 }
 
 // WriteFloat64Array writes an array of 64-bit floats. An empty array is valid
-// and emits exactly [header][count=0] — no fixlen_word, no payload (§4.8).
+// and emits exactly [header][count=0][fixlen_word] — the fixlen_word is always
+// present (even when empty) so the element subtype is never ambiguous (§4.8).
 func (e *Encoder) WriteFloat64Array(id ID, a []float64) error {
 	e.writeHeader(id, TypeFixlenArray)
 	e.putVarint(uint64(len(a)))
-	if len(a) == 0 {
-		return e.err
-	}
 	e.putVarint((8 << 3) | fixFp64)
 	var b [8]byte
 	for _, f := range a {

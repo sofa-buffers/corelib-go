@@ -234,14 +234,9 @@ func (c *cursor) acceptFixlenArray(v Visitor, id ID) error {
 	if err != nil {
 		return err
 	}
-	if n == 0 {
-		// A zero-count fixlen array carries no fixlen_word (§4.8), so the
-		// element subtype is absent from the wire — an empty fp32 array and an
-		// empty fp64 array are byte-identical. Generated code keys on the field
-		// id, not the visitor method, so the empty slice is delivered as
-		// Float32Array by convention.
-		return v.Float32Array(id, []float32{})
-	}
+	// A fixlen array always carries its fixlen_word, even when empty (§4.8), so
+	// the element subtype is always on the wire: an empty fp32 array dispatches
+	// to Float32Array and an empty fp64 array to Float64Array.
 	h, err := c.uvarint(false)
 	if err != nil {
 		return err
