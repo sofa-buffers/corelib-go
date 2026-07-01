@@ -30,10 +30,19 @@ copied verbatim from the
 (which generates them and is their authoritative source) to guarantee
 byte-for-byte interoperability with the C, C++ and Rust implementations.
 
-Module path: `github.com/sofa-buffers/corelib-go` · package `sofab`. Requires Go 1.21+.
+### Package name
+
+The module (go get) path is `github.com/sofa-buffers/corelib-go` — the family
+`sofa-buffers` + `corelib` naming, realized natively by the Go module path.
+Consumers `import "github.com/sofa-buffers/corelib-go"` and use it as package
+`sofab` (the code API namespace). Requires Go 1.21+.
 
 ```bash
 go get github.com/sofa-buffers/corelib-go
+```
+
+```go
+import sofab "github.com/sofa-buffers/corelib-go"
 ```
 
 ## Why this design
