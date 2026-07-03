@@ -1,36 +1,41 @@
 package sofab
 
 import (
-	"bufio"
 	"encoding/binary"
 	"io"
 	"math"
 )
 
-// Encoder writes Sofab fields to an io.Writer. It buffers internally, so call
-// Flush when done. Errors are sticky: once a write fails, subsequent writes are
-// no-ops and the same error is returned, so generated Marshal code can issue a
-// run of writes and check only the final Flush.
+// Encoder writes Sofab fields to an io.Writer. It accumulates the message in an
+// internal byte slice and writes it to the destination in one shot on Flush —
+// advancing over a contiguous buffer instead of pushing each byte through a
+// bufio.Writer interface call. Errors are sticky: once a write fails, subsequent
+// writes are no-ops and the same error is returned, so generated Marshal code
+// can issue a run of writes and check only the final Flush.
 type Encoder struct {
-	w     *bufio.Writer
+	w     io.Writer
+	buf   []byte
 	err   error
 	depth int
 }
 
 // NewEncoder returns an Encoder writing to w.
 func NewEncoder(w io.Writer) *Encoder {
-	return &Encoder{w: bufio.NewWriter(w)}
+	return &Encoder{w: w, buf: make([]byte, 0, 512)}
 }
 
 // Err returns the first error encountered, if any.
 func (e *Encoder) Err() error { return e.err }
 
-// Flush writes any buffered bytes to the underlying writer.
+// Flush writes any buffered bytes to the underlying writer in one Write.
 func (e *Encoder) Flush() error {
 	if e.err != nil {
 		return e.err
 	}
-	e.err = e.w.Flush()
+	if len(e.buf) > 0 {
+		_, e.err = e.w.Write(e.buf)
+		e.buf = e.buf[:0]
+	}
 	return e.err
 }
 
@@ -42,30 +47,50 @@ func (e *Encoder) setErr(err error) {
 	}
 }
 
+// flushThreshold bounds how large the internal buffer grows before it is
+// written out mid-stream. It mirrors bufio's capacity-triggered flush: small
+// messages accumulate and go out in a single Write on Flush, while a large
+// message (or a big blob) drives the destination multiple times and surfaces a
+// write error immediately rather than only at Flush.
+const flushThreshold = 4096
+
+// maybeFlush writes the buffer out and resets it once it grows past the
+// threshold, keeping memory bounded and preserving mid-stream write semantics.
+func (e *Encoder) maybeFlush() {
+	if e.err == nil && len(e.buf) >= flushThreshold {
+		_, e.err = e.w.Write(e.buf)
+		e.buf = e.buf[:0]
+	}
+}
+
 // putVarint writes v as a base-128 varint, least-significant 7-bit group first.
 // It is a no-op once the encoder holds a sticky error.
 func (e *Encoder) putVarint(v uint64) {
+	if e.err != nil {
+		return
+	}
 	for {
 		b := byte(v & 0x7F)
 		v >>= 7
 		if v != 0 {
 			b |= 0x80
 		}
-		if e.err == nil {
-			e.err = e.w.WriteByte(b)
-		}
+		e.buf = append(e.buf, b)
 		if v == 0 {
-			return
+			break
 		}
 	}
+	e.maybeFlush()
 }
 
 // putRaw writes data verbatim (no length prefix). It is a no-op once the
 // encoder holds a sticky error.
 func (e *Encoder) putRaw(data []byte) {
-	if e.err == nil {
-		_, e.err = e.w.Write(data)
+	if e.err != nil {
+		return
 	}
+	e.buf = append(e.buf, data...)
+	e.maybeFlush()
 }
 
 // writeHeader writes a field header, the varint (id<<3 | type). It sets
@@ -127,9 +152,15 @@ func (e *Encoder) WriteFloat64(id ID, f float64) error {
 	return e.err
 }
 
-// WriteString writes a string field (raw UTF-8 bytes, no NUL on the wire).
+// WriteString writes a string field (raw UTF-8 bytes, no NUL on the wire). The
+// bytes are appended straight from the string, with no []byte(s) copy.
 func (e *Encoder) WriteString(id ID, s string) error {
-	e.writeFixlen(id, []byte(s), fixStr)
+	e.writeHeader(id, TypeFixlen)
+	e.putVarint((uint64(len(s)) << 3) | fixStr)
+	if e.err == nil {
+		e.buf = append(e.buf, s...)
+		e.maybeFlush()
+	}
 	return e.err
 }
 
