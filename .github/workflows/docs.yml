@@ -26,7 +26,7 @@ jobs:
       MODULE: github.com/sofa-buffers/corelib-go
       PORT: "6060"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Set up Go
         uses: actions/setup-go@v5
