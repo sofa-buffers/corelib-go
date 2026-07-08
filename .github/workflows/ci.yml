@@ -24,7 +24,7 @@ jobs:
         # Oldest supported (matches go.mod) plus the current stable release.
         go: ['1.21', 'stable']
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -59,7 +59,7 @@ jobs:
     permissions:
       contents: write # to publish the generated badge to the `badges` branch
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Set up Go
         uses: actions/setup-go@v5
