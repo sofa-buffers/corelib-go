@@ -89,6 +89,16 @@ var (
 	// distinct from ErrInvalidMsg so a truncated stream is never conflated with a
 	// malformed one.
 	ErrIncomplete = errors.New("sofab: incomplete message")
+	// ErrLimitExceeded is returned when a decoded field exceeds a limit configured
+	// on the decoder via WithMaxArrayCount, WithMaxStringLen, or WithMaxBlobLen. It
+	// is a *receiver-side policy* decision, not a property of the wire format: the
+	// bytes may be perfectly well-formed, but a locally configured cap rejects
+	// them. It is therefore a distinct sentinel from ErrInvalidMsg — a message
+	// turned away only because it exceeds a locally chosen limit must never be
+	// conflated with a malformed one (e.g. differential fuzzing must not read a
+	// limit rejection as a conformance divergence). Test for it with errors.Is.
+	// With no limits configured (the default) it is never returned.
+	ErrLimitExceeded = errors.New("sofab: decode limit exceeded")
 )
 
 // zigzagEncode maps a signed value to its unsigned varint representation.
