@@ -21,13 +21,14 @@ type cursor struct {
 
 // uvarint reads a base-128 varint at pos. If eofOK, a field boundary with no
 // bytes left is reported as io.EOF (clean end of stream); a varint truncated by
-// the end of the buffer is ErrInvalidMsg.
+// the end of the buffer is ErrIncomplete (INCOMPLETE, §7) — it ran out of bytes
+// mid-field. A varint that exceeds 64 bits is ErrInvalidMsg (malformed).
 func (c *cursor) uvarint(eofOK bool) (uint64, error) {
 	if c.pos >= len(c.buf) {
 		if eofOK {
 			return 0, io.EOF
 		}
-		return 0, ErrInvalidMsg
+		return 0, ErrIncomplete // expected a varint, but the stream ended
 	}
 	var val uint64
 	var shift uint
@@ -40,16 +41,17 @@ func (c *cursor) uvarint(eofOK bool) (uint64, error) {
 		}
 		shift += 7
 		if shift >= 64 {
-			return 0, ErrInvalidMsg
+			return 0, ErrInvalidMsg // varint > 64 bits: malformed
 		}
 	}
-	return 0, ErrInvalidMsg // ran off the end mid-varint
+	return 0, ErrIncomplete // ran off the end mid-varint: truncated, not malformed
 }
 
-// take returns the next n bytes as a subslice of buf (zero-copy) and advances.
+// take returns the next n bytes as a subslice of buf (zero-copy) and advances. A
+// payload shorter than n means the stream ended mid-field: ErrIncomplete (§7).
 func (c *cursor) take(n uint64) ([]byte, error) {
 	if n > uint64(len(c.buf)-c.pos) {
-		return nil, ErrInvalidMsg
+		return nil, ErrIncomplete
 	}
 	b := c.buf[c.pos : c.pos+int(n)]
 	c.pos += int(n)
@@ -84,9 +86,9 @@ func (c *cursor) arrayCount() (uint64, error) {
 
 // accept drives v over the buffer. depth is the number of sequences currently
 // open (0 at the top level); when depth > 0 we are nested, so a clean
-// end-of-buffer is an error and a sequence-end returns. Recursion is bounded by
-// MaxDepth so a hostile, deeply nested message is rejected rather than
-// overflowing the Go stack (§4.9).
+// end-of-buffer means the message stopped inside an open sequence (INCOMPLETE),
+// and a sequence-end returns. Recursion is bounded by MaxDepth so a hostile,
+// deeply nested message is rejected rather than overflowing the Go stack (§4.9).
 func (c *cursor) accept(v Visitor, depth int) error {
 	nested := depth > 0
 	for {
@@ -94,7 +96,7 @@ func (c *cursor) accept(v Visitor, depth int) error {
 		if err != nil {
 			if err == io.EOF {
 				if nested {
-					return ErrInvalidMsg // missing sequence end
+					return ErrIncomplete // ended inside an open sequence (§7)
 				}
 				return nil
 			}

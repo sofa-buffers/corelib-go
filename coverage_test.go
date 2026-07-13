@@ -208,129 +208,153 @@ func TestDecoderTruncatedValues(t *testing.T) {
 		name string
 		in   []byte
 		read func(d *sofab.Decoder) error
+		want error
 	}{
 		{
 			"signed truncated varint",
 			append(vhdr(0, sofab.TypeVarintSigned), 0x80), // continuation bit, then EOF
 			func(d *sofab.Decoder) error { _, err := d.Signed(); return err },
+			sofab.ErrIncomplete,
 		},
 		{
 			"float32 truncated header",
 			append(vhdr(0, sofab.TypeFixlen), 0x80), // truncated length varint
 			func(d *sofab.Decoder) error { _, err := d.Float32(); return err },
+			sofab.ErrIncomplete,
 		},
 		{
 			"float32 truncated payload",
 			append(vhdr(0, sofab.TypeFixlen), append(vbytes((4<<3)|subFP32), 0xAA, 0xBB)...), // 2 of 4 bytes
 			func(d *sofab.Decoder) error { _, err := d.Float32(); return err },
+			sofab.ErrIncomplete,
 		},
 		{
 			"float64 wrong subtype",
 			append(vhdr(0, sofab.TypeFixlen), vbytes((8<<3)|subFP32)...), // len 8 but sub fp32
 			func(d *sofab.Decoder) error { _, err := d.Float64(); return err },
+			sofab.ErrInvalidMsg,
 		},
 		{
 			"float64 truncated header",
 			append(vhdr(0, sofab.TypeFixlen), 0x80),
 			func(d *sofab.Decoder) error { _, err := d.Float64(); return err },
+			sofab.ErrIncomplete,
 		},
 		{
 			"float64 truncated payload",
 			append(vhdr(0, sofab.TypeFixlen), append(vbytes((8<<3)|subFP64), 0x01)...),
 			func(d *sofab.Decoder) error { _, err := d.Float64(); return err },
+			sofab.ErrIncomplete,
 		},
 		{
 			"string truncated header",
 			append(vhdr(0, sofab.TypeFixlen), 0x80),
 			func(d *sofab.Decoder) error { _, err := d.String(); return err },
+			sofab.ErrIncomplete,
 		},
 		{
 			"string truncated payload",
 			append(vhdr(0, sofab.TypeFixlen), append(vbytes((4<<3)|subStr), 'h', 'i')...), // 2 of 4
 			func(d *sofab.Decoder) error { _, err := d.String(); return err },
+			sofab.ErrIncomplete,
 		},
 		{
 			"bytes wrong subtype (string, not blob)",
 			append(vhdr(0, sofab.TypeFixlen), append(vbytes((1<<3)|subStr), 'x')...),
 			func(d *sofab.Decoder) error { _, err := d.Bytes(); return err },
+			sofab.ErrInvalidMsg,
 		},
 		{
 			"fixlen length above max",
 			append(vhdr(0, sofab.TypeFixlen), vbytes((uint64(sofab.IDMax+1)<<3)|subBlob)...),
 			func(d *sofab.Decoder) error { _, err := d.Bytes(); return err },
+			sofab.ErrInvalidMsg,
 		},
 		{
 			"unsigned-array count truncated",
 			append(vhdr(0, sofab.TypeVarintArrayUnsigned), 0x80),
 			func(d *sofab.Decoder) error { _, err := sofab.ReadUnsignedArray[uint32](d); return err },
+			sofab.ErrIncomplete,
 		},
 		{
 			"unsigned-array count above max",
 			append(vhdr(0, sofab.TypeVarintArrayUnsigned), vbytes(uint64(sofab.IDMax)+1)...),
 			func(d *sofab.Decoder) error { _, err := sofab.ReadUnsignedArray[uint32](d); return err },
+			sofab.ErrInvalidMsg,
 		},
 		{
 			"unsigned-array element truncated",
 			append(vhdr(0, sofab.TypeVarintArrayUnsigned), append(vbytes(2), 0x05, 0x80)...), // 2 elems, 2nd truncated
 			func(d *sofab.Decoder) error { _, err := sofab.ReadUnsignedArray[uint32](d); return err },
+			sofab.ErrIncomplete,
 		},
 		{
 			"signed-array count truncated",
 			append(vhdr(0, sofab.TypeVarintArraySigned), 0x80),
 			func(d *sofab.Decoder) error { _, err := sofab.ReadSignedArray[int32](d); return err },
+			sofab.ErrIncomplete,
 		},
 		{
 			"signed-array element truncated",
 			append(vhdr(0, sofab.TypeVarintArraySigned), append(vbytes(2), 0x02, 0x80)...),
 			func(d *sofab.Decoder) error { _, err := sofab.ReadSignedArray[int32](d); return err },
+			sofab.ErrIncomplete,
 		},
 		{
 			"float32-array count truncated",
 			append(vhdr(0, sofab.TypeFixlenArray), 0x80),
 			func(d *sofab.Decoder) error { _, err := d.ReadFloat32Array(); return err },
+			sofab.ErrIncomplete,
 		},
 		{
 			"float32-array header truncated",
 			append(vhdr(0, sofab.TypeFixlenArray), append(vbytes(1), 0x80)...),
 			func(d *sofab.Decoder) error { _, err := d.ReadFloat32Array(); return err },
+			sofab.ErrIncomplete,
 		},
 		{
 			"float32-array wrong element header",
 			append(vhdr(0, sofab.TypeFixlenArray), append(vbytes(1), vbytes((8<<3)|subFP64)...)...),
 			func(d *sofab.Decoder) error { _, err := d.ReadFloat32Array(); return err },
+			sofab.ErrInvalidMsg,
 		},
 		{
 			"float32-array payload truncated",
 			append(vhdr(0, sofab.TypeFixlenArray), append(vbytes(1), append(vbytes((4<<3)|subFP32), 0x00, 0x00)...)...),
 			func(d *sofab.Decoder) error { _, err := d.ReadFloat32Array(); return err },
+			sofab.ErrIncomplete,
 		},
 		{
 			"float64-array count truncated",
 			append(vhdr(0, sofab.TypeFixlenArray), 0x80),
 			func(d *sofab.Decoder) error { _, err := d.ReadFloat64Array(); return err },
+			sofab.ErrIncomplete,
 		},
 		{
 			"float64-array header truncated",
 			append(vhdr(0, sofab.TypeFixlenArray), append(vbytes(1), 0x80)...),
 			func(d *sofab.Decoder) error { _, err := d.ReadFloat64Array(); return err },
+			sofab.ErrIncomplete,
 		},
 		{
 			"float64-array wrong element header",
 			append(vhdr(0, sofab.TypeFixlenArray), append(vbytes(1), vbytes((4<<3)|subFP32)...)...),
 			func(d *sofab.Decoder) error { _, err := d.ReadFloat64Array(); return err },
+			sofab.ErrInvalidMsg,
 		},
 		{
 			"float64-array payload truncated",
 			append(vhdr(0, sofab.TypeFixlenArray), append(vbytes(1), append(vbytes((8<<3)|subFP64), 0x00)...)...),
 			func(d *sofab.Decoder) error { _, err := d.ReadFloat64Array(); return err },
+			sofab.ErrIncomplete,
 		},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			d := newDec(c.in)
 			mustNext(t, d)
-			if err := c.read(d); !errors.Is(err, sofab.ErrInvalidMsg) {
-				t.Fatalf("got %v, want ErrInvalidMsg", err)
+			if err := c.read(d); !errors.Is(err, c.want) {
+				t.Fatalf("got %v, want %v", err, c.want)
 			}
 		})
 	}
@@ -386,8 +410,8 @@ func TestSkipValueErrors(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			d := newDec(c.in)
 			mustNext(t, d)
-			if err := d.Skip(); !errors.Is(err, sofab.ErrInvalidMsg) {
-				t.Fatalf("Skip got %v, want ErrInvalidMsg", err)
+			if err := d.Skip(); !errors.Is(err, sofab.ErrIncomplete) {
+				t.Fatalf("Skip got %v, want ErrIncomplete", err)
 			}
 		})
 	}
@@ -406,11 +430,11 @@ func TestSkipSequenceEndIsNoop(t *testing.T) {
 
 func TestSkipUnterminatedSequence(t *testing.T) {
 	// A sequence start with no matching end: Skip must hit EOF and report it as
-	// a malformed message.
+	// an incomplete (truncated) message.
 	d := newDec(vhdr(0, sofab.TypeSequenceStart))
 	mustNext(t, d)
-	if err := d.Skip(); !errors.Is(err, sofab.ErrInvalidMsg) {
-		t.Fatalf("Skip = %v, want ErrInvalidMsg", err)
+	if err := d.Skip(); !errors.Is(err, sofab.ErrIncomplete) {
+		t.Fatalf("Skip = %v, want ErrIncomplete", err)
 	}
 }
 
@@ -433,8 +457,8 @@ func TestSkipSequenceWithTruncatedValue(t *testing.T) {
 	in = append(in, 0x80) // truncated varint
 	d := newDec(in)
 	mustNext(t, d)
-	if err := d.Skip(); !errors.Is(err, sofab.ErrInvalidMsg) {
-		t.Fatalf("Skip = %v, want ErrInvalidMsg", err)
+	if err := d.Skip(); !errors.Is(err, sofab.ErrIncomplete) {
+		t.Fatalf("Skip = %v, want ErrIncomplete", err)
 	}
 }
 
@@ -446,8 +470,8 @@ func TestNextAutoSkipPropagatesError(t *testing.T) {
 	// and must surface the error.
 	d := newDec(append(vhdr(1, sofab.TypeVarintUnsigned), 0x80))
 	mustNext(t, d)
-	if _, err := d.Next(); !errors.Is(err, sofab.ErrInvalidMsg) {
-		t.Fatalf("Next = %v, want ErrInvalidMsg", err)
+	if _, err := d.Next(); !errors.Is(err, sofab.ErrIncomplete) {
+		t.Fatalf("Next = %v, want ErrIncomplete", err)
 	}
 }
 

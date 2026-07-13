@@ -69,10 +69,26 @@ var (
 	ErrArgument = errors.New("sofab: invalid argument")
 	// ErrUsage is invalid API usage (e.g. reading a value as the wrong type).
 	ErrUsage = errors.New("sofab: invalid usage")
-	// ErrInvalidMsg is malformed input (varint overflow, bad type tag,
-	// truncated payload, dangling sequence end, nesting past MaxDepth,
-	// invalid UTF-8 in a string, ...).
+	// ErrInvalidMsg is malformed input that is wrong regardless of what bytes
+	// might follow: varint overflow (> 64 bits), a bad type/subtype tag, a length
+	// or count past arrayMax, a dangling sequence end, nesting past MaxDepth, or
+	// invalid UTF-8 in a string. This is the INVALID decode outcome
+	// (MESSAGE_SPEC §7).
 	ErrInvalidMsg = errors.New("sofab: invalid message")
+	// ErrIncomplete is the INCOMPLETE decode outcome (MESSAGE_SPEC §7): the input
+	// ended *inside* a field — a varint whose continuation bit was set with no
+	// terminating byte, a fixlen/array payload shorter than its declared length,
+	// or a nested sequence that was never closed. The bytes so far are valid but
+	// do not form a complete message; feeding more could complete it.
+	//
+	// INCOMPLETE is NOT a malformed-message error. Like io.EOF, it is an outcome
+	// surfaced as a sentinel: the decoder does not itself decide that a trailing
+	// incomplete field is fatal — the caller owns end-of-input and judges, from
+	// its own framing (length prefix, datagram boundary, EOF), whether a trailing
+	// ErrIncomplete is a truncation error. Test for it with errors.Is; it is
+	// distinct from ErrInvalidMsg so a truncated stream is never conflated with a
+	// malformed one.
+	ErrIncomplete = errors.New("sofab: incomplete message")
 )
 
 // zigzagEncode maps a signed value to its unsigned varint representation.
