@@ -32,6 +32,26 @@
 // message. AcceptBytes is the zero-copy form when the message is already a
 // []byte (e.g. generated Unmarshal).
 //
+// # Decode outcome (three-valued, finish-less)
+//
+// Decoding reports one of three outcomes (MESSAGE_SPEC §7), on both the pull and
+// visitor paths, and identically for one-shot and streaming use:
+//
+//   - COMPLETE — the input ended exactly at a field boundary (a valid message).
+//     Signalled by a nil error (Accept) or io.EOF at the top level (Next).
+//   - INCOMPLETE — the input ended *inside* a field (an unterminated varint, a
+//     short fixlen/array payload, or an unclosed sequence). Signalled by
+//     ErrIncomplete. This is NOT a malformed-message error: the bytes so far are
+//     valid and more input could complete them. Like io.EOF, it is an outcome,
+//     not a failure — the *caller* owns end-of-input and decides, from its own
+//     framing (length prefix, datagram boundary, EOF), whether a trailing
+//     ErrIncomplete is a truncation error. There is no finish/finalize step.
+//   - INVALID — the bytes are malformed regardless of what follows. Signalled by
+//     ErrInvalidMsg.
+//
+// Test the two with errors.Is; they are distinct sentinels, so a truncated
+// stream is never conflated with a malformed one.
+//
 // # Encoding example (what generated Marshal code looks like)
 //
 //	func (m *SensorReading) Marshal(e *sofab.Encoder) error {

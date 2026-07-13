@@ -78,7 +78,8 @@ func (d *Decoder) Field() Field { return d.cur }
 
 // readVarint reads a base-128 varint. If firstEOFok is true, an EOF before any
 // byte is reported as io.EOF (a clean stream boundary); a mid-varint EOF is
-// always ErrInvalidMsg.
+// ErrIncomplete (INCOMPLETE, §7 — ran out of bytes mid-field, not malformed). A
+// varint that exceeds 64 bits is ErrInvalidMsg (malformed).
 func (d *Decoder) readVarint(firstEOFok bool) (uint64, error) {
 	var val uint64
 	var shift uint
@@ -89,7 +90,7 @@ func (d *Decoder) readVarint(firstEOFok bool) (uint64, error) {
 				if i == 0 && firstEOFok {
 					return 0, io.EOF
 				}
-				return 0, ErrInvalidMsg
+				return 0, ErrIncomplete // ended mid-varint: truncated
 			}
 			return 0, err
 		}
@@ -99,7 +100,7 @@ func (d *Decoder) readVarint(firstEOFok bool) (uint64, error) {
 		}
 		shift += 7
 		if shift >= 64 {
-			return 0, ErrInvalidMsg
+			return 0, ErrInvalidMsg // varint > 64 bits: malformed
 		}
 	}
 }
@@ -121,11 +122,12 @@ func (d *Decoder) readFixlenHeader() (length uint64, sub uint64, err error) {
 }
 
 // readRaw reads exactly n bytes into a freshly allocated buffer. A short read
-// (the stream ending early) is reported as ErrInvalidMsg.
+// (the stream ending early) is reported as ErrIncomplete — the payload was
+// truncated mid-field (§7), not malformed.
 func (d *Decoder) readRaw(n uint64) ([]byte, error) {
 	buf := make([]byte, n)
 	if _, err := io.ReadFull(d.r, buf); err != nil {
-		return nil, eofToInvalid(err)
+		return nil, eofToIncomplete(err)
 	}
 	return buf, nil
 }
@@ -251,7 +253,7 @@ func (d *Decoder) Skip() error {
 		for depth > 0 {
 			f, err := d.Next()
 			if err == io.EOF {
-				return ErrInvalidMsg
+				return ErrIncomplete // sequence never closed: truncated (§7)
 			}
 			if err != nil {
 				return err
@@ -293,7 +295,7 @@ func (d *Decoder) skipValue() error {
 			return err
 		}
 		_, err = d.r.Discard(int(n))
-		return eofToInvalid(err)
+		return eofToIncomplete(err)
 	case TypeVarintArrayUnsigned, TypeVarintArraySigned:
 		n, err := d.readVarint(false)
 		if err != nil {
@@ -318,7 +320,7 @@ func (d *Decoder) skipValue() error {
 		}
 		size := h >> 3
 		_, err = d.r.Discard(int(n * size))
-		return eofToInvalid(err)
+		return eofToIncomplete(err)
 	}
 	return nil
 }
@@ -446,11 +448,12 @@ func (d *Decoder) ReadFloat64Array() ([]float64, error) {
 	return out, nil
 }
 
-// eofToInvalid maps an end-of-stream error hit mid-value to ErrInvalidMsg (the
-// message was truncated), passing any other error through unchanged.
-func eofToInvalid(err error) error {
+// eofToIncomplete maps an end-of-stream error hit mid-value to ErrIncomplete
+// (the payload was truncated mid-field, §7 — INCOMPLETE, not malformed), passing
+// any other error through unchanged.
+func eofToIncomplete(err error) error {
 	if err == io.EOF || err == io.ErrUnexpectedEOF {
-		return ErrInvalidMsg
+		return ErrIncomplete
 	}
 	return err
 }
