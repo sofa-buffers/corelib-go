@@ -20,14 +20,19 @@ type Decoder struct {
 	r           *bufio.Reader // pull-parser buffer, created lazily on first Next
 	cur         Field
 	needConsume bool // a value-bearing field header is read but not yet consumed
+	lim         limits
 }
 
 // NewDecoder returns a Decoder reading from r. The internal buffer for the
 // pull-parser path is allocated lazily on first use, so the visitor path
 // (Accept) — which reads the message into one contiguous buffer itself — does
 // not pay for it.
-func NewDecoder(r io.Reader) *Decoder {
-	return &Decoder{src: r}
+//
+// Optional decode limits (WithMaxArrayCount, WithMaxStringLen, WithMaxBlobLen)
+// apply to both the pull parser and Decoder.Accept; with none, no limits are
+// enforced.
+func NewDecoder(r io.Reader, opts ...Option) *Decoder {
+	return &Decoder{src: r, lim: newLimits(opts)}
 }
 
 // asBufio reuses an existing *bufio.Reader source, otherwise wraps it once.
@@ -118,18 +123,57 @@ func (d *Decoder) readFixlenHeader() (length uint64, sub uint64, err error) {
 	if length > arrayMax {
 		return 0, 0, ErrInvalidMsg
 	}
+	if err := d.lim.checkFixlen(sub, length); err != nil {
+		return 0, 0, err
+	}
 	return length, sub, nil
 }
 
-// readRaw reads exactly n bytes into a freshly allocated buffer. A short read
-// (the stream ending early) is reported as ErrIncomplete — the payload was
-// truncated mid-field (§7), not malformed.
+// readRaw reads exactly n bytes. A short read (the stream ending early) is
+// reported as ErrIncomplete — the payload was truncated mid-field (§7), not
+// malformed.
+//
+// It never pre-allocates the full n bytes from the (untrusted) claimed length:
+// up to readRawChunk it sizes the buffer once — the common path for ordinary
+// fields — but a larger claim is grown as bytes actually arrive, so a hostile
+// length costs memory only in proportion to the bytes really delivered before
+// the stream ends (amplification hardening, issue #40).
 func (d *Decoder) readRaw(n uint64) ([]byte, error) {
-	buf := make([]byte, n)
-	if _, err := io.ReadFull(d.r, buf); err != nil {
-		return nil, eofToIncomplete(err)
+	if n <= readRawChunk {
+		buf := make([]byte, n)
+		if _, err := io.ReadFull(d.r, buf); err != nil {
+			return nil, eofToIncomplete(err)
+		}
+		return buf, nil
+	}
+	buf := make([]byte, 0, readRawChunk)
+	tmp := make([]byte, readRawChunk)
+	for uint64(len(buf)) < n {
+		want := min(n-uint64(len(buf)), uint64(readRawChunk))
+		m, err := io.ReadFull(d.r, tmp[:want])
+		buf = append(buf, tmp[:m]...)
+		if err != nil {
+			return nil, eofToIncomplete(err)
+		}
 	}
 	return buf, nil
+}
+
+// readRawChunk bounds the largest slice readRaw allocates up front; past it the
+// buffer grows incrementally as bytes arrive.
+const readRawChunk = 1 << 16
+
+// initialArrayCap chooses a starting capacity for a decoded array that never
+// pre-allocates from the untrusted wire count: the slice grows via append as
+// elements actually decode, so a hostile count costs memory only in proportion
+// to the bytes delivered before the stream ends (amplification hardening,
+// issue #40).
+func initialArrayCap(n uint64) int {
+	const cap0 = 64
+	if n < cap0 {
+		return int(n)
+	}
+	return cap0
 }
 
 // Unsigned consumes the current field as an unsigned integer.
@@ -335,6 +379,9 @@ func (d *Decoder) arrayCount() (uint64, error) {
 	if n > arrayMax {
 		return 0, ErrInvalidMsg
 	}
+	if err := d.lim.checkArrayCount(n); err != nil {
+		return 0, err
+	}
 	return n, nil
 }
 
@@ -347,13 +394,13 @@ func ReadUnsignedArray[T Unsigned](d *Decoder) ([]T, error) {
 	if err != nil {
 		return nil, err
 	}
-	out := make([]T, n)
-	for i := range out {
+	out := make([]T, 0, initialArrayCap(n))
+	for i := uint64(0); i < n; i++ {
 		v, err := d.readVarint(false)
 		if err != nil {
 			return nil, err
 		}
-		out[i] = T(v)
+		out = append(out, T(v))
 	}
 	d.needConsume = false
 	return out, nil
@@ -368,13 +415,13 @@ func ReadSignedArray[T Signed](d *Decoder) ([]T, error) {
 	if err != nil {
 		return nil, err
 	}
-	out := make([]T, n)
-	for i := range out {
+	out := make([]T, 0, initialArrayCap(n))
+	for i := uint64(0); i < n; i++ {
 		v, err := d.readVarint(false)
 		if err != nil {
 			return nil, err
 		}
-		out[i] = T(zigzagDecode(v))
+		out = append(out, T(zigzagDecode(v)))
 	}
 	d.needConsume = false
 	return out, nil
@@ -402,13 +449,13 @@ func (d *Decoder) ReadFloat32Array() ([]float32, error) {
 		d.needConsume = false
 		return []float32{}, nil
 	}
-	out := make([]float32, n)
-	for i := range out {
+	out := make([]float32, 0, initialArrayCap(n))
+	for i := uint64(0); i < n; i++ {
 		buf, err := d.readRaw(4)
 		if err != nil {
 			return nil, err
 		}
-		out[i] = math.Float32frombits(binary.LittleEndian.Uint32(buf))
+		out = append(out, math.Float32frombits(binary.LittleEndian.Uint32(buf)))
 	}
 	d.needConsume = false
 	return out, nil
@@ -436,13 +483,13 @@ func (d *Decoder) ReadFloat64Array() ([]float64, error) {
 		d.needConsume = false
 		return []float64{}, nil
 	}
-	out := make([]float64, n)
-	for i := range out {
+	out := make([]float64, 0, initialArrayCap(n))
+	for i := uint64(0); i < n; i++ {
 		buf, err := d.readRaw(8)
 		if err != nil {
 			return nil, err
 		}
-		out[i] = math.Float64frombits(binary.LittleEndian.Uint64(buf))
+		out = append(out, math.Float64frombits(binary.LittleEndian.Uint64(buf)))
 	}
 	d.needConsume = false
 	return out, nil

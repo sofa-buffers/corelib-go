@@ -40,7 +40,7 @@ func (d *Decoder) Accept(v Visitor) error {
 	if err != nil {
 		return err
 	}
-	c := cursor{buf: buf}
+	c := cursor{buf: buf, lim: d.lim}
 	return c.accept(v, 0)
 }
 
@@ -50,8 +50,11 @@ func (d *Decoder) Accept(v Visitor) error {
 // point when the message is already in memory (e.g. generated Unmarshal code).
 // buf is not retained, but byte/blob fields handed to v alias it, so the visitor
 // must copy any it keeps past the call.
-func AcceptBytes(buf []byte, v Visitor) error {
-	c := cursor{buf: buf}
+//
+// Optional decode limits (WithMaxArrayCount, WithMaxStringLen, WithMaxBlobLen)
+// may be supplied; with none, no limits are enforced.
+func AcceptBytes(buf []byte, v Visitor, opts ...Option) error {
+	c := cursor{buf: buf, lim: newLimits(opts)}
 	return c.accept(v, 0)
 }
 

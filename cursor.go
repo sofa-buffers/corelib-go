@@ -17,6 +17,7 @@ import (
 type cursor struct {
 	buf []byte
 	pos int
+	lim limits
 }
 
 // uvarint reads a base-128 varint at pos. If eofOK, a field boundary with no
@@ -68,6 +69,9 @@ func (c *cursor) fixlenHeader() (length, sub uint64, err error) {
 	if length > arrayMax {
 		return 0, 0, ErrInvalidMsg
 	}
+	if err := c.lim.checkFixlen(sub, length); err != nil {
+		return 0, 0, err
+	}
 	return length, sub, nil
 }
 
@@ -80,6 +84,9 @@ func (c *cursor) arrayCount() (uint64, error) {
 	}
 	if n > arrayMax {
 		return 0, ErrInvalidMsg
+	}
+	if err := c.lim.checkArrayCount(n); err != nil {
+		return 0, err
 	}
 	return n, nil
 }
@@ -133,6 +140,12 @@ func (c *cursor) accept(v Visitor, depth int) error {
 			if err != nil {
 				return err
 			}
+			// Each varint element is at least one byte, so a count exceeding the
+			// bytes left cannot be satisfied: fail fast as INCOMPLETE (§7) instead
+			// of allocating a huge slice from the untrusted count (issue #40).
+			if n > uint64(len(c.buf)-c.pos) {
+				return ErrIncomplete
+			}
 			out := make([]uint64, n)
 			for i := range out {
 				if out[i], err = c.uvarint(false); err != nil {
@@ -146,6 +159,11 @@ func (c *cursor) accept(v Visitor, depth int) error {
 			n, err := c.arrayCount()
 			if err != nil {
 				return err
+			}
+			// See TypeVarintArrayUnsigned: reject a count larger than the bytes
+			// remaining before allocating from it (issue #40).
+			if n > uint64(len(c.buf)-c.pos) {
+				return ErrIncomplete
 			}
 			out := make([]int64, n)
 			for i := range out {
