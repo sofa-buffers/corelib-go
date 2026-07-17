@@ -182,6 +182,73 @@ func TestVarintOverflowInvalid(t *testing.T) {
 	}
 }
 
+// TestOverlongVarintInvalid pins the fix for issue #48 (Crucible F-0016): a
+// varint whose payload spills past bit 63 is malformed (§4.1/§6.3) and must be
+// rejected as ErrInvalidMsg, not silently truncated. A 64-bit value uses at
+// most 10 bytes, and in the 10th byte only the low bit may be set — anything
+// above it is a >64-bit overflow, even though the varint terminates on that
+// byte (no 11th continuation byte). Both the visitor and pull paths are driven;
+// the …01 maximum (2^64-1) is the control that must still decode.
+func TestOverlongVarintInvalid(t *testing.T) {
+	// id 6, unsigned varint (0x30 = 6<<3 | TypeVarintUnsigned), matching the
+	// issue's reproducer.
+	const hdr = 0x30
+	cont := []byte{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF} // 9 continuation bytes
+	msg := func(last byte) []byte { return append(append([]byte{hdr}, cont...), last) }
+
+	cases := []struct {
+		name    string
+		last    byte
+		wantErr bool
+		want    uint64 // only checked when wantErr is false
+	}{
+		{name: "10th byte 65th bit set", last: 0x02, wantErr: true},
+		{name: "10th byte bits 64..69 set", last: 0x7F, wantErr: true},
+		{name: "control 2^64-1", last: 0x01, wantErr: false, want: math.MaxUint64},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			in := msg(c.last)
+
+			// Visitor path (what generated Unmarshal uses).
+			verr := sofab.AcceptBytes(in, baseV{})
+			if c.wantErr {
+				if !errors.Is(verr, sofab.ErrInvalidMsg) {
+					t.Fatalf("AcceptBytes = %v, want ErrInvalidMsg", verr)
+				}
+				if errors.Is(verr, sofab.ErrIncomplete) {
+					t.Fatalf("AcceptBytes = %v, overlong varint is malformed, not truncated", verr)
+				}
+			} else if verr != nil {
+				t.Fatalf("AcceptBytes control = %v, want nil", verr)
+			}
+
+			// Pull path.
+			d := newDec(in)
+			if _, err := d.Next(); err != nil {
+				t.Fatalf("pull Next = %v", err)
+			}
+			v, perr := d.Unsigned()
+			if c.wantErr {
+				if !errors.Is(perr, sofab.ErrInvalidMsg) {
+					t.Fatalf("pull Unsigned = %v, want ErrInvalidMsg", perr)
+				}
+				if errors.Is(perr, sofab.ErrIncomplete) {
+					t.Fatalf("pull Unsigned = %v, overlong varint is malformed, not truncated", perr)
+				}
+			} else {
+				if perr != nil {
+					t.Fatalf("pull Unsigned control = %v, want nil", perr)
+				}
+				if v != c.want {
+					t.Fatalf("pull Unsigned control = %d, want %d", v, c.want)
+				}
+			}
+		})
+	}
+}
+
 func TestDanglingSequenceEndInvalid(t *testing.T) {
 	// header 0x07 = id 0, type SequenceEnd. The pull decoder surfaces it as a
 	// token; a generated decoder treats an unmatched end as end-of-message. Here

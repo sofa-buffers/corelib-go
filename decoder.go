@@ -99,11 +99,20 @@ func (d *Decoder) readVarint(firstEOFok bool) (uint64, error) {
 			}
 			return 0, err
 		}
+		// Reject an overlong (>64-bit) varint *before* OR-ing the byte in, so
+		// its high payload bits are never silently shifted out (§4.1/§6.3): on
+		// the 10th byte (shift == 63) only the single low payload bit fits
+		// below bit 63, so any higher bit is a >64-bit overflow.
+		if shift+7 > 64 && (b&0x7F)>>(64-shift) != 0 {
+			return 0, ErrInvalidMsg // payload spills past bit 63: overlong, malformed
+		}
 		val |= uint64(b&0x7F) << shift
 		if b&0x80 == 0 {
 			return val, nil
 		}
 		shift += 7
+		// A continuation bit on the 10th byte demands an 11th: the varint is
+		// overlong regardless of whether that byte is present.
 		if shift >= 64 {
 			return 0, ErrInvalidMsg // varint > 64 bits: malformed
 		}
