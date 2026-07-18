@@ -243,8 +243,12 @@ func (c *cursor) acceptFixlen(v Visitor, id ID) error {
 		if err != nil {
 			return err
 		}
-		if !utf8.Valid(b) {
-			return ErrInvalidMsg // invalid UTF-8 (§6.3)
+		// c.take yields the complete payload (or ErrIncomplete) before this
+		// check, so validity is judged on the whole string, not a chunk slice
+		// (§6.4). Gated by SOFAB_STRICT_UTF8 (default ON); when off the bytes pass
+		// through verbatim.
+		if c.lim.strictUTF8 && !utf8.Valid(b) {
+			return ErrInvalidMsg // invalid UTF-8 (§5.2 INVALID)
 		}
 		return v.String(id, string(b))
 	case fixBlob:

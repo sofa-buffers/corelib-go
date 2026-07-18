@@ -257,14 +257,21 @@ func (d *Decoder) Float64() (float64, error) {
 	return math.Float64frombits(binary.LittleEndian.Uint64(buf)), nil
 }
 
-// String consumes the current field as a string. A payload that is not valid
-// UTF-8 is rejected as ErrInvalidMsg (§6.3).
+// String consumes the current field as a string. When strict UTF-8 is enabled
+// (SOFAB_STRICT_UTF8, the default; §6.4), a payload that is not valid UTF-8 is
+// rejected as ErrInvalidMsg (the INVALID outcome, §5.2). With it disabled
+// (WithStrictUTF8(false)) the wire bytes are kept verbatim. Validation runs only
+// here, where the string is materialized — a skipped field (Skip) is a length
+// jump that is never validated (§6.4). The full payload is assembled (via
+// fixlenBytes → readRaw) before this check, so a payload split across a chunk
+// boundary stays ErrIncomplete rather than being misread as invalid (§6.4
+// cross-chunk).
 func (d *Decoder) String() (string, error) {
 	b, err := d.fixlenBytes(fixStr)
 	if err != nil {
 		return "", err
 	}
-	if !utf8.Valid(b) {
+	if d.lim.strictUTF8 && !utf8.Valid(b) {
 		return "", ErrInvalidMsg
 	}
 	return string(b), nil

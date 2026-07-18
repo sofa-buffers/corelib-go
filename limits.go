@@ -21,12 +21,17 @@ package sofab
 // arrays, and byte length for strings and blobs.
 type Option func(*limits)
 
-// limits holds the optional per-field decode caps. The zero value (every field
-// 0) means unlimited, which is the default.
+// limits holds the optional per-field decode caps plus the string-validity
+// policy. The three cap fields' zero value (0) means unlimited, which is their
+// default. strictUTF8 is the SOFAB_STRICT_UTF8 option (§6.4) and is set by
+// newLimits, whose default is ON; do not construct a limits value directly
+// (always go through newLimits) or strictUTF8 would default to its zero value
+// (OFF) instead of the intended ON.
 type limits struct {
 	maxArrayCount uint64 // 0 = unlimited
 	maxStringLen  uint64 // 0 = unlimited
 	maxBlobLen    uint64 // 0 = unlimited
+	strictUTF8    bool   // SOFAB_STRICT_UTF8 (§6.4); default ON via newLimits
 }
 
 // WithMaxArrayCount caps the element count of every count-prefixed array — the
@@ -52,6 +57,26 @@ func WithMaxBlobLen(n int) Option {
 	return func(l *limits) { l.maxBlobLen = clampLimit(n) }
 }
 
+// WithStrictUTF8 sets the SOFAB_STRICT_UTF8 string-validity policy (§6.4). It
+// applies to both the decoder (NewDecoder, AcceptBytes) and the encoder
+// (NewEncoder). Unlike the cap options it is not a receiver limit but a
+// validation policy, and it defaults to ON — pass WithStrictUTF8(false) to opt
+// out.
+//
+//   - ON (default): an invalid-UTF-8 string that is *read* on decode is the
+//     INVALID outcome (ErrInvalidMsg, §5.2); a non-UTF-8 string passed to
+//     WriteString on encode is refused with ErrArgument (§6.3). Skipped fields
+//     are never validated.
+//   - OFF: validation is waived and Go's byte-container string keeps the wire
+//     bytes verbatim on decode / writes them verbatim on encode — never lossy,
+//     never a silent replacement (§6.4).
+//
+// The knob never changes how valid data is encoded, so two peers with different
+// settings interoperate on all valid data.
+func WithStrictUTF8(enabled bool) Option {
+	return func(l *limits) { l.strictUTF8 = enabled }
+}
+
 // clampLimit maps a caller-supplied limit to its internal form: a non-positive
 // value means "no limit" (stored as 0).
 func clampLimit(n int) uint64 {
@@ -61,9 +86,11 @@ func clampLimit(n int) uint64 {
 	return uint64(n)
 }
 
-// newLimits folds the options into a limits value.
+// newLimits folds the options into a limits value. SOFAB_STRICT_UTF8 (§6.4)
+// defaults to ON, so strictUTF8 starts true and only WithStrictUTF8(false)
+// turns it off; the cap fields start at their zero value (unlimited).
 func newLimits(opts []Option) limits {
-	var l limits
+	l := limits{strictUTF8: true}
 	for _, opt := range opts {
 		opt(&l)
 	}

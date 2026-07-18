@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"io"
 	"math"
+	"unicode/utf8"
 )
 
 // Encoder writes Sofab fields to an io.Writer. It accumulates the message in an
@@ -17,11 +18,15 @@ type Encoder struct {
 	buf   []byte
 	err   error
 	depth int
+	lim   limits
 }
 
-// NewEncoder returns an Encoder writing to w.
-func NewEncoder(w io.Writer) *Encoder {
-	return &Encoder{w: w, buf: make([]byte, 0, 512)}
+// NewEncoder returns an Encoder writing to w. Of the shared Options only
+// WithStrictUTF8 affects encoding (the SOFAB_STRICT_UTF8 policy, §6.4, default
+// ON); the receiver-side cap options (WithMaxArrayCount, WithMaxStringLen,
+// WithMaxBlobLen) are decode-only and are accepted but ignored here.
+func NewEncoder(w io.Writer, opts ...Option) *Encoder {
+	return &Encoder{w: w, buf: make([]byte, 0, 512), lim: newLimits(opts)}
 }
 
 // Err returns the first error encountered, if any.
@@ -154,7 +159,22 @@ func (e *Encoder) WriteFloat64(id ID, f float64) error {
 
 // WriteString writes a string field (raw UTF-8 bytes, no NUL on the wire). The
 // bytes are appended straight from the string, with no []byte(s) copy.
+//
+// When strict UTF-8 is enabled (SOFAB_STRICT_UTF8, the default; §6.4), a Go
+// string that is not valid UTF-8 — a byte container can hold arbitrary bytes —
+// is refused with ErrArgument (§6.3) and no bytes are written, enforcing the
+// producer-side MUST NOT of MESSAGE_SPEC §8. With it disabled
+// (WithStrictUTF8(false)) the bytes are written verbatim. utf8.ValidString
+// correctly rejects overlong encodings, surrogate code points, and code points
+// above U+10FFFF, while accepting an embedded NUL.
 func (e *Encoder) WriteString(id ID, s string) error {
+	if e.err != nil {
+		return e.err
+	}
+	if e.lim.strictUTF8 && !utf8.ValidString(s) {
+		e.setErr(ErrArgument)
+		return e.err
+	}
 	e.writeHeader(id, TypeFixlen)
 	e.putVarint((uint64(len(s)) << 3) | fixStr)
 	if e.err == nil {

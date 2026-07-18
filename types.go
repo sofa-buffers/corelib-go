@@ -64,8 +64,10 @@ type Signed interface {
 // Errors returned by the encoder and decoder. They mirror the C sofab_ret_t
 // codes (write-buffer-full is reported via the underlying io.Writer instead).
 var (
-	// ErrArgument is an invalid caller argument (e.g. id > IDMax, or opening a
-	// nested sequence past MaxDepth).
+	// ErrArgument is an invalid caller argument (e.g. id > IDMax, opening a
+	// nested sequence past MaxDepth, or — with strict UTF-8 enabled, §6.4 — a
+	// WriteString value that is not valid UTF-8). This is the InvalidArgument code
+	// (§6.3).
 	ErrArgument = errors.New("sofab: invalid argument")
 	// ErrUsage is invalid API usage (e.g. reading a value as the wrong type).
 	ErrUsage = errors.New("sofab: invalid usage")
