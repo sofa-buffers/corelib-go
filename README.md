@@ -200,7 +200,16 @@ arrays are always freshly allocated on every path.
 
 ## Feature flags
 
-Go always ships the **full format** — no build toggles.
+Go always ships the **full format** — there are no build-time toggles for wire
+features. The one configurable policy is **strict UTF-8 validation**, exposed as a
+runtime option rather than a build flag:
+
+| Option | Default | Effect |
+|--------|---------|--------|
+| `WithStrictUTF8(bool)` (`SOFAB_STRICT_UTF8`) | on | Passed to `NewDecoder`, `AcceptBytes`, or `NewEncoder`. On: an invalid-UTF-8 `string` is rejected — `ErrInvalidMsg` on decode, `ErrArgument` on encode. Off: bytes are stored/written verbatim (never lossy). |
+
+It is a validation policy only, never a wire-format switch, so peers with
+different settings still interoperate on all valid data (CORELIB_PLAN §6.4).
 
 ## Build & test
 
