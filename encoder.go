@@ -61,8 +61,30 @@ const flushThreshold = 4096
 
 // maybeFlush writes the buffer out and resets it once it grows past the
 // threshold, keeping memory bounded and preserving mid-stream write semantics.
+//
+// It is called after every varint and every raw write, so for a message that
+// never reaches the threshold the check is pure overhead — and it is the common
+// case, since flushThreshold is 4 KB. Keeping the body to a length test and a
+// call makes it inlinable, so that common case costs a load and a compare
+// instead of a function call; the write lives in flushBuffered, whose cost only
+// applies when it actually fires. Moving the err test into the slow path is
+// behaviour-preserving: with an error held, neither form writes anything.
 func (e *Encoder) maybeFlush() {
-	if e.err == nil && len(e.buf) >= flushThreshold {
+	if len(e.buf) >= flushThreshold {
+		e.flushBuffered()
+	}
+}
+
+// flushBuffered writes the accumulated bytes out and resets the buffer. It is
+// the out-of-line half of maybeFlush; do not call it on the hot path.
+//
+// go:noinline is load-bearing, not a hint: without it the compiler inlines this
+// body back into maybeFlush, whose cost then exceeds the inline budget again and
+// the split buys nothing.
+//
+//go:noinline
+func (e *Encoder) flushBuffered() {
+	if e.err == nil {
 		_, e.err = e.w.Write(e.buf)
 		e.buf = e.buf[:0]
 	}
@@ -74,17 +96,17 @@ func (e *Encoder) putVarint(v uint64) {
 	if e.err != nil {
 		return
 	}
-	for {
-		b := byte(v & 0x7F)
+	// Hold the slice header in a local across the loop: appending straight to
+	// e.buf reloads and stores the three-word header on every byte. Appending
+	// the bytes one at a time beats building them in a local array and
+	// appending that slice once — measured: the slice form routes short varints
+	// through memmove and costs more than it saves.
+	buf := e.buf
+	for v >= 0x80 {
+		buf = append(buf, byte(v)|0x80)
 		v >>= 7
-		if v != 0 {
-			b |= 0x80
-		}
-		e.buf = append(e.buf, b)
-		if v == 0 {
-			break
-		}
 	}
+	e.buf = append(buf, byte(v))
 	e.maybeFlush()
 }
 
