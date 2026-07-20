@@ -24,7 +24,31 @@ type cursor struct {
 // bytes left is reported as io.EOF (clean end of stream); a varint truncated by
 // the end of the buffer is ErrIncomplete (INCOMPLETE, §7) — it ran out of bytes
 // mid-field. A varint that exceeds 64 bits is ErrInvalidMsg (malformed).
+//
+// The single-byte case (payload < 0x80 — every field header for id<16, and every
+// small scalar/count) is peeled into a lean fast path: one bounds-checked load and
+// a return, with none of the multi-byte loop's shift/overflow bookkeeping. uvarint
+// is the hottest decode function (~32 % of Ir), so shaving the common read is worth
+// it even though the two-value return keeps uvarint just over the inline budget.
+// Measured: decode 38603 -> 37044 Ir/op (-4.0 %), encode unchanged.
 func (c *cursor) uvarint(eofOK bool) (uint64, error) {
+	if p := c.pos; p < len(c.buf) {
+		if b := c.buf[p]; b < 0x80 {
+			c.pos = p + 1
+			return uint64(b), nil
+		}
+	}
+	return c.uvarintSlow(eofOK)
+}
+
+// uvarintSlow is the complete varint reader and the out-of-line half of uvarint:
+// the empty-cursor EOF/INCOMPLETE cases and every multi-byte value.
+//
+// go:noinline is load-bearing: without it the compiler folds the loop back into
+// uvarint, restoring the original per-call cost and erasing the fast path's win.
+//
+//go:noinline
+func (c *cursor) uvarintSlow(eofOK bool) (uint64, error) {
 	if c.pos >= len(c.buf) {
 		if eofOK {
 			return 0, io.EOF
