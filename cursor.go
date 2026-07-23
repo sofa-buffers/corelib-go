@@ -107,6 +107,11 @@ func (c *cursor) arrayCount() (uint64, error) {
 // deeply nested message is rejected rather than overflowing the Go stack (§4.9).
 func (c *cursor) accept(v Visitor, depth int) error {
 	nested := depth > 0
+	// One type-assertion per scope, not per field: nil unless this visitor opts
+	// into the header hooks (HeaderVisitor). A visitor without them pays only a
+	// predictable nil branch per array/fixlen field, so the max-speed path is
+	// unchanged.
+	hv, _ := v.(HeaderVisitor)
 	for {
 		h, err := c.uvarint(true)
 		if err != nil {
@@ -141,13 +146,21 @@ func (c *cursor) accept(v Visitor, depth int) error {
 				return err
 			}
 		case TypeFixlen:
-			if err := c.acceptFixlen(v, id); err != nil {
+			if err := c.acceptFixlen(v, hv, id); err != nil {
 				return err
 			}
 		case TypeVarintArrayUnsigned:
 			n, err := c.arrayCount()
 			if err != nil {
 				return err
+			}
+			// Header hook at the count word, before the truncation check below, so
+			// a schema over-count is INVALID even when the array is then truncated
+			// (§5.2). No-op unless the visitor declares a bound.
+			if hv != nil {
+				if err := hv.ArrayBegin(id, int(n)); err != nil {
+					return err
+				}
 			}
 			// Each varint element is at least one byte, so a count exceeding the
 			// bytes left cannot be satisfied: fail fast as INCOMPLETE (§7) instead
@@ -169,6 +182,11 @@ func (c *cursor) accept(v Visitor, depth int) error {
 			if err != nil {
 				return err
 			}
+			if hv != nil {
+				if err := hv.ArrayBegin(id, int(n)); err != nil {
+					return err
+				}
+			}
 			// See TypeVarintArrayUnsigned: reject a count larger than the bytes
 			// remaining before allocating from it (issue #40).
 			if n > uint64(len(c.buf)-c.pos) {
@@ -186,7 +204,7 @@ func (c *cursor) accept(v Visitor, depth int) error {
 				return err
 			}
 		case TypeFixlenArray:
-			if err := c.acceptFixlenArray(v, id); err != nil {
+			if err := c.acceptFixlenArray(v, hv, id); err != nil {
 				return err
 			}
 		case TypeSequenceStart:
@@ -214,10 +232,17 @@ func (c *cursor) accept(v Visitor, depth int) error {
 	}
 }
 
-func (c *cursor) acceptFixlen(v Visitor, id ID) error {
+func (c *cursor) acceptFixlen(v Visitor, hv HeaderVisitor, id ID) error {
 	n, sub, err := c.fixlenHeader()
 	if err != nil {
 		return err
+	}
+	// Header hook at the length word, before take() below can report the payload
+	// truncated: an over-maxlen string/blob stays INVALID (§5.2).
+	if hv != nil {
+		if err := hv.FixlenHeader(id, int(sub), int(n)); err != nil {
+			return err
+		}
 	}
 	switch sub {
 	case fixFp32:
@@ -262,10 +287,15 @@ func (c *cursor) acceptFixlen(v Visitor, id ID) error {
 	}
 }
 
-func (c *cursor) acceptFixlenArray(v Visitor, id ID) error {
+func (c *cursor) acceptFixlenArray(v Visitor, hv HeaderVisitor, id ID) error {
 	n, err := c.arrayCount()
 	if err != nil {
 		return err
+	}
+	if hv != nil {
+		if err := hv.ArrayBegin(id, int(n)); err != nil {
+			return err
+		}
 	}
 	// A fixlen array always carries its fixlen_word, even when empty (§4.8), so
 	// the element subtype is always on the wire: an empty fp32 array dispatches

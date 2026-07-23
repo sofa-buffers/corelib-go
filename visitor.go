@@ -30,6 +30,33 @@ type Visitor interface {
 	EndSequence() error
 }
 
+// HeaderVisitor is an optional extension a Visitor may also implement to inspect
+// an array's element count or a fixlen field's declared length at the header —
+// the instant the count/length word is read, before the truncation check and
+// before any element or payload byte. It exists so a schema-bound violation
+// (over-count, over-maxlen) is rejected at the header as INVALID by returning
+// ErrInvalidMsg, even when the field is then truncated: MESSAGE_SPEC §5.2 has
+// INVALID dominate INCOMPLETE ("anti-folding" — more bytes cannot make a
+// schema-illegal count/length legal), so the whole-slice callback the generated
+// len(v)>N guard runs in is too late once the array is truncated.
+//
+// It is additive and backward-compatible. The cursor type-asserts the visitor
+// to HeaderVisitor once per scope, so a visitor that does not implement it
+// decodes exactly as before — no method, no call. Generated code implements
+// these only when the schema declares a bound, and the hooks then fire once per
+// array/fixlen field (never per element), so the max-speed decode path is
+// unchanged for visitors without bounds.
+type HeaderVisitor interface {
+	// ArrayBegin is called with the wire element count right after an array's
+	// count varint is read, before the truncation check and any element. A
+	// non-nil return (typically ErrInvalidMsg) aborts the decode at the header.
+	ArrayBegin(id ID, count int) error
+	// FixlenHeader is called with the element subtype and declared byte length
+	// right after a fixlen length word is read, before the payload is taken.
+	// Same contract for the schema maxlen bound.
+	FixlenHeader(id ID, subtype int, length int) error
+}
+
 // Accept decodes the entire top-level stream into v. It slurps the remaining
 // input into one contiguous buffer and advances a cursor over it (see cursor),
 // so dispatch never re-enters the io.Reader per byte. It returns nil at a clean
