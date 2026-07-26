@@ -37,7 +37,7 @@ func encodeTypicalMsg() []byte {
 	e.WriteFloat32(4, 3.14159)
 	e.WriteString(5, "sofab")
 	sofab.WriteUnsignedArray(e, 6, []uint16{10, 20, 30, 40})
-	e.WriteSequenceBegin(7)
+	e.WriteSequenceBeginLazy(7)
 	e.WriteUnsigned(1, 99)
 	e.WriteSigned(2, -7)
 	e.WriteSequenceEnd()

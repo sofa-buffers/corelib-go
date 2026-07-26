@@ -91,7 +91,7 @@ func TestRoundTripNestedSequences(t *testing.T) {
 	e := sofab.NewEncoder(&buf)
 	e.WriteUnsigned(0, 1)
 	for i := 0; i < 5; i++ {
-		e.WriteSequenceBegin(1)
+		e.WriteSequenceBeginLazy(1)
 		e.WriteUnsigned(0, 42)
 	}
 	for i := 0; i < 5; i++ {

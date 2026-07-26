@@ -145,9 +145,14 @@ func encodeField(t *testing.T, e *sofab.Encoder, f vecField) {
 	case "array":
 		encodeArray(t, e, id, f)
 	case "sequence_begin":
-		e.WriteSequenceBegin(id)
+		e.WriteSequenceBeginLazy(id)
 	case "sequence_end":
-		e.WriteSequenceEnd()
+		// A vector's `serialized` form is the primitive-layer ground truth and
+		// always carries the frame, so every sequence closes with
+		// WriteSequenceEndKeep: identical bytes once the sequence has content,
+		// and the empty-sequence vectors keep their begin+end pair instead of
+		// vanishing (MESSAGE_SPEC §2).
+		e.WriteSequenceEndKeep()
 	default:
 		t.Fatalf("unknown op %q", f.Op)
 	}

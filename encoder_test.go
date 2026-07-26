@@ -173,7 +173,7 @@ func TestWriteArrayFloat64(t *testing.T) {
 func TestWriteNestedSequence(t *testing.T) {
 	got := encode(t, func(e *sofab.Encoder) {
 		e.WriteUnsigned(0, 42)
-		e.WriteSequenceBegin(1)
+		e.WriteSequenceBeginLazy(1)
 		e.WriteUnsigned(0, 42)
 		e.WriteSigned(2, -42)
 		e.WriteSequenceEnd()
@@ -185,7 +185,7 @@ func TestWriteNestedSequence(t *testing.T) {
 func TestWriteNestedSequenceWithArray(t *testing.T) {
 	got := encode(t, func(e *sofab.Encoder) {
 		e.WriteUnsigned(0, 42)
-		e.WriteSequenceBegin(3)
+		e.WriteSequenceBeginLazy(3)
 		e.WriteUnsigned(0, 42)
 		sofab.WriteSignedArray(e, 3, []int32{-42, -43, -44})
 		e.WriteSequenceEnd()

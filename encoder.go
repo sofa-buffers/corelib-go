@@ -18,15 +18,38 @@ type Encoder struct {
 	buf   []byte
 	err   error
 	depth int
-	lim   limits
+	// pending holds the ids of the innermost open sequences whose header has not
+	// been written yet (WriteSequenceBeginLazy, MESSAGE_SPEC §2). It is always a
+	// contiguous suffix of the open sequences — writing any field commits the
+	// whole run at once — which is what lets WriteSequenceEnd simply drop the
+	// last entry. It is truncated, never released, so its backing array is reused
+	// for the encoder's lifetime; MaxDepth bounds it at 255 entries.
+	//
+	// It starts out backed by pendingInline, so the common nesting depth costs no
+	// allocation at all; append() spills it to the heap on its own for a schema
+	// that nests deeper, with no eager-framing fallback to get wrong. (The
+	// self-reference means an Encoder must be used through the *Encoder that
+	// NewEncoder returns, never copied by value — which is already the API.)
+	pending       []ID
+	pendingInline [lazySeqInline]ID
+	lim           limits
 }
+
+// lazySeqInline is how many held-back sequence ids fit in the Encoder itself
+// before the pending run has to spill to the heap. Not a wire-format or API
+// limit — nesting deeper still works and still produces canonical bytes, it just
+// allocates once. Sized for real schemas rather than MaxDepth so the Encoder
+// stays small.
+const lazySeqInline = 32
 
 // NewEncoder returns an Encoder writing to w. Of the shared Options only
 // WithStrictUTF8 affects encoding (the SOFAB_STRICT_UTF8 policy, §6.4, default
 // ON); the receiver-side cap options (WithMaxArrayCount, WithMaxStringLen,
 // WithMaxBlobLen) are decode-only and are accepted but ignored here.
 func NewEncoder(w io.Writer, opts ...Option) *Encoder {
-	return &Encoder{w: w, buf: make([]byte, 0, 512), lim: newLimits(opts)}
+	e := &Encoder{w: w, buf: make([]byte, 0, 512), lim: newLimits(opts)}
+	e.pending = e.pendingInline[:0]
+	return e
 }
 
 // Err returns the first error encountered, if any.
@@ -122,6 +145,15 @@ func (e *Encoder) putRaw(data []byte) {
 
 // writeHeader writes a field header, the varint (id<<3 | type). It sets
 // ErrArgument when id exceeds IDMax and is a no-op once an error is held.
+//
+// It is the single choke point every field write passes through — every
+// Write* method below reaches the wire through it — so it is also where a
+// held-back sequence run is committed: the field about to be written is
+// content, which proves every enclosing sequence differs from its default and
+// must be framed after all (MESSAGE_SPEC §2). The two sequence markers are
+// excluded because they are framing, not content: WriteSequenceEndKeep commits
+// the run itself before writing its marker, and WriteSequenceEnd only reaches
+// here with an already-empty run.
 func (e *Encoder) writeHeader(id ID, t WireType) {
 	if e.err != nil {
 		return
@@ -130,7 +162,26 @@ func (e *Encoder) writeHeader(id ID, t WireType) {
 		e.err = ErrArgument
 		return
 	}
+	if len(e.pending) != 0 && t != TypeSequenceStart && t != TypeSequenceEnd {
+		e.commitPending()
+	}
 	e.putVarint((uint64(id) << 3) | uint64(t))
+}
+
+// commitPending writes out the held-back sequence headers, outermost first. It
+// runs at most once per non-default sequence, never per field — the per-field
+// cost of lazy framing is the length test in writeHeader that guards this call.
+//
+// Deliberately NOT marked go:noinline, unlike flushBuffered above: that
+// annotation exists to keep its *caller* (maybeFlush) inside the inline budget,
+// whereas writeHeader is over the budget either way, so forcing a call here
+// would only add one. Measured 11 Ir/op cheaper inlined on the typical-message
+// workload of bench/run_callgrind.sh.
+func (e *Encoder) commitPending() {
+	for _, id := range e.pending {
+		e.putVarint((uint64(id) << 3) | uint64(TypeSequenceStart))
+	}
+	e.pending = e.pending[:0]
 }
 
 // WriteUnsigned writes an unsigned-integer field.
@@ -212,26 +263,95 @@ func (e *Encoder) WriteBytes(id ID, data []byte) error {
 	return e.err
 }
 
-// WriteSequenceBegin opens a nested sequence with the given field id. Opening
-// would-be sequence number MaxDepth+1 is rejected with ErrArgument and writes no
-// bytes, so the wire never nests deeper than MaxDepth (§4.9).
-func (e *Encoder) WriteSequenceBegin(id ID) error {
+// WriteSequenceBeginLazy opens a nested sequence with the given field id and
+// holds its header back until the sequence turns out to have content.
+//
+// MESSAGE_SPEC §2 omits a sequence-typed field whose value equals its declared
+// default, and "not one child was written" is exactly that condition — evaluated
+// per child field, recursively, for free, because the message layer already
+// omits every child equal to its own default. A sequence closed with nothing in
+// it therefore emits nothing instead of a two-byte empty frame, and an
+// all-default message encodes to the empty byte string. The predicate is never a
+// byte image of the object, so struct padding cannot influence it and a non-zero
+// nested default is handled by the caller's ordinary per-field test.
+//
+// The header cannot simply be written and rolled back later: the ids are
+// encoder state, not buffer content, which is what keeps the bytes identical
+// when the buffer flushes mid-message (a flush can never split a pending run).
+//
+// This is the only way to open a sequence. How it closes decides whether a
+// contentless one survives: WriteSequenceEnd drops it, WriteSequenceEndKeep
+// forces the frame out.
+//
+// Opening would-be sequence number MaxDepth+1 is rejected with ErrArgument and
+// writes no bytes, so the wire never nests deeper than MaxDepth (§4.9).
+func (e *Encoder) WriteSequenceBeginLazy(id ID) error {
 	if e.err != nil {
 		return e.err
 	}
-	if e.depth >= MaxDepth {
+	if e.depth >= MaxDepth || id > IDMax {
 		e.setErr(ErrArgument)
 		return e.err
 	}
-	e.writeHeader(id, TypeSequenceStart)
-	if e.err == nil {
-		e.depth++
+	e.pending = append(e.pending, id)
+	e.depth++
+	return e.err
+}
+
+// WriteSequenceEnd closes the most recently opened nested sequence, letting it
+// vanish if it received no content.
+//
+// Use it wherever absence encodes the same value as an empty frame: a
+// struct/union field, and an array field whose declared default is the empty
+// collection (MESSAGE_SPEC §2). Where the frame must be visible, close with
+// WriteSequenceEndKeep instead.
+func (e *Encoder) WriteSequenceEnd() error {
+	if e.err != nil {
+		return e.err
+	}
+	if n := len(e.pending); n != 0 {
+		// The innermost open sequence is the last held-back one (pending is a
+		// contiguous suffix of the open sequences), and it never got content:
+		// drop it — header and end marker both.
+		e.pending = e.pending[:n-1]
+		e.depth--
+		return e.err
+	}
+	e.writeHeader(0, TypeSequenceEnd)
+	if e.err == nil && e.depth > 0 {
+		e.depth--
 	}
 	return e.err
 }
 
-// WriteSequenceEnd closes the most recently opened nested sequence.
-func (e *Encoder) WriteSequenceEnd() error {
+// WriteSequenceEndKeep closes the most recently opened nested sequence, keeping
+// its frame even when it received no content.
+//
+// It behaves like a write: it first emits any held-back headers — this frame's
+// and every enclosing one's — and then the end marker, so an empty sequence
+// still reaches the wire as begin+end.
+//
+// Required wherever the frame carries information beyond its contents:
+//
+//   - a wrapper-array element (struct/union/nested row): element presence is
+//     what carries a dynamic array's length — highest present id + 1 (§5.1) — so
+//     dropping an all-default element would change the decoded length, not just
+//     the bytes;
+//   - an array field already known to differ from a non-empty declared default:
+//     absence would reconstruct that default, so the empty frame is the only
+//     encoding of "explicitly empty" (§2, §3).
+//
+// The two failure directions are not symmetric, which is why this is the safe
+// choice when a call site is ambiguous: using it where WriteSequenceEnd would do
+// costs one non-canonical empty frame that every decoder normalizes away, while
+// the reverse silently changes an array's length.
+func (e *Encoder) WriteSequenceEndKeep() error {
+	if e.err != nil {
+		return e.err
+	}
+	if len(e.pending) != 0 {
+		e.commitPending()
+	}
 	e.writeHeader(0, TypeSequenceEnd)
 	if e.err == nil && e.depth > 0 {
 		e.depth--

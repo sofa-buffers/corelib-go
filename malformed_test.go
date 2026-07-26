@@ -91,21 +91,33 @@ func TestOversizedCountLengthInvalid(t *testing.T) {
 // TestDeepNestingRejected already covers the ErrArgument sentinel and both decode
 // paths; this adds the "writes no bytes" assertion it cannot make against
 // io.Discard, by opening the 256th sequence over a real buffer.
+//
+// A scalar is written at the bottom of the nest before the assertion: sequence
+// headers are held back until a sequence gets content (MESSAGE_SPEC §2), so
+// without it the 255 opens would emit nothing and "no growth" would be trivially
+// true. The write commits all 255 headers, giving the assertion real bytes to
+// compare against.
 func TestDeepNestingEncoderWritesNoBytes(t *testing.T) {
 	var buf bytes.Buffer
 	e := sofab.NewEncoder(&buf)
 	for i := 0; i < sofab.MaxDepth; i++ {
-		if err := e.WriteSequenceBegin(0); err != nil {
+		if err := e.WriteSequenceBeginLazy(0); err != nil {
 			t.Fatalf("begin %d = %v", i, err)
 		}
+	}
+	if err := e.WriteUnsigned(1, 7); err != nil {
+		t.Fatalf("write at depth %d = %v", sofab.MaxDepth, err)
 	}
 	if err := e.Flush(); err != nil {
 		t.Fatalf("flush = %v", err)
 	}
 	before := buf.Len()
+	if before == 0 {
+		t.Fatal("expected the committed sequence headers in the buffer, got none")
+	}
 
 	// The 256th open is rejected and must not add a byte to the buffer.
-	if err := e.WriteSequenceBegin(0); !errors.Is(err, sofab.ErrArgument) {
+	if err := e.WriteSequenceBeginLazy(0); !errors.Is(err, sofab.ErrArgument) {
 		t.Fatalf("256th begin = %v, want ErrArgument", err)
 	}
 	if err := e.Flush(); err != nil {

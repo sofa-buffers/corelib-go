@@ -41,7 +41,12 @@ func (m *SensorReading) Marshal(e *sofab.Encoder) {
 	e.WriteSigned(fieldTemperature, int64(m.Temperature))
 	e.WriteString(fieldName, m.Name)
 	sofab.WriteUnsignedArray(e, fieldSamples, m.Samples)
-	e.WriteSequenceBegin(fieldCalibration)
+	// A struct FIELD: BeginLazy holds the header back and End drops the frame if
+	// the nested marshal writes nothing, so an all-default sub-message is omitted
+	// rather than framed empty (MESSAGE_SPEC §2). A wrapper-array ELEMENT would
+	// close with WriteSequenceEndKeep instead — its presence is what carries the
+	// array's length (§5.1).
+	e.WriteSequenceBeginLazy(fieldCalibration)
 	m.Calibration.marshal(e)
 	e.WriteSequenceEnd()
 }
