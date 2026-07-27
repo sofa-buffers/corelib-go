@@ -56,7 +56,7 @@ import sofab "github.com/sofa-buffers/corelib-go"
 | Sticky errors | The encoder records the first failure and turns later writes into no-ops, so generated `Marshal` can issue a run of writes and check once at `Flush`. |
 | Generics for arrays | `WriteUnsignedArray[T]` / `ReadUnsignedArray[T]` (and signed variants) accept any `~uint8..~uint64` / `~int8..~int64` element type; float arrays have dedicated methods. |
 | Forward/backward compatible | Unknown fields are consumed with `Skip()` — old readers tolerate new fields, new readers tolerate missing ones. |
-| Canonical sequence framing | `WriteSequenceBeginLazy` holds a sequence header back until the sequence gets content, so an all-default one is omitted rather than framed empty (MESSAGE_SPEC §2) — in one forward pass, without buffering the sub-message. `WriteSequenceEndKeep` forces the frame where its presence carries meaning (a wrapper-array element). |
+| Canonical sequence framing | `WriteSequenceBeginLazy` holds a sequence header back until the sequence gets content, so an all-default sequence **field** is omitted rather than framed empty (MESSAGE_SPEC §2) — in one forward pass, without buffering the sub-message. A wrapper-array **element** keeps its frame even when all-default, since element presence is what carries a dynamic array's length (§5.1); it closes with `WriteSequenceEndKeep`, which forces the frame out. The hold-back has no depth bound of its own: the pending run grows with the nesting, so every sequence up to `MaxDepth` is canonical (CORELIB_PLAN §6). |
 
 ## Usage
 

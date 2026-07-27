@@ -150,10 +150,17 @@ func (e *Encoder) putRaw(data []byte) {
 // Write* method below reaches the wire through it — so it is also where a
 // held-back sequence run is committed: the field about to be written is
 // content, which proves every enclosing sequence differs from its default and
-// must be framed after all (MESSAGE_SPEC §2). The two sequence markers are
-// excluded because they are framing, not content: WriteSequenceEndKeep commits
-// the run itself before writing its marker, and WriteSequenceEnd only reaches
-// here with an already-empty run.
+// must be framed after all (MESSAGE_SPEC §2).
+//
+// The commit is unconditional on the wire type, because by construction no
+// framing marker can arrive here with a run still pending: TypeSequenceStart is
+// never routed through writeHeader at all (WriteSequenceBeginLazy only pushes an
+// id, and commitPending emits the run's headers itself), and of the two closers
+// WriteSequenceEndKeep commits the run before writing its marker while
+// WriteSequenceEnd reaches here only once the run is already empty. An earlier
+// `t != TypeSequenceStart && t != TypeSequenceEnd` guard here was therefore dead
+// — and left the false impression that a marker might legitimately show up
+// mid-run — so it is gone rather than kept as decoration.
 func (e *Encoder) writeHeader(id ID, t WireType) {
 	if e.err != nil {
 		return
@@ -162,7 +169,7 @@ func (e *Encoder) writeHeader(id ID, t WireType) {
 		e.err = ErrArgument
 		return
 	}
-	if len(e.pending) != 0 && t != TypeSequenceStart && t != TypeSequenceEnd {
+	if len(e.pending) != 0 {
 		e.commitPending()
 	}
 	e.putVarint((uint64(id) << 3) | uint64(t))

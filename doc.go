@@ -64,6 +64,13 @@
 // non-canonical empty frame that every decoder normalizes away, while the
 // reverse silently changes an array's length.
 //
+// The hold-back reaches the full MaxDepth: the run of held-back ids grows with
+// the nesting, with no fixed window past which this package would give up and
+// frame eagerly, so its output is canonical at every depth — what CORELIB_PLAN
+// §6 requires of an implementation that can allocate. (Only a heap-free profile
+// may bound the run and emit the empty frames beyond that bound; such output is
+// still well-formed and decodes to the same value, it is simply not canonical.)
+//
 // # Decode outcome (three-valued, finish-less)
 //
 // Decoding reports one of three outcomes (MESSAGE_SPEC §7), on both the pull and

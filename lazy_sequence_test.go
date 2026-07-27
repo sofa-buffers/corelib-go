@@ -13,6 +13,7 @@ import (
 	"bytes"
 	"errors"
 	"io"
+	"strconv"
 	"testing"
 
 	sofab "github.com/sofa-buffers/corelib-go"
@@ -110,6 +111,11 @@ func TestLazySequenceAfterContentIsIndependent(t *testing.T) {
 // design: the held-back ids live in the Encoder, not in the buffer, so pushing
 // the buffer to the sink between the begin and its first content cannot split
 // the pending run or reorder a byte.
+//
+// The caller-driven Flush is the *only* way to land a flush while a header is
+// held back — see TestRunCommittedAcrossAFlushMatchesOneShot for why the
+// automatic, buffer-pressure flush cannot — so this is the test that covers the
+// reachable case.
 func TestLazyFramingSurvivesAnExplicitFlush(t *testing.T) {
 	var buf bytes.Buffer
 	e := sofab.NewEncoder(&buf)
@@ -131,23 +137,39 @@ func TestLazyFramingSurvivesAnExplicitFlush(t *testing.T) {
 	wantBytes(t, buf.Bytes(), []byte{0x00, 0x01, 0x0E, 0x16, 0x00, 0x2A, 0x07, 0x07})
 }
 
-// TestLazyFramingIsFlushBoundaryIndependent is the Go form of "encode through a
+// TestRunCommittedAcrossAFlushMatchesOneShot is the Go form of "encode through a
 // buffer far smaller than the message and get byte-identical output". The Go
 // Encoder has no caller-supplied buffer — it accumulates into an internal slice
 // and pushes to the io.Writer once that slice passes its threshold — so the
 // small-buffer case is a message big enough to drive several mid-stream Writes
-// while a lazy sequence is open (chunkWriter, streaming_test.go). The
-// concatenated chunks must equal the one-shot bytes exactly.
-func TestLazyFramingIsFlushBoundaryIndependent(t *testing.T) {
+// while a lazy sequence is open (chunkWriter, streaming_test.go).
+//
+// What it asserts is exactly what it can prove: a run *committed* across a flush
+// boundary — the sequence headers go out in one Write, the payload they frame in
+// later ones — yields byte-identical output to the same message encoded in one
+// shot, and to the hand-computed ground truth.
+//
+// It deliberately does NOT claim to catch "an automatic flush split a pending
+// run", because that state is unreachable by construction: held-back ids are
+// encoder state and occupy no buffer space, and the buffer only grows through a
+// write — which commits the whole run before its own first byte. So the
+// threshold can never be crossed with a header still pending. The one way to
+// flush mid-run at all is the caller's own Flush, covered by
+// TestLazyFramingSurvivesAnExplicitFlush.
+func TestRunCommittedAcrossAFlushMatchesOneShot(t *testing.T) {
 	payload := bytes.Repeat([]byte{0xAB}, 40000) // far past the internal threshold
+
+	write := func(e *sofab.Encoder) {
+		e.WriteSequenceBeginLazy(1)
+		e.WriteSequenceBeginLazy(2)
+		e.WriteSequenceEnd() // empty inner: dropped even though a flush intervenes
+		e.WriteBytes(0, payload)
+		e.WriteSequenceEnd()
+	}
 
 	var w chunkWriter
 	e := sofab.NewEncoder(&w)
-	e.WriteSequenceBeginLazy(1)
-	e.WriteSequenceBeginLazy(2)
-	e.WriteSequenceEnd() // empty inner: dropped even though a flush intervenes
-	e.WriteBytes(0, payload)
-	e.WriteSequenceEnd()
+	write(e)
 	if err := e.Flush(); err != nil {
 		t.Fatalf("flush: %v", err)
 	}
@@ -155,7 +177,7 @@ func TestLazyFramingIsFlushBoundaryIndependent(t *testing.T) {
 		t.Fatalf("sink saw %d writes, want the message split across several", w.writes)
 	}
 
-	// Expected: sequence header id 1, blob header id 0, fixlen word
+	// Ground truth: sequence header id 1, blob header id 0, fixlen word
 	// (len<<3)|blob=3, the payload, then the end marker.
 	var want []byte
 	want = append(want, 0x0E, 0x02)
@@ -170,7 +192,12 @@ func TestLazyFramingIsFlushBoundaryIndependent(t *testing.T) {
 	}
 	want = append(want, payload...)
 	want = append(want, 0x07)
+
 	wantBytes(t, w.buf.Bytes(), want)
+	// ... and identical to the one-shot encode (a sink that takes it all in one
+	// Write still sees the buffer flushed by threshold, but nothing about the
+	// framing decision differs).
+	wantBytes(t, w.buf.Bytes(), encode(t, write))
 }
 
 // TestLazySequenceArgumentErrors pins the two rejections WriteSequenceBeginLazy
@@ -252,5 +279,129 @@ func TestEveryWriterCommitsPendingRun(t *testing.T) {
 				t.Fatalf("decode %v: % X", err, got)
 			}
 		})
+	}
+}
+
+// --- depth (§4.9) and the pending run at depth ------------------------------
+
+// TestClosingASequenceRestoresDepth pins the bookkeeping half of the MaxDepth
+// guarantee: every closer must give the depth budget back. Nothing else can
+// observe Encoder.depth from outside the package, so the observation is made
+// where it matters — the budget itself: MaxDepth+16 sequential open/close cycles
+// must all succeed, which they cannot if a closer forgets to decrement, and a
+// full-depth nest must still fit afterwards while the one past it is still
+// refused, which catches a decrement in the other direction.
+//
+// It is driven once per closing *path*, because they decrement in three
+// different places: WriteSequenceEnd dropping a held-back frame, WriteSequenceEnd
+// closing a framed one, and WriteSequenceEndKeep.
+func TestClosingASequenceRestoresDepth(t *testing.T) {
+	cycles := map[string]func(*sofab.Encoder){
+		"End/dropped": func(e *sofab.Encoder) {
+			e.WriteSequenceBeginLazy(1)
+			e.WriteSequenceEnd()
+		},
+		"End/withContent": func(e *sofab.Encoder) {
+			e.WriteSequenceBeginLazy(1)
+			e.WriteUnsigned(0, 1)
+			e.WriteSequenceEnd()
+		},
+		"EndKeep": func(e *sofab.Encoder) {
+			e.WriteSequenceBeginLazy(1)
+			e.WriteSequenceEndKeep()
+		},
+	}
+	for name, cycle := range cycles {
+		t.Run(name, func(t *testing.T) {
+			var buf bytes.Buffer
+			e := sofab.NewEncoder(&buf)
+			for i := 0; i < sofab.MaxDepth+16; i++ {
+				cycle(e)
+				if err := e.Err(); err != nil {
+					t.Fatalf("open/close cycle %d = %v: the closer is not restoring depth", i, err)
+				}
+			}
+			// The budget is intact, not merely non-zero: a full nest still fits...
+			for i := 0; i < sofab.MaxDepth; i++ {
+				if err := e.WriteSequenceBeginLazy(1); err != nil {
+					t.Fatalf("open %d of a full nest = %v, want it to fit", i, err)
+				}
+			}
+			// ...and the one past MaxDepth is still refused (a closer that gave
+			// back too much would let it through).
+			if err := e.WriteSequenceBeginLazy(1); !errors.Is(err, sofab.ErrArgument) {
+				t.Fatalf("open past MaxDepth = %v, want ErrArgument", err)
+			}
+		})
+	}
+}
+
+// TestDeepNestingPastTheInlineRunEmitsNothing is the "no hold-back window" test.
+// The Encoder holds the pending run in a slice backed by a small inline array
+// and lets append spill it to the heap, so there is no bound past which it
+// frames eagerly (CORELIB_PLAN §6, "How deep the hold-back reaches": an
+// implementation that can allocate MUST hold back to the full MAX_DEPTH). This
+// nests far past that inline capacity — and, in the second case, all the way to
+// MaxDepth — closes every level contentless, and demands zero bytes: the eager
+// fallback other profiles are allowed to take is exactly what would show up here
+// as a run of empty frames.
+func TestDeepNestingPastTheInlineRunEmitsNothing(t *testing.T) {
+	for _, depth := range []int{40, sofab.MaxDepth} {
+		t.Run(strconv.Itoa(depth), func(t *testing.T) {
+			got := encode(t, func(e *sofab.Encoder) {
+				for i := 0; i < depth; i++ {
+					if err := e.WriteSequenceBeginLazy(1); err != nil {
+						t.Fatalf("open %d = %v", i, err)
+					}
+				}
+				for i := 0; i < depth; i++ {
+					if err := e.WriteSequenceEnd(); err != nil {
+						t.Fatalf("close %d = %v", i, err)
+					}
+				}
+			})
+			if len(got) != 0 {
+				t.Fatalf("got % X (%d bytes), want no bytes", got, len(got))
+			}
+		})
+	}
+}
+
+// TestDeepNestingPastTheInlineRunCommitsInOrder is its counterpart: once the
+// spilled run does get content, every held-back header must come back out
+// outermost-first and in one piece. A spill that lost or reordered entries would
+// still produce "zero bytes" above, so the empty case alone does not cover it.
+func TestDeepNestingPastTheInlineRunCommitsInOrder(t *testing.T) {
+	const depth = 40 // past the Encoder's inline pending capacity
+
+	got := encode(t, func(e *sofab.Encoder) {
+		for i := 0; i < depth; i++ {
+			e.WriteSequenceBeginLazy(sofab.ID(i))
+		}
+		e.WriteUnsigned(0, 42)
+		for i := 0; i < depth; i++ {
+			e.WriteSequenceEnd()
+		}
+	})
+
+	var want []byte
+	for i := 0; i < depth; i++ { // headers, outermost (id 0) first
+		for v := uint64(i)<<3 | 0x06; ; { // ids past 15 need a two-byte header
+			if v >= 0x80 {
+				want = append(want, byte(v)|0x80)
+				v >>= 7
+				continue
+			}
+			want = append(want, byte(v))
+			break
+		}
+	}
+	want = append(want, 0x00, 0x2A)
+	for i := 0; i < depth; i++ {
+		want = append(want, 0x07)
+	}
+	wantBytes(t, got, want)
+	if err := sofab.AcceptBytes(got, baseV{}); err != nil {
+		t.Fatalf("decode: %v", err)
 	}
 }

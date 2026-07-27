@@ -36,24 +36,43 @@ const (
 	calGain   sofab.ID = 2
 )
 
+// Marshal writes the message the way generated code does: each field is written
+// only when it differs from its declared default — here the zero value —
+// because a field equal to its default is omitted from the wire (MESSAGE_SPEC
+// §2). The reader reconstructs it from the schema.
 func (m *SensorReading) Marshal(e *sofab.Encoder) {
-	e.WriteUnsigned(fieldID, uint64(m.ID))
-	e.WriteSigned(fieldTemperature, int64(m.Temperature))
-	e.WriteString(fieldName, m.Name)
-	sofab.WriteUnsignedArray(e, fieldSamples, m.Samples)
+	if m.ID != 0 {
+		e.WriteUnsigned(fieldID, uint64(m.ID))
+	}
+	if m.Temperature != 0 {
+		e.WriteSigned(fieldTemperature, int64(m.Temperature))
+	}
+	if m.Name != "" {
+		e.WriteString(fieldName, m.Name)
+	}
+	if len(m.Samples) != 0 {
+		sofab.WriteUnsignedArray(e, fieldSamples, m.Samples)
+	}
 	// A struct FIELD: BeginLazy holds the header back and End drops the frame if
 	// the nested marshal writes nothing, so an all-default sub-message is omitted
-	// rather than framed empty (MESSAGE_SPEC §2). A wrapper-array ELEMENT would
-	// close with WriteSequenceEndKeep instead — its presence is what carries the
-	// array's length (§5.1).
+	// rather than framed empty (MESSAGE_SPEC §2). That is what makes the per-field
+	// test above compose: because Calibration.marshal omits each of its own
+	// default-valued fields, "not one child was written" is exactly "the
+	// sub-message equals its default" — no extra whole-object comparison needed.
+	// A wrapper-array ELEMENT would close with WriteSequenceEndKeep instead — its
+	// presence is what carries the array's length (§5.1).
 	e.WriteSequenceBeginLazy(fieldCalibration)
 	m.Calibration.marshal(e)
 	e.WriteSequenceEnd()
 }
 
 func (c *Calibration) marshal(e *sofab.Encoder) {
-	e.WriteFloat32(calOffset, c.Offset)
-	e.WriteFloat32(calGain, c.Gain)
+	if c.Offset != 0 {
+		e.WriteFloat32(calOffset, c.Offset)
+	}
+	if c.Gain != 0 {
+		e.WriteFloat32(calGain, c.Gain)
+	}
 }
 
 func (m *SensorReading) Unmarshal(d *sofab.Decoder) error {
@@ -134,5 +153,25 @@ func Example() {
 
 	fmt.Printf("id=%d temp=%d name=%s samples=%v offset=%.1f gain=%.1f\n",
 		out.ID, out.Temperature, out.Name, out.Samples, out.Calibration.Offset, out.Calibration.Gain)
+
+	// The same Marshal on an all-default value writes nothing at all: every
+	// field is omitted, so the nested Calibration receives no content and its
+	// held-back header is dropped along with its end marker (MESSAGE_SPEC §2).
+	// An all-default message is the empty byte string, and decoding it back
+	// yields the defaults again.
+	var empty bytes.Buffer
+	def := sofab.NewEncoder(&empty)
+	(&SensorReading{}).Marshal(def)
+	if err := def.Flush(); err != nil {
+		panic(err)
+	}
+	var back SensorReading
+	if err := back.Unmarshal(sofab.NewDecoder(&empty)); err != nil {
+		panic(err)
+	}
+	fmt.Printf("all-default: %d bytes, decodes back to id=%d gain=%.1f\n",
+		empty.Len(), back.ID, back.Calibration.Gain)
+
 	// Output: id=7 temp=-12 name=sensor-A samples=[100 200 300] offset=0.5 gain=2.0
+	// all-default: 0 bytes, decodes back to id=0 gain=0.0
 }
