@@ -12,7 +12,11 @@ func TestTrimTail(t *testing.T) {
 	if got := sofab.TrimTail([]uint32{1, 0, 2, 0, 0}, 0); len(got) != 3 || got[2] != 2 {
 		t.Errorf("TrimTail = %v, want [1 0 2]", got)
 	}
-	// An all-default array trims to empty — the field is then omitted entirely.
+	// An all-default array trims to empty. The FIELD is then omitted entirely if
+	// its declared default is the empty collection; if that default is non-empty,
+	// the explicitly empty array must still reach the wire (the wrapper closes
+	// with WriteSequenceEndKeep), because absence would reconstruct the non-empty
+	// default instead (MESSAGE_SPEC §2).
 	if got := sofab.TrimTail([]uint32{0, 0, 0, 0}, 0); len(got) != 0 {
 		t.Errorf("all-default array should trim to empty, got %v", got)
 	}

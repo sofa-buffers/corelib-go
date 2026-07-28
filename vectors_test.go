@@ -48,6 +48,21 @@ type vectorFile struct {
 	Vectors []vector `json:"vectors"`
 }
 
+// loadVectors reads the shared vector file.
+//
+// Which column this repo asserts: `serialized` — the primitive-layer ground
+// truth, every field written explicitly and every sequence framed. It is the
+// only form a corelib can produce, because a corelib has no message layer: it
+// never sees a schema, a declared default, or a whole object, so it can never
+// decide that a field equals its default and omit it.
+//
+// The file also carries a `serialized_sparse` column (the MESSAGE_SPEC §2 form,
+// where a field equal to its declared default — including an all-default
+// sequence field — is omitted). Nothing here reads it, deliberately: it is
+// exercised by the *generator's* conformance drivers (sofabgen,
+// tests/conformance/<lang>/run.sh), which generate the message layer that
+// produces it. The vector struct above accordingly has no field for it, so its
+// absence cannot be mistaken for coverage that exists.
 func loadVectors(t *testing.T) vectorFile {
 	t.Helper()
 	raw, err := os.ReadFile("assets/test_vectors.json")
@@ -145,9 +160,14 @@ func encodeField(t *testing.T, e *sofab.Encoder, f vecField) {
 	case "array":
 		encodeArray(t, e, id, f)
 	case "sequence_begin":
-		e.WriteSequenceBegin(id)
+		e.WriteSequenceBeginLazy(id)
 	case "sequence_end":
-		e.WriteSequenceEnd()
+		// A vector's `serialized` form is the primitive-layer ground truth and
+		// always carries the frame, so every sequence closes with
+		// WriteSequenceEndKeep: identical bytes once the sequence has content,
+		// and the empty-sequence vectors keep their begin+end pair instead of
+		// vanishing (MESSAGE_SPEC §2).
+		e.WriteSequenceEndKeep()
 	default:
 		t.Fatalf("unknown op %q", f.Op)
 	}

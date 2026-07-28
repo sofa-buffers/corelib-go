@@ -246,7 +246,10 @@ func (f failOn) BeginSequence(sofab.ID) (sofab.Visitor, error) {
 func (f failOn) EndSequence() error { return f.hit("EndSequence") }
 
 func TestVisitorPropagatesErrors(t *testing.T) {
-	seq := func(e *sofab.Encoder) { e.WriteSequenceBegin(1); e.WriteSequenceEnd() }
+	// EndKeep, not End: this vector needs a sequence frame on the wire for the
+	// decoder to reach BeginSequence/EndSequence, and a contentless sequence
+	// closed with End emits nothing at all (MESSAGE_SPEC §2).
+	seq := func(e *sofab.Encoder) { e.WriteSequenceBeginLazy(1); e.WriteSequenceEndKeep() }
 	build := map[string]func(*sofab.Encoder){
 		"Unsigned":      func(e *sofab.Encoder) { e.WriteUnsigned(1, 5) },
 		"Signed":        func(e *sofab.Encoder) { e.WriteSigned(1, -5) },
@@ -355,11 +358,11 @@ func TestDeepNestingRejected(t *testing.T) {
 	// Encoder caps at MaxDepth open sequences.
 	e := sofab.NewEncoder(io.Discard)
 	for i := 0; i < sofab.MaxDepth; i++ {
-		if err := e.WriteSequenceBegin(0); err != nil {
+		if err := e.WriteSequenceBeginLazy(0); err != nil {
 			t.Fatalf("begin %d = %v", i, err)
 		}
 	}
-	if err := e.WriteSequenceBegin(0); !errors.Is(err, sofab.ErrArgument) {
+	if err := e.WriteSequenceBeginLazy(0); !errors.Is(err, sofab.ErrArgument) {
 		t.Fatalf("256th begin = %v, want ErrArgument", err)
 	}
 
@@ -382,7 +385,7 @@ func TestDeepNestingRejected(t *testing.T) {
 func TestMaxDepthRoundTrip(t *testing.T) {
 	got := encode(t, func(e *sofab.Encoder) {
 		for i := 0; i < sofab.MaxDepth; i++ {
-			e.WriteSequenceBegin(1)
+			e.WriteSequenceBeginLazy(1)
 		}
 		e.WriteUnsigned(2, 7)
 		for i := 0; i < sofab.MaxDepth; i++ {

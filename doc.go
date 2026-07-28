@@ -32,6 +32,45 @@
 // message. AcceptBytes is the zero-copy form when the message is already a
 // []byte (e.g. generated Unmarshal).
 //
+// # Sequence framing (omitting an all-default sequence)
+//
+// MESSAGE_SPEC §2 omits a sequence-typed *field* whose value equals its declared
+// default instead of emitting an empty begin/end frame — but a wrapper-array
+// *element* keeps its frame even when all-default, because element presence is
+// what carries a dynamic array's length (§5.1). Whether a sequence is emitted
+// therefore depends on what its children turn out to be, while its header must
+// precede them, and the format exists to be streamed, so the sub-message must
+// not be buffered to find out.
+//
+// Encoder.WriteSequenceBeginLazy resolves that by holding the header back: the
+// first field write inside the sequence emits the whole run of held-back
+// headers, outermost first. Since generated Marshal code already omits every
+// child equal to its default, "not one child was written" is exactly "the object
+// equals its declared default" — per child field, recursively, for free, and
+// never as a byte comparison, so struct padding cannot influence it.
+//
+// The closer is a static property of the position in the schema, not of the
+// value:
+//
+//   - Encoder.WriteSequenceEnd — a struct/union field, and an array wrapper
+//     whose declared default is the empty collection: a contentless sequence
+//     vanishes, header and end marker both.
+//   - Encoder.WriteSequenceEndKeep — a wrapper-array element, and an array field
+//     that differs from a non-empty declared default: the frame is emitted even
+//     with no content.
+//
+// The two failure directions are not symmetric, which makes EndKeep the safe
+// default when a call site is ambiguous: using it where End would do costs one
+// non-canonical empty frame that every decoder normalizes away, while the
+// reverse silently changes an array's length.
+//
+// The hold-back reaches the full MaxDepth: the run of held-back ids grows with
+// the nesting, with no fixed window past which this package would give up and
+// frame eagerly, so its output is canonical at every depth — what CORELIB_PLAN
+// §6 requires of an implementation that can allocate. (Only a heap-free profile
+// may bound the run and emit the empty frames beyond that bound; such output is
+// still well-formed and decodes to the same value, it is simply not canonical.)
+//
 // # Decode outcome (three-valued, finish-less)
 //
 // Decoding reports one of three outcomes (MESSAGE_SPEC §7), on both the pull and

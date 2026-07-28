@@ -317,9 +317,9 @@ func TestSkipNestedSequence(t *testing.T) {
 	var buf bytes.Buffer
 	e := sofab.NewEncoder(&buf)
 	e.WriteUnsigned(1, 11)
-	e.WriteSequenceBegin(2)
+	e.WriteSequenceBeginLazy(2)
 	e.WriteUnsigned(0, 99)
-	e.WriteSequenceBegin(5) // nested sequence inside
+	e.WriteSequenceBeginLazy(5) // nested sequence inside
 	e.WriteString(0, "deep")
 	e.WriteSequenceEnd()
 	e.WriteSigned(0, -1)
