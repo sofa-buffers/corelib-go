@@ -244,6 +244,25 @@ func TestF0038SkippedStringNotValidated(t *testing.T) {
 			name: "unknown id inside a declared sequence",
 			in:   []byte{0x56, 0x4a, 0x0a, 0x8a, 0x07},
 		},
+		{
+			// §7.3 at a DECLARED string id: nested.str (id 2, declared string)
+			// arrives with fixlen subtype BLOB (0b). The wire subtype
+			// contradicts the schema, so the field is skipped exactly as an
+			// unknown id is (MESSAGE_SPEC §7.3) — it reaches Visitor.Blob,
+			// where the string arm does not live, so nothing is validated and
+			// nothing is stored. Proves the check is keyed on actual
+			// materialization, not on "the schema declares a string here".
+			name: "declared string id arriving as blob is skipped",
+			in:   []byte{0x56, 0x12, 0x0b, 0x8a, 0x07},
+		},
+		{
+			// The mirror image: nested.bytes_field (id 3, declared blob, 1a =
+			// (3<<3)|2 FIXLEN) arrives as subtype STRING. It reaches
+			// Visitor.String at an id with no string arm, so the payload is
+			// skipped, never validated.
+			name: "declared blob id arriving as string is skipped",
+			in:   []byte{0x56, 0x1a, 0x0a, 0x8a, 0x07},
+		},
 	}
 
 	for _, tc := range cases {
@@ -312,6 +331,9 @@ func TestF0038ChunkBoundaryDeterminism(t *testing.T) {
 		{"C1 declared nested.str", []byte{0x56, 0x12, 0x0a, 0x8a, 0x07}, sofab.ErrInvalidMsg},
 		{"V2 §7.3 mistyped slot", []byte{0xd6, 0x0c, 0x02, 0x12, 0xff, 0xff, 0x07}, nil},
 		{"truncated skipped string", []byte{0x4a, 0x12, 0xff}, sofab.ErrIncomplete},
+		{"§7.3 declared string id as blob", []byte{0x56, 0x12, 0x0b, 0x8a, 0x07}, nil},
+		{"§7.3 declared blob id as string", []byte{0x56, 0x1a, 0x0a, 0x8a, 0x07}, nil},
+		{"materialized string_array element", []byte{0xc6, 0x0c, 0x02, 0x0a, 0x8a, 0x07}, sofab.ErrInvalidMsg},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
