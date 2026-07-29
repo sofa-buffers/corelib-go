@@ -4,7 +4,6 @@ import (
 	"encoding/binary"
 	"io"
 	"math"
-	"unicode/utf8"
 )
 
 // cursor parses a Sofab message by advancing an index over a single contiguous
@@ -292,13 +291,18 @@ func (c *cursor) acceptFixlen(v Visitor, hv HeaderVisitor, id ID) error {
 		if err != nil {
 			return err
 		}
-		// c.take yields the complete payload (or ErrIncomplete) before this
-		// check, so validity is judged on the whole string, not a chunk slice
-		// (§6.4). Gated by SOFAB_STRICT_UTF8 (default ON); when off the bytes pass
-		// through verbatim.
-		if c.lim.strictUTF8 && !utf8.Valid(b) {
-			return ErrInvalidMsg // invalid UTF-8 (§5.2 INVALID)
-		}
+		// No UTF-8 validation here (§6.4 "Skipped fields are never validated").
+		// The cursor cannot know whether the visitor has a destination for this
+		// id: an id the schema does not declare — and a field whose wire type
+		// contradicts the schema (MESSAGE_SPEC §7.3) — reaches this callback
+		// exactly like a declared one, and validating here would turn a field
+		// that is merely skipped into INVALID. Go's string is a byte-container
+		// type (§6.4), so the wire bytes pass through verbatim and validation
+		// belongs at the destination: generated code calls the Utf8Valid
+		// primitive (utf8.go) inside the arm that binds the value. The framing —
+		// the fixlen word, the reserved-subtype rejection, arrayMax, and the
+		// exact length advance in c.take — is fully checked either way, which is
+		// what keeps a skip a length jump and not a peek.
 		return v.String(id, string(b))
 	case fixBlob:
 		b, err := c.take(n)

@@ -71,8 +71,16 @@ func WithMaxBlobLen(n int) Option {
 //     bytes verbatim on decode / writes them verbatim on encode — never lossy,
 //     never a silent replacement (§6.4).
 //
+// Scope on decode: this option governs Decoder.String, the pull read that
+// materializes a string by construction. The visitor path (Accept, AcceptBytes)
+// never validates in either setting, because the cursor cannot tell a field the
+// visitor binds from one it skips and §6.4 forbids validating a skip; there the
+// check belongs to the destination and is performed by the caller via the
+// Utf8Valid primitive, whose own gate is compile-time (see utf8.go).
+//
 // The knob never changes how valid data is encoded, so two peers with different
-// settings interoperate on all valid data.
+// settings interoperate on all valid data. It is a validation policy, never a
+// wire-format switch.
 func WithStrictUTF8(enabled bool) Option {
 	return func(l *limits) { l.strictUTF8 = enabled }
 }
