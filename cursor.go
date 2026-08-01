@@ -179,9 +179,11 @@ func (c *cursor) accept(v Visitor, depth int) error {
 			}
 			// Header hook at the count word, before the truncation check below, so
 			// a schema over-count is INVALID even when the array is then truncated
-			// (§5.2). No-op unless the visitor declares a bound.
+			// (§5.2). No-op unless the visitor declares a bound. An integer array
+			// carries no second word, so the wire type alone fixes the element kind
+			// and the hook fires here — unlike the fixlen array (§4.8).
 			if hv != nil {
-				if err := hv.ArrayBegin(id, int(n)); err != nil {
+				if err := hv.ArrayBegin(id, ArrayUnsigned, int(n)); err != nil {
 					return err
 				}
 			}
@@ -206,7 +208,7 @@ func (c *cursor) accept(v Visitor, depth int) error {
 				return err
 			}
 			if hv != nil {
-				if err := hv.ArrayBegin(id, int(n)); err != nil {
+				if err := hv.ArrayBegin(id, ArraySigned, int(n)); err != nil {
 					return err
 				}
 			}
@@ -320,22 +322,47 @@ func (c *cursor) acceptFixlenArray(v Visitor, hv HeaderVisitor, id ID) error {
 	if err != nil {
 		return err
 	}
-	if hv != nil {
-		if err := hv.ArrayBegin(id, int(n)); err != nil {
-			return err
-		}
-	}
 	// A fixlen array always carries its fixlen_word, even when empty (§4.8), so
 	// the element subtype is always on the wire: an empty fp32 array dispatches
 	// to Float32Array and an empty fp64 array to Float64Array.
+	//
+	// The word is read BEFORE the header hook fires (§4.8 decode order). The
+	// count word above already enforced the format ceiling arrayMax and any
+	// receiver limit — neither moves — but nothing schema-bound may be judged on
+	// the count alone: the subtype decides whether this header is the declared
+	// field's value at all, and a header skipped under §7.3 must not have the
+	// schema count bound applied to it. Two consequences, both intended: a
+	// message ending between the two words is INCOMPLETE (the hook never fires),
+	// and an over-count with a contradicting subtype is a skip, not INVALID.
 	h, err := c.uvarint(false)
 	if err != nil {
 		return err
 	}
 	sub := h & 0x07
 	size := h >> 3
+	// Validate the word as a FORMAT matter first: §4.8 admits only fp32/4 and
+	// fp64/8 as fixlen-array elements. A string or blob subtype, or a width
+	// mismatch, is malformed regardless of the schema — it is INVALID here and is
+	// never routed to the §7.3 skip path, even though its subtype also
+	// contradicts whatever was declared.
+	var kind ArrayKind
 	switch {
 	case sub == fixFp32 && size == 4:
+		kind = ArrayFp32
+	case sub == fixFp64 && size == 8:
+		kind = ArrayFp64
+	default:
+		return ErrInvalidMsg
+	}
+	// Only now is the array offered to the header hook, with a kind that names
+	// the actual element subtype. Still exactly one call per array field, never
+	// per element; count == 0 is offered like any other.
+	if hv != nil {
+		if err := hv.ArrayBegin(id, kind, int(n)); err != nil {
+			return err
+		}
+	}
+	if kind == ArrayFp32 {
 		payload, err := c.take(n * 4)
 		if err != nil {
 			return err
@@ -345,17 +372,14 @@ func (c *cursor) acceptFixlenArray(v Visitor, hv HeaderVisitor, id ID) error {
 			out[i] = math.Float32frombits(binary.LittleEndian.Uint32(payload[i*4:]))
 		}
 		return v.Float32Array(id, out)
-	case sub == fixFp64 && size == 8:
-		payload, err := c.take(n * 8)
-		if err != nil {
-			return err
-		}
-		out := make([]float64, n)
-		for i := range out {
-			out[i] = math.Float64frombits(binary.LittleEndian.Uint64(payload[i*8:]))
-		}
-		return v.Float64Array(id, out)
-	default:
-		return ErrInvalidMsg
 	}
+	payload, err := c.take(n * 8)
+	if err != nil {
+		return err
+	}
+	out := make([]float64, n)
+	for i := range out {
+		out[i] = math.Float64frombits(binary.LittleEndian.Uint64(payload[i*8:]))
+	}
+	return v.Float64Array(id, out)
 }

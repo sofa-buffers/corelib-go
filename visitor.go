@@ -31,14 +31,14 @@ type Visitor interface {
 }
 
 // HeaderVisitor is an optional extension a Visitor may also implement to inspect
-// an array's element count or a fixlen field's declared length at the header —
-// the instant the count/length word is read, before the truncation check and
-// before any element or payload byte. It exists so a schema-bound violation
-// (over-count, over-maxlen) is rejected at the header as INVALID by returning
-// ErrInvalidMsg, even when the field is then truncated: MESSAGE_SPEC §5.2 has
-// INVALID dominate INCOMPLETE ("anti-folding" — more bytes cannot make a
-// schema-illegal count/length legal), so the whole-slice callback the generated
-// len(v)>N guard runs in is too late once the array is truncated.
+// an array's element kind and count, or a fixlen field's declared length, at the
+// header — before the truncation check and before any element or payload byte.
+// It exists so a schema-bound violation (over-count, over-maxlen) is rejected at
+// the header as INVALID by returning ErrInvalidMsg, even when the field is then
+// truncated: MESSAGE_SPEC §5.2 has INVALID dominate INCOMPLETE ("anti-folding" —
+// more bytes cannot make a schema-illegal count/length legal), so the
+// whole-slice callback the generated len(v)>N guard runs in is too late once the
+// array is truncated.
 //
 // It is additive and backward-compatible. The cursor type-asserts the visitor
 // to HeaderVisitor once per scope, so a visitor that does not implement it
@@ -47,10 +47,33 @@ type Visitor interface {
 // array/fixlen field (never per element), so the max-speed decode path is
 // unchanged for visitors without bounds.
 type HeaderVisitor interface {
-	// ArrayBegin is called with the wire element count right after an array's
-	// count varint is read, before the truncation check and any element. A
-	// non-nil return (typically ErrInvalidMsg) aborts the decode at the header.
-	ArrayBegin(id ID, count int) error
+	// ArrayBegin is called once per array field with the element kind the wire
+	// declares and the wire element count, before the truncation check and any
+	// element. A non-nil return (typically ErrInvalidMsg) aborts the decode at
+	// the header.
+	//
+	// WHERE IT FIRES depends on the wire type, because that is where the element
+	// kind becomes known (CORELIB_PLAN §4.8):
+	//
+	//   - integer arrays (ArrayUnsigned, ArraySigned): right after the count
+	//     varint — the wire type alone fixes the kind, there is no second word;
+	//   - fixlen arrays (ArrayFp32, ArrayFp64): after the fixlen_word, once the
+	//     element subtype is read and found format-legal. The count word is read
+	//     first, and the FORMAT ceiling and any receiver limit still fire there,
+	//     but the hook is deferred so the kind it carries is never a guess.
+	//
+	// The deferral is what MESSAGE_SPEC §7.3 requires: a fixlen array whose
+	// subtype contradicts the declared element type is skipped, and the schema
+	// count bound MUST NOT be applied to it — the field was never this array's
+	// value, so its element count is not this array's count. Generated code must
+	// therefore apply its count bound only in the arm matching the declared
+	// element type. A consequence, and intended: a message that ends between the
+	// two words is INCOMPLETE, not INVALID, because no bound can yet be judged.
+	//
+	// A fixlen_word that is format-illegal (a string or blob subtype, or a
+	// width mismatch) is INVALID before the hook fires; that is a format
+	// violation (§4.8), not a skippable schema mismatch.
+	ArrayBegin(id ID, kind ArrayKind, count int) error
 	// FixlenHeader is called with the element subtype and declared byte length
 	// right after a fixlen length word is read, before the payload is taken.
 	// Same contract for the schema maxlen bound.
