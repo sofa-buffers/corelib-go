@@ -403,7 +403,10 @@ func (probeHookV) String(id sofab.ID, v string) error {
 	return nil
 }
 
-func (probeHookV) ArrayBegin(sofab.ID, int) error { return nil }
+// NB: the 3-arg form (F-0042). HeaderVisitor is an OPTIONAL interface, so a
+// stale signature does not fail to compile -- it silently stops satisfying the
+// interface, FixlenHeader is never called, and the maxlen reject below vanishes.
+func (probeHookV) ArrayBegin(sofab.ID, sofab.ArrayKind, int) error { return nil }
 
 func (probeHookV) FixlenHeader(id sofab.ID, subtype, length int) error {
 	if id == 2 && subtype == 2 && length > 4 {
