@@ -421,8 +421,12 @@ func TestMaxDepthRoundTrip(t *testing.T) {
 	}
 }
 
-// TestInvalidUTF8Rejected covers §6.3: a string field whose payload is not valid
-// UTF-8 is rejected as ErrInvalidMsg on both decode paths (blobs stay unchecked).
+// TestInvalidUTF8Rejected covers §6.4: a string field whose payload is not valid
+// UTF-8 is rejected as ErrInvalidMsg where it is materialized. Decoder.String is
+// a materializing read and rejects it itself; on the visitor path the bytes are
+// handed through verbatim (the cursor cannot know whether the visitor has a
+// destination for the id) and the destination rejects them with Utf8Valid.
+// Blobs stay unchecked on every path.
 func TestInvalidUTF8Rejected(t *testing.T) {
 	// fixlen string, length 1, payload 0xFF (an invalid UTF-8 byte).
 	in := append(vhdr(1, sofab.TypeFixlen), append(vbytes((1<<3)|subStr), 0xFF)...)
@@ -431,15 +435,45 @@ func TestInvalidUTF8Rejected(t *testing.T) {
 	if _, err := d.String(); !errors.Is(err, sofab.ErrInvalidMsg) {
 		t.Fatalf("pull String invalid utf8 = %v, want ErrInvalidMsg", err)
 	}
-	if err := sofab.AcceptBytes(in, baseV{}); !errors.Is(err, sofab.ErrInvalidMsg) {
-		t.Fatalf("visitor invalid utf8 = %v, want ErrInvalidMsg", err)
+	// A visitor with no destination for the id ignores the payload: accepted.
+	if err := sofab.AcceptBytes(in, baseV{}); err != nil {
+		t.Fatalf("visitor with no destination = %v, want nil (skips are never validated)", err)
+	}
+	// A visitor that binds id 1 validates at the destination: INVALID.
+	if err := sofab.AcceptBytes(in, &bindStrV{id: 1}); !errors.Is(err, sofab.ErrInvalidMsg) {
+		t.Fatalf("visitor destination invalid utf8 = %v, want ErrInvalidMsg", err)
 	}
 	// A blob with the same payload is fine (blobs are opaque).
 	blob := append(vhdr(1, sofab.TypeFixlen), append(vbytes((1<<3)|subBlob), 0xFF)...)
 	if err := sofab.AcceptBytes(blob, baseV{}); err != nil {
 		t.Fatalf("visitor blob 0xFF = %v, want nil", err)
 	}
+	if err := sofab.AcceptBytes(blob, &bindStrV{id: 1}); err != nil {
+		t.Fatalf("blob at a string destination = %v, want nil (blob is never UTF-8 validated)", err)
+	}
 }
+
+// bindStrV models the shape sofabgen emits: the destination lookup comes first
+// and Utf8Valid runs inside the matched arm, so an id with no destination is
+// never inspected.
+type bindStrV struct {
+	baseV
+	id  sofab.ID
+	got string
+}
+
+func (v *bindStrV) String(id sofab.ID, s string) error {
+	switch id {
+	case v.id:
+		if !sofab.Utf8Valid([]byte(s)) {
+			return sofab.ErrInvalidMsg
+		}
+		v.got = s
+	}
+	return nil
+}
+
+func (v *bindStrV) BeginSequence(sofab.ID) (sofab.Visitor, error) { return v, nil }
 
 // lenReader reports a remaining length but never delivers those bytes, so
 // Accept's sized slurp (the Len-aware fast path) hits a short read.

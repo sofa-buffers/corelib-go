@@ -202,12 +202,31 @@ arrays are always freshly allocated on every path.
 ## Feature flags
 
 Go always ships the **full format** — there are no build-time toggles for wire
-features. The one configurable policy is **strict UTF-8 validation**, exposed as a
-runtime option rather than a build flag:
+features. The one configurable policy is **strict UTF-8 validation**:
 
 | Option | Default | Effect |
 |--------|---------|--------|
-| `WithStrictUTF8(bool)` (`SOFAB_STRICT_UTF8`) | on | Passed to `NewDecoder`, `AcceptBytes`, or `NewEncoder`. On: an invalid-UTF-8 `string` is rejected — `ErrInvalidMsg` on decode, `ErrArgument` on encode. Off: bytes are stored/written verbatim (never lossy). |
+| `WithStrictUTF8(bool)` (`SOFAB_STRICT_UTF8`) | on | Passed to `NewEncoder` or `NewDecoder`. On: an invalid-UTF-8 `string` is rejected — `ErrArgument` on encode, `ErrInvalidMsg` on `Decoder.String`. Off: bytes are stored/written verbatim (never lossy). |
+| `-tags sofab_no_strict_utf8` | off (check compiled in) | Folds `Utf8Valid` to a constant `true`, compiling the validator out for footprint builds. A documented non-strict build; CI conformance-tests the default. |
+
+**Where validation happens on decode.** A Go `string` is a byte-container type,
+so validation runs where the payload is *materialized into a destination* and
+nowhere else (CORELIB_PLAN §6.4, normative — a skipped field is a length jump
+over bytes that are never inspected):
+
+* `Decoder.String` is a materializing read by construction, so it validates
+  internally, under `WithStrictUTF8`. `Decoder.Skip` stays a pure discard.
+* `Accept` / `AcceptBytes` hand the wire bytes to `Visitor.String` verbatim. The
+  cursor cannot tell a field the visitor binds from one it ignores — an
+  undeclared id, or a field whose wire type contradicts the schema
+  (MESSAGE_SPEC §7.3), arrives at the same callback — so the consumer validates
+  at the destination with the exported `Utf8Valid(b []byte) bool` primitive and
+  returns `ErrInvalidMsg` on false. Generated code emits that call in each arm
+  that binds a `string`.
+
+Framing is checked on every field regardless: the fixlen word, the reserved
+subtype rejection, `ARRAY_MAX`, `MAX_DEPTH`, varint overflow, and the exact
+`length`-byte advance. Only the *content* check moves.
 
 It is a validation policy only, never a wire-format switch, so peers with
 different settings still interoperate on all valid data (CORELIB_PLAN §6.4).
