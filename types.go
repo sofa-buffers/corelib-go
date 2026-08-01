@@ -44,6 +44,28 @@ const (
 	fixBlob uint64 = 0x3
 )
 
+// ArrayKind names the element kind an array header on the wire declares, as
+// delivered to HeaderVisitor.ArrayBegin. It distinguishes the two fixlen
+// element subtypes — fp32 and fp64 — rather than collapsing them, because for a
+// fixlen array (§4.8) the element subtype decides whether the field is this
+// array's value at all: a header whose subtype contradicts the declared element
+// type is skipped under MESSAGE_SPEC §7.3, and the schema count bound must not
+// be applied to it. Generated code therefore keys its bound on the kind and
+// applies it only inside the arm matching the declared element type.
+//
+// The ordinals are normative and shared by every push-API corelib in the family
+// (they match corelib-ts src/constants.ts ArrayKind). The Go names carry an
+// Array prefix because the bare Unsigned/Signed identifiers are already taken by
+// this package's element-type constraints; the values are unchanged.
+type ArrayKind uint8
+
+const (
+	ArrayUnsigned ArrayKind = 0 // wire type 0b011, count + unsigned varints
+	ArraySigned   ArrayKind = 1 // wire type 0b100, count + zigzag varints
+	ArrayFp32     ArrayKind = 2 // wire type 0b101, fixlen_word subtype fp32 / 4 B
+	ArrayFp64     ArrayKind = 3 // wire type 0b101, fixlen_word subtype fp64 / 8 B
+)
+
 // Field is a decoded field header returned by Decoder.Next.
 type Field struct {
 	ID   ID

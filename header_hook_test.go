@@ -14,7 +14,11 @@ import (
 // does not care about, exactly as generated code would.
 type boundedVisitor struct{ baseV }
 
-func (boundedVisitor) ArrayBegin(id sofab.ID, count int) error {
+// HeaderVisitor is satisfied structurally, so a stale ArrayBegin signature would
+// silently opt the visitor out of the hooks instead of failing to compile. Pin it.
+var _ sofab.HeaderVisitor = boundedVisitor{}
+
+func (boundedVisitor) ArrayBegin(id sofab.ID, kind sofab.ArrayKind, count int) error {
 	if id == 15 && count > 4 {
 		return sofab.ErrInvalidMsg
 	}
