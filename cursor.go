@@ -43,41 +43,114 @@ func (c *cursor) uvarint(eofOK bool) (uint64, error) {
 // uvarintSlow is the complete varint reader and the out-of-line half of uvarint:
 // the empty-cursor EOF/INCOMPLETE cases and every multi-byte value.
 //
-// go:noinline is load-bearing: without it the compiler folds the loop back into
+// go:noinline is load-bearing: without it the compiler folds the body back into
 // uvarint, restoring the original per-call cost and erasing the fast path's win.
+//
+// The two branches below differ only in whether an end-of-buffer test is needed
+// per byte. Away from the buffer's end — the overwhelmingly common case, and the
+// whole of a multi-element array — uvarintFast runs the unrolled constant-shift
+// decoder with a single bounds-check hint; only the last few bytes of the
+// message fall into uvarintTail. Value and overflow semantics are identical in
+// both (varint.go).
 //
 //go:noinline
 func (c *cursor) uvarintSlow(eofOK bool) (uint64, error) {
-	if c.pos >= len(c.buf) {
+	buf, p := c.buf, c.pos
+	if p >= len(buf) {
 		if eofOK {
 			return 0, io.EOF
 		}
 		return 0, ErrIncomplete // expected a varint, but the stream ended
 	}
-	var val uint64
-	var shift uint
-	for i := c.pos; i < len(c.buf); i++ {
-		b := c.buf[i]
-		// Reject an overlong (>64-bit) varint *before* OR-ing the byte in, so
-		// its high payload bits are never silently shifted out (§4.1/§6.3): on
-		// the 10th byte (shift == 63) only the single low payload bit fits
-		// below bit 63, so any higher bit is a >64-bit overflow.
-		if shift+7 > 64 && (b&0x7F)>>(64-shift) != 0 {
-			return 0, ErrInvalidMsg // payload spills past bit 63: overlong, malformed
+	if len(buf)-p >= maxVarintLen {
+		v, np, ok := uvarintFast(buf, p)
+		if !ok {
+			return 0, ErrInvalidMsg // > 64 bits: overlong, malformed
 		}
-		val |= uint64(b&0x7F) << shift
-		if b&0x80 == 0 {
-			c.pos = i + 1
-			return val, nil
-		}
-		shift += 7
-		// A continuation bit on the 10th byte demands an 11th: the varint is
-		// overlong regardless of whether that byte is present.
-		if shift >= 64 {
-			return 0, ErrInvalidMsg // varint > 64 bits: malformed
-		}
+		c.pos = np
+		return v, nil
+	}
+	v, np, st := uvarintTail(buf, p)
+	switch st {
+	case varintOK:
+		c.pos = np
+		return v, nil
+	case varintOverflow:
+		return 0, ErrInvalidMsg // varint > 64 bits: malformed
 	}
 	return 0, ErrIncomplete // ran off the end mid-varint: truncated, not malformed
+}
+
+// fillUnsigned decodes len(out) varint elements into out.
+//
+// Decoding goes through decodeUvarintRun, the shared bulk decoder (varint.go).
+// Calling c.uvarint per element instead would pay three layers — the inlined
+// single-byte probe, the out-of-line uvarintSlow dispatch, and uvarintFast
+// itself — plus a reload of c.buf/c.pos from memory each time.
+func (c *cursor) fillUnsigned(out []uint64) error {
+	buf, p := c.buf, c.pos
+	// Unsigned elements are the bulk decoder's own output type, so it fills the
+	// destination in place — no staging, no copy.
+	got, np, st := decodeUvarintRun(buf, p, out)
+	if st != varintOK {
+		return tailErr(st)
+	}
+	p = np
+	// decodeUvarintRun stops on reaching the last maxVarintLen bytes of the
+	// buffer, where an element could run off the end; those go through the
+	// bounds-checked tail path.
+	for i := got; i < len(out); i++ {
+		v, np, st := uvarintTail(buf, p)
+		if st != varintOK {
+			return tailErr(st)
+		}
+		out[i], p = v, np
+	}
+	c.pos = p
+	return nil
+}
+
+// fillSigned is fillUnsigned for a zigzag-encoded signed array.
+func (c *cursor) fillSigned(out []int64) error {
+	buf, p := c.buf, c.pos
+	// Signed elements are not the bulk decoder's output type, so a chunk is
+	// staged on the stack and zigzag-mapped out. varintChunk is sized so that
+	// zeroing the staging array stays small against the per-element call
+	// overhead it saves.
+	var stage [varintChunk]uint64
+	i := 0
+	for i < len(out) {
+		want := min(len(out)-i, varintChunk)
+		got, np, st := decodeUvarintRun(buf, p, stage[:want])
+		if st != varintOK {
+			return tailErr(st)
+		}
+		for k, v := range stage[:got] {
+			out[i+k] = zigzagDecode(v)
+		}
+		i, p = i+got, np
+		if got < want {
+			break // reached the buffer's tail region
+		}
+	}
+	for ; i < len(out); i++ {
+		v, np, st := uvarintTail(buf, p)
+		if st != varintOK {
+			return tailErr(st)
+		}
+		out[i], p = zigzagDecode(v), np
+	}
+	c.pos = p
+	return nil
+}
+
+// tailErr maps a non-OK tail status to its outcome: overflow is malformed
+// (INVALID), running off the end is truncation (INCOMPLETE) — §5.2.
+func tailErr(st varintTailStatus) error {
+	if st == varintOverflow {
+		return ErrInvalidMsg
+	}
+	return ErrIncomplete
 }
 
 // take returns the next n bytes as a subslice of buf (zero-copy) and advances. A
@@ -123,6 +196,32 @@ func (c *cursor) arrayCount() (uint64, error) {
 	return n, nil
 }
 
+// hvCache resolves a visitor's optional HeaderVisitor hooks on first need
+// rather than on scope entry.
+//
+// v.(HeaderVisitor) is a runtime itab lookup, and for a concrete visitor type
+// that does NOT implement the interface the first lookup for that (type,
+// interface) pair walks the type's whole method list — resolveNameOff /
+// resolveTypeOff / itabInit. Measured on the typical message, doing it eagerly
+// in every scope cost about 45 % of the decode, because a nested sequence of
+// plain scalars paid for an answer it never used. The hooks are only ever
+// consulted at an array or fixlen field, so that is where the question is asked.
+//
+// Still at most one assertion per scope: the answer is cached, including a nil
+// one (known is what distinguishes "no hooks" from "not asked yet").
+type hvCache struct {
+	hv    HeaderVisitor
+	known bool
+}
+
+func (c *hvCache) of(v Visitor) HeaderVisitor {
+	if !c.known {
+		c.hv, _ = v.(HeaderVisitor)
+		c.known = true
+	}
+	return c.hv
+}
+
 // accept drives v over the buffer. depth is the number of sequences currently
 // open (0 at the top level); when depth > 0 we are nested, so a clean
 // end-of-buffer means the message stopped inside an open sequence (INCOMPLETE),
@@ -130,11 +229,10 @@ func (c *cursor) arrayCount() (uint64, error) {
 // deeply nested message is rejected rather than overflowing the Go stack (§4.9).
 func (c *cursor) accept(v Visitor, depth int) error {
 	nested := depth > 0
-	// One type-assertion per scope, not per field: nil unless this visitor opts
-	// into the header hooks (HeaderVisitor). A visitor without them pays only a
-	// predictable nil branch per array/fixlen field, so the max-speed path is
-	// unchanged.
-	hv, _ := v.(HeaderVisitor)
+	// The header hooks are resolved lazily — see hvCache. Still at most one
+	// assertion per scope, and none at all in a scope that holds no array or
+	// fixlen field.
+	var hooks hvCache
 	for {
 		h, err := c.uvarint(true)
 		if err != nil {
@@ -169,7 +267,7 @@ func (c *cursor) accept(v Visitor, depth int) error {
 				return err
 			}
 		case TypeFixlen:
-			if err := c.acceptFixlen(v, hv, id); err != nil {
+			if err := c.acceptFixlen(v, hooks.of(v), id); err != nil {
 				return err
 			}
 		case TypeVarintArrayUnsigned:
@@ -182,7 +280,7 @@ func (c *cursor) accept(v Visitor, depth int) error {
 			// (§5.2). No-op unless the visitor declares a bound. An integer array
 			// carries no second word, so the wire type alone fixes the element kind
 			// and the hook fires here — unlike the fixlen array (§4.8).
-			if hv != nil {
+			if hv := hooks.of(v); hv != nil {
 				if err := hv.ArrayBegin(id, ArrayUnsigned, int(n)); err != nil {
 					return err
 				}
@@ -194,10 +292,8 @@ func (c *cursor) accept(v Visitor, depth int) error {
 				return ErrIncomplete
 			}
 			out := make([]uint64, n)
-			for i := range out {
-				if out[i], err = c.uvarint(false); err != nil {
-					return err
-				}
+			if err := c.fillUnsigned(out); err != nil {
+				return err
 			}
 			if err := v.UnsignedArray(id, out); err != nil {
 				return err
@@ -207,7 +303,7 @@ func (c *cursor) accept(v Visitor, depth int) error {
 			if err != nil {
 				return err
 			}
-			if hv != nil {
+			if hv := hooks.of(v); hv != nil {
 				if err := hv.ArrayBegin(id, ArraySigned, int(n)); err != nil {
 					return err
 				}
@@ -218,18 +314,14 @@ func (c *cursor) accept(v Visitor, depth int) error {
 				return ErrIncomplete
 			}
 			out := make([]int64, n)
-			for i := range out {
-				x, err := c.uvarint(false)
-				if err != nil {
-					return err
-				}
-				out[i] = zigzagDecode(x)
+			if err := c.fillSigned(out); err != nil {
+				return err
 			}
 			if err := v.SignedArray(id, out); err != nil {
 				return err
 			}
 		case TypeFixlenArray:
-			if err := c.acceptFixlenArray(v, hv, id); err != nil {
+			if err := c.acceptFixlenArray(v, hooks.of(v), id); err != nil {
 				return err
 			}
 		case TypeSequenceStart:

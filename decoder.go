@@ -85,38 +85,91 @@ func (d *Decoder) Field() Field { return d.cur }
 // byte is reported as io.EOF (a clean stream boundary); a mid-varint EOF is
 // ErrIncomplete (INCOMPLETE, §7 — ran out of bytes mid-field, not malformed). A
 // varint that exceeds 64 bits is ErrInvalidMsg (malformed).
+//
+// It decodes out of the reader's own buffer via Peek, then Discard, rather than
+// pulling one byte at a time: bufio.ReadByte is a method call and a bounds test
+// per byte, so a ten-byte varint cost ten of them before any decoding happened.
+// Peek hands back a window into that same buffer with no copy, the shared
+// unrolled decoder (varint.go) reads it, and Discard advances by exactly the
+// bytes the varint used.
+//
+// Peek fills until it has maxVarintLen bytes or the source reports an error, so
+// a short window means the stream really is ending — never merely a chunk
+// boundary. That is what keeps a varint split across reads INCOMPLETE rather
+// than misread, and nothing is consumed unless a whole varint was decoded.
 func (d *Decoder) readVarint(firstEOFok bool) (uint64, error) {
-	var val uint64
-	var shift uint
-	for i := 0; ; i++ {
-		b, err := d.r.ReadByte()
-		if err != nil {
-			if err == io.EOF {
-				if i == 0 && firstEOFok {
-					return 0, io.EOF
-				}
-				return 0, ErrIncomplete // ended mid-varint: truncated
+	w, err := d.r.Peek(maxVarintLen)
+	if len(w) >= maxVarintLen {
+		v, np, ok := uvarintFast(w, 0)
+		if !ok {
+			return 0, ErrInvalidMsg // > 64 bits: overlong, malformed
+		}
+		d.r.Discard(np)
+		return v, nil
+	}
+	if len(w) == 0 {
+		if err != nil && err != io.EOF {
+			return 0, err // a real reader failure, not a stream boundary
+		}
+		if firstEOFok {
+			return 0, io.EOF // clean end of stream at a field boundary
+		}
+		return 0, ErrIncomplete // expected a varint, but the stream ended
+	}
+	v, np, st := uvarintTail(w, 0)
+	switch st {
+	case varintOK:
+		d.r.Discard(np)
+		return v, nil
+	case varintOverflow:
+		return 0, ErrInvalidMsg // varint > 64 bits: malformed
+	}
+	if err != nil && err != io.EOF {
+		return 0, err
+	}
+	return 0, ErrIncomplete // ended mid-varint: truncated
+}
+
+// readVarintBatch decodes as many of dst's elements as it can straight out of
+// the reader's buffer, and returns how many. Zero means the buffer is down to
+// its last few bytes (or the stream is ending) and the caller should fall back
+// to readVarint for the next element, which is where truncation and end-of-
+// stream are judged.
+//
+// It exists because Peek and Discard are the pull parser's per-varint cost once
+// the byte-at-a-time reads are gone — together about a third of an array read.
+// One Peek/Discard pair per batch amortizes that away, and the elements decode
+// through the same shared kernel the visitor path uses (varint.go).
+//
+// Nothing is consumed beyond the elements actually decoded, so a batch that runs
+// into the end of the buffer leaves the remaining bytes for the next call and
+// the resume-at-any-boundary property is unchanged.
+func (d *Decoder) readVarintBatch(dst []uint64) (int, error) {
+	avail := d.r.Buffered()
+	if avail < maxVarintLen {
+		// Force a fill so a whole varint is present if the stream can supply
+		// one; a short result here just means the caller takes the slow path.
+		if _, err := d.r.Peek(maxVarintLen); err != nil {
+			if err != io.EOF {
+				return 0, err
 			}
-			return 0, err
 		}
-		// Reject an overlong (>64-bit) varint *before* OR-ing the byte in, so
-		// its high payload bits are never silently shifted out (§4.1/§6.3): on
-		// the 10th byte (shift == 63) only the single low payload bit fits
-		// below bit 63, so any higher bit is a >64-bit overflow.
-		if shift+7 > 64 && (b&0x7F)>>(64-shift) != 0 {
-			return 0, ErrInvalidMsg // payload spills past bit 63: overlong, malformed
-		}
-		val |= uint64(b&0x7F) << shift
-		if b&0x80 == 0 {
-			return val, nil
-		}
-		shift += 7
-		// A continuation bit on the 10th byte demands an 11th: the varint is
-		// overlong regardless of whether that byte is present.
-		if shift >= 64 {
-			return 0, ErrInvalidMsg // varint > 64 bits: malformed
+		if avail = d.r.Buffered(); avail < maxVarintLen {
+			return 0, nil
 		}
 	}
+	w, err := d.r.Peek(avail)
+	if err != nil {
+		return 0, err
+	}
+	got, np, st := decodeUvarintRun(w, 0, dst)
+	if st != varintOK {
+		return 0, tailErr(st)
+	}
+	if np > 0 {
+		d.r.Discard(np)
+	}
+	return got, nil
 }
 
 // readFixlenHeader reads a fixed-length field's length-and-subtype varint,
@@ -361,10 +414,21 @@ func (d *Decoder) skipValue() error {
 		if err != nil {
 			return err
 		}
-		for i := uint64(0); i < n; i++ {
-			if _, err := d.readVarint(false); err != nil {
+		var stage [varintChunk]uint64
+		for n > 0 {
+			want := min(n, uint64(varintChunk))
+			got, err := d.readVarintBatch(stage[:want])
+			if err != nil {
 				return err
 			}
+			if got == 0 {
+				if _, err := d.readVarint(false); err != nil {
+					return err
+				}
+				n--
+				continue
+			}
+			n -= uint64(got)
 		}
 		return nil
 	case TypeFixlenArray:
@@ -411,12 +475,26 @@ func ReadUnsignedArray[T Unsigned](d *Decoder) ([]T, error) {
 		return nil, err
 	}
 	out := make([]T, 0, initialArrayCap(n))
-	for i := uint64(0); i < n; i++ {
-		v, err := d.readVarint(false)
+	var stage [varintChunk]uint64
+	for uint64(len(out)) < n {
+		want := min(n-uint64(len(out)), uint64(varintChunk))
+		got, err := d.readVarintBatch(stage[:want])
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, T(v))
+		if got == 0 {
+			// Near the end of the buffer or the stream: one element at a time,
+			// where truncation and end-of-stream are decided.
+			v, err := d.readVarint(false)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, T(v))
+			continue
+		}
+		for _, v := range stage[:got] {
+			out = append(out, T(v))
+		}
 	}
 	d.needConsume = false
 	return out, nil
@@ -432,12 +510,24 @@ func ReadSignedArray[T Signed](d *Decoder) ([]T, error) {
 		return nil, err
 	}
 	out := make([]T, 0, initialArrayCap(n))
-	for i := uint64(0); i < n; i++ {
-		v, err := d.readVarint(false)
+	var stage [varintChunk]uint64
+	for uint64(len(out)) < n {
+		want := min(n-uint64(len(out)), uint64(varintChunk))
+		got, err := d.readVarintBatch(stage[:want])
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, T(zigzagDecode(v)))
+		if got == 0 {
+			v, err := d.readVarint(false)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, T(zigzagDecode(v)))
+			continue
+		}
+		for _, v := range stage[:got] {
+			out = append(out, T(zigzagDecode(v)))
+		}
 	}
 	d.needConsume = false
 	return out, nil
