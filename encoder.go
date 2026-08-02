@@ -16,12 +16,11 @@ import (
 type Encoder struct {
 	w io.Writer
 	// buf is a fixed window, not an append target: len(buf) is its capacity and
-	// n is how much of it is used. Appending byte-by-byte cost a length/capacity
+	// n is how much of it is used. Appending byte-by-byte costs a length/capacity
 	// test, a possible growslice call, and a three-word slice-header store per
-	// byte — 84 % of the array-encode profile. Writing through an index instead
-	// makes the hot path a store plus an integer bump, with one capacity test per
-	// field rather than per byte, and never rewrites the slice header (so no
-	// write-barrier check either).
+	// byte. Writing through an index instead makes the hot path a store plus an
+	// integer bump, with one capacity test per field rather than per byte, and
+	// never rewrites the slice header (so no write-barrier check either).
 	//
 	// The window grows by doubling up to flushThreshold and then stops: past
 	// that it is drained to w instead, which is what keeps memory bounded and
@@ -249,9 +248,8 @@ func (e *Encoder) writeHeader(id ID, t WireType) {
 // extra is how many further bytes the caller will write with no capacity test of
 // its own. A scalar field is a header varint plus a value varint, so reserving
 // both together turns two capacity tests, two error tests and two bounds checks
-// into one of each — measured about a fifth of the typical-message encode. extra
-// must not exceed flushThreshold-maxVarintLen; every caller passes a small
-// constant.
+// into one of each. extra must not exceed flushThreshold-maxVarintLen; every
+// caller passes a small constant.
 func (e *Encoder) writeHeaderRoom(id ID, t WireType, extra int) bool {
 	// The three conditions that make a header anything other than "reserve and
 	// write" are peeled into writeHeaderSlow so this stays under the inline
@@ -572,9 +570,8 @@ func WriteSignedArray[T Signed](e *Encoder, id ID, a []T) error {
 // putUvarintRun and putZigzagRun write an integer array's elements.
 //
 // The varint writer is unrolled INTO each loop rather than called per element:
-// calling putUvarint cost argument setup, a call/return pair and a re-derived
-// window on every element — roughly a quarter of the array-encode profile — so
-// the bulk path pays none of it.
+// calling putUvarint costs argument setup, a call/return pair and a re-derived
+// window on every element, so the bulk path pays none of it.
 //
 // The destination advances as a slice, and `len(w) >= maxVarintLen` is carried
 // in the LOOP CONDITION. That is what makes the ten stores bounds-check-free:
@@ -584,8 +581,9 @@ func WriteSignedArray[T Signed](e *Encoder, id ID, a []T) error {
 // and re-enters.
 //
 // The two are a deliberate specialization pair, differing ONLY in how an element
-// maps to its wire value. Sharing one body and branching on the mapping was
-// measured 6-7 % slower whichever side of the inner loop the branch sat on.
+// maps to its wire value. Sharing one body and branching on the mapping is
+// slower whichever side of the inner loop the branch sits on, so the mapping is
+// fixed at compile time here instead.
 // Everything after that mapping is the same unrolled writer as putUvarint
 // (varint.go), which stays the single-value entry point for headers, counts and
 // scalars. All three copies must encode identically; TestVarintWritersAgree

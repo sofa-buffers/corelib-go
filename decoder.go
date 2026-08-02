@@ -137,9 +137,9 @@ func (d *Decoder) readVarint(firstEOFok bool) (uint64, error) {
 // stream are judged.
 //
 // It exists because Peek and Discard are the pull parser's per-varint cost once
-// the byte-at-a-time reads are gone — together about a third of an array read.
-// One Peek/Discard pair per batch amortizes that away, and the elements decode
-// through the same shared kernel the visitor path uses (varint.go).
+// the byte-at-a-time reads are gone. One Peek/Discard pair per batch amortizes
+// that away, and the elements decode through the same shared kernel the visitor
+// path uses (varint.go).
 //
 // Nothing is consumed beyond the elements actually decoded, so a batch that runs
 // into the end of the buffer leaves the remaining bytes for the next call and

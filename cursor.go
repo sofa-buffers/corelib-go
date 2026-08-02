@@ -26,10 +26,9 @@ type cursor struct {
 //
 // The single-byte case (payload < 0x80 — every field header for id<16, and every
 // small scalar/count) is peeled into a lean fast path: one bounds-checked load and
-// a return, with none of the multi-byte loop's shift/overflow bookkeeping. uvarint
-// is the hottest decode function (~32 % of Ir), so shaving the common read is worth
-// it even though the two-value return keeps uvarint just over the inline budget.
-// Measured: decode 38603 -> 37044 Ir/op (-4.0 %), encode unchanged.
+// a return, with none of the multi-byte loop's shift/overflow bookkeeping. That is
+// the common read, so it is worth the peel even though the two-value return keeps
+// uvarint just over the inline budget.
 func (c *cursor) uvarint(eofOK bool) (uint64, error) {
 	if p := c.pos; p < len(c.buf) {
 		if b := c.buf[p]; b < 0x80 {
@@ -202,10 +201,10 @@ func (c *cursor) arrayCount() (uint64, error) {
 // v.(HeaderVisitor) is a runtime itab lookup, and for a concrete visitor type
 // that does NOT implement the interface the first lookup for that (type,
 // interface) pair walks the type's whole method list — resolveNameOff /
-// resolveTypeOff / itabInit. Measured on the typical message, doing it eagerly
-// in every scope cost about 45 % of the decode, because a nested sequence of
-// plain scalars paid for an answer it never used. The hooks are only ever
-// consulted at an array or fixlen field, so that is where the question is asked.
+// resolveTypeOff / itabInit. Asking eagerly in every scope makes a nested
+// sequence of plain scalars pay for an answer it never uses. The hooks are only
+// ever consulted at an array or fixlen field, so that is where the question is
+// asked.
 //
 // Still at most one assertion per scope: the answer is cached, including a nil
 // one (known is what distinguishes "no hooks" from "not asked yet").

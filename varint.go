@@ -16,14 +16,12 @@ package sofab
 //   - one bounds-check hint (`_ = b[9]`) covers all ten indices, so the prove
 //     pass drops the per-byte checks.
 //
-// Measured on bench/run_callgrind.sh: decode of the 1000-element u64 array went
-// from ~255 Ir per element to ~45, encode from ~115 to ~30.
 //
 // THE UNROLLED BLOCK APPEARS MORE THAN ONCE, and the copies must stay in
 // lockstep. In this file: putUvarint (single value, encode), uvarintFast
 // (single value, decode) and decodeUvarintRun (bulk decode). In encoder.go:
 // putUvarintRun and putZigzagRun (bulk encode). Each copy exists because the
-// call it replaces was measured to cost 15-25 % of its workload, not for taste.
+// call it replaces is a real cost on its hot path, not for taste.
 // varint_internal_test.go pins every one of them to the naive reference encoder
 // and to each other, so a change made to one and not the rest fails the suite
 // rather than corrupting the wire.
@@ -38,8 +36,8 @@ const maxVarintLen = 10
 //
 // It takes (buffer, offset) rather than a pre-sliced tail so that a caller
 // writing many elements keeps one slice header live in registers for the whole
-// loop. Passing b[n:] instead cost a slice bounds check and a three-register
-// header rebuild per element — 36 of the 70 Ir an element took.
+// loop. Passing b[n:] instead costs a slice bounds check and a three-register
+// header rebuild per element.
 //
 // The encoding is always minimal — the fewest bytes that represent v — which is
 // the canonical form CORELIB_PLAN §4.1 requires of an encoder.
@@ -230,17 +228,17 @@ const varintChunk = 32
 // This is the bulk decoder BOTH array element types go through — the unsigned
 // destination copies its output, the signed one zigzag-maps it — so the unrolled
 // loop exists once rather than once per element type. Calling uvarintFast per
-// element instead cost about 15 % of the array decode in call overhead and a
-// re-derived window; staging a chunk pays that once per varintChunk elements and
-// adds only a stack store and load each.
+// element instead pays call overhead and a re-derived window every time; staging
+// a chunk pays that once per varintChunk elements and adds only a stack store and
+// load each.
 func decodeUvarintRun(b []byte, p int, dst []uint64) (got, np int, st varintTailStatus) {
 	// The window advances as a slice rather than being re-cut from b at each
 	// element. Carrying `len(s) >= maxVarintLen` in the LOOP CONDITION is what
 	// makes this cheap: the prove pass then knows every one of s[0]..s[9] is in
 	// range, so the ten loads need no bounds check and no per-element slice is
-	// built. Re-slicing b[p:p+maxVarintLen] per element instead cost 10 Ir an
-	// element — 12 % of the whole decode — for the bounds check and the
-	// pointer/length/capacity triple it had to materialize.
+	// built. Re-slicing b[p:p+maxVarintLen] per element instead pays a bounds
+	// check and the pointer/length/capacity triple it has to materialize, on
+	// every element.
 	s := b[p:]
 	i := 0
 	for ; i < len(dst) && len(s) >= maxVarintLen; i++ {
