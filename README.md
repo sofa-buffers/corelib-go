@@ -180,11 +180,15 @@ got, _ := DecodePoint(wire)              // got.X == 3, got.Y == 4
 Buffer ownership is the part that most affects how callers wire the library in.
 
 **Encoder.** You hand `NewEncoder` an `io.Writer` sink, not a fixed output
-buffer. Bytes accumulate in a small internal slice and flush to the writer as it
-fills (and on `Flush`), so the whole encoded message is never held. Each write
-copies its bytes into that slice, so caller source strings/slices may be reused
-immediately. You **must call `Flush`** to push the tail and surface a late write
-error.
+buffer. Bytes accumulate in a small internal window — 512 B, growing on demand to
+4 KiB — and flush to the writer as it fills (and on `Flush`), so the whole encoded
+message is never held. Each write copies its bytes into that window, so caller
+source strings/slices may be reused immediately. The one exception is a `string`
+or blob larger than the window: it is handed to the sink directly (after the
+buffered bytes, so ordering is unchanged) rather than growing the buffer to its
+size, which the sink sees as one extra `Write`. That write completes before the
+call returns, so the reuse guarantee still holds. You **must call `Flush`** to
+push the tail and surface a late write error.
 
 **Decoder.** The pull path (`Next`) is safe-by-default *and* streaming: `String()`
 and `Bytes()` both return fresh copies the caller owns. `Accept` / `AcceptBytes`

@@ -14,8 +14,20 @@ import (
 // writes are no-ops and the same error is returned, so generated Marshal code
 // can issue a run of writes and check only the final Flush.
 type Encoder struct {
-	w     io.Writer
+	w io.Writer
+	// buf is a fixed window, not an append target: len(buf) is its capacity and
+	// n is how much of it is used. Appending byte-by-byte cost a length/capacity
+	// test, a possible growslice call, and a three-word slice-header store per
+	// byte — 84 % of the array-encode profile. Writing through an index instead
+	// makes the hot path a store plus an integer bump, with one capacity test per
+	// field rather than per byte, and never rewrites the slice header (so no
+	// write-barrier check either).
+	//
+	// The window grows by doubling up to flushThreshold and then stops: past
+	// that it is drained to w instead, which is what keeps memory bounded and
+	// preserves mid-stream flushing.
 	buf   []byte
+	n     int
 	err   error
 	depth int
 	// pending holds the ids of the innermost open sequences whose header has not
@@ -47,7 +59,7 @@ const lazySeqInline = 32
 // ON); the receiver-side cap options (WithMaxArrayCount, WithMaxStringLen,
 // WithMaxBlobLen) are decode-only and are accepted but ignored here.
 func NewEncoder(w io.Writer, opts ...Option) *Encoder {
-	e := &Encoder{w: w, buf: make([]byte, 0, 512), lim: newLimits(opts)}
+	e := &Encoder{w: w, buf: make([]byte, encBufInit), lim: newLimits(opts)}
 	e.pending = e.pendingInline[:0]
 	return e
 }
@@ -60,9 +72,9 @@ func (e *Encoder) Flush() error {
 	if e.err != nil {
 		return e.err
 	}
-	if len(e.buf) > 0 {
-		_, e.err = e.w.Write(e.buf)
-		e.buf = e.buf[:0]
+	if e.n > 0 {
+		_, e.err = e.w.Write(e.buf[:e.n])
+		e.n = 0
 	}
 	return e.err
 }
@@ -82,65 +94,131 @@ func (e *Encoder) setErr(err error) {
 // write error immediately rather than only at Flush.
 const flushThreshold = 4096
 
-// maybeFlush writes the buffer out and resets it once it grows past the
-// threshold, keeping memory bounded and preserving mid-stream write semantics.
+// encBufInit is the initial window size. Most messages are small, so the
+// encoder starts here and doubles on demand rather than committing
+// flushThreshold bytes to every Encoder that will never need them.
+const encBufInit = 512
+
+// room reports whether k bytes can be written at the current position, making
+// space if not: it grows the window while that is still allowed, and otherwise
+// drains it to the writer. It returns false only when the encoder holds an
+// error, so callers can write unconditionally after a true.
 //
-// It is called after every varint and every raw write, so for a message that
-// never reaches the threshold the check is pure overhead — and it is the common
-// case, since flushThreshold is 4 KB. Keeping the body to a length test and a
-// call makes it inlinable, so that common case costs a load and a compare
-// instead of a function call; the write lives in flushBuffered, whose cost only
-// applies when it actually fires. Moving the err test into the slow path is
-// behaviour-preserving: with an error held, neither form writes anything.
-func (e *Encoder) maybeFlush() {
-	if len(e.buf) >= flushThreshold {
-		e.flushBuffered()
+// This is the one capacity test on the hot path, and it is per field (or per
+// batch of array elements) rather than per byte. Everything that can fail lives
+// in the out-of-line makeRoom, keeping room itself small enough to inline.
+func (e *Encoder) room(k int) bool {
+	if len(e.buf)-e.n >= k {
+		return e.err == nil
 	}
+	return e.makeRoom(k)
 }
 
-// flushBuffered writes the accumulated bytes out and resets the buffer. It is
-// the out-of-line half of maybeFlush; do not call it on the hot path.
+// makeRoom is the out-of-line half of room: grow, or flush, or both.
 //
-// go:noinline is load-bearing, not a hint: without it the compiler inlines this
-// body back into maybeFlush, whose cost then exceeds the inline budget again and
-// the split buys nothing.
+// go:noinline is load-bearing, not a hint: inlined, its body pushes room past
+// the inline budget and the fast path becomes a call again.
+//
+//go:noinline
+func (e *Encoder) makeRoom(k int) bool {
+	if e.err != nil {
+		return false
+	}
+	// Grow first while the window is still below the threshold: a small message
+	// then accumulates entirely and leaves in a single Write on Flush, exactly
+	// as the append-based buffer did. Doubling from encBufInit lands on
+	// flushThreshold exactly (both are powers of two), so the window converges
+	// there and stops growing.
+	if len(e.buf) < flushThreshold && len(e.buf)-e.n < k {
+		size := len(e.buf)
+		for size < flushThreshold && size-e.n < k {
+			size *= 2
+		}
+		grown := make([]byte, size)
+		copy(grown, e.buf[:e.n])
+		e.buf = grown
+		if len(e.buf)-e.n >= k {
+			return true
+		}
+	}
+	// At the cap and still too tight: drain, which is the mid-stream flush.
+	if e.n > 0 {
+		if _, err := e.w.Write(e.buf[:e.n]); err != nil {
+			e.err = err
+			return false
+		}
+		e.n = 0
+	}
+	// A single field wider than the whole window. putRaw routes anything past
+	// flushThreshold straight to the sink, so this only rounds a sub-threshold
+	// window up to the request.
+	if len(e.buf) < k {
+		size := len(e.buf)
+		for size < k {
+			size *= 2
+		}
+		e.buf = make([]byte, size)
+	}
+	return true
+}
+
+// flushBuffered drains the window to the writer. Used where a flush is wanted
+// for its own sake — ordering a direct write behind the buffered bytes.
 //
 //go:noinline
 func (e *Encoder) flushBuffered() {
-	if e.err == nil {
-		_, e.err = e.w.Write(e.buf)
-		e.buf = e.buf[:0]
+	if e.err == nil && e.n > 0 {
+		_, e.err = e.w.Write(e.buf[:e.n])
+		e.n = 0
 	}
 }
 
 // putVarint writes v as a base-128 varint, least-significant 7-bit group first.
 // It is a no-op once the encoder holds a sticky error.
+//
+// It is the reserve-then-write pair: room makes space, putVarintFit writes into
+// it. Callers that already reserve — every Write* method, via writeHeaderRoom —
+// skip this and call putVarintFit directly, which is what removes the second
+// capacity test from a scalar field.
+//
+// No separate flush test is needed afterwards: room() is what drains a full
+// window, so the mid-stream write still happens, one reserve earlier.
 func (e *Encoder) putVarint(v uint64) {
-	if e.err != nil {
+	if !e.room(maxVarintLen) {
 		return
 	}
-	// Hold the slice header in a local across the loop: appending straight to
-	// e.buf reloads and stores the three-word header on every byte. Appending
-	// the bytes one at a time beats building them in a local array and
-	// appending that slice once — measured: the slice form routes short varints
-	// through memmove and costs more than it saves.
-	buf := e.buf
-	for v >= 0x80 {
-		buf = append(buf, byte(v)|0x80)
-		v >>= 7
-	}
-	e.buf = append(buf, byte(v))
-	e.maybeFlush()
+	e.putVarintFit(v)
 }
 
 // putRaw writes data verbatim (no length prefix). It is a no-op once the
 // encoder holds a sticky error.
+//
+// A payload past the window cap is written straight to the sink after the
+// window is drained, so the byte stream is unchanged while an oversized blob
+// never forces the buffer to grow to its size.
 func (e *Encoder) putRaw(data []byte) {
+	if len(data) > flushThreshold {
+		e.putRawLarge(data)
+		return
+	}
+	if !e.room(len(data)) {
+		return
+	}
+	e.n += copy(e.buf[e.n:], data)
+}
+
+// putRawLarge writes a payload bigger than the whole window: drain what is
+// buffered first so ordering holds, then hand the payload to the sink directly.
+//
+//go:noinline
+func (e *Encoder) putRawLarge(data []byte) {
+	e.flushBuffered()
 	if e.err != nil {
 		return
 	}
-	e.buf = append(e.buf, data...)
-	e.maybeFlush()
+	if _, err := e.w.Write(data); err != nil {
+		e.err = err
+	}
 }
 
 // writeHeader writes a field header, the varint (id<<3 | type). It sets
@@ -162,28 +240,88 @@ func (e *Encoder) putRaw(data []byte) {
 // — and left the false impression that a marker might legitimately show up
 // mid-run — so it is gone rather than kept as decoration.
 func (e *Encoder) writeHeader(id ID, t WireType) {
+	e.writeHeaderRoom(id, t, 0)
+}
+
+// writeHeaderRoom is writeHeader with the field's payload reserved alongside the
+// header, and reports whether the caller may go on to write it.
+//
+// extra is how many further bytes the caller will write with no capacity test of
+// its own. A scalar field is a header varint plus a value varint, so reserving
+// both together turns two capacity tests, two error tests and two bounds checks
+// into one of each — measured about a fifth of the typical-message encode. extra
+// must not exceed flushThreshold-maxVarintLen; every caller passes a small
+// constant.
+func (e *Encoder) writeHeaderRoom(id ID, t WireType, extra int) bool {
+	// The three conditions that make a header anything other than "reserve and
+	// write" are peeled into writeHeaderSlow so this stays under the inline
+	// budget: a field header then costs no call at all.
+	if e.err != nil || id > IDMax || len(e.pending) != 0 {
+		return e.writeHeaderSlow(id, t, extra)
+	}
+	if !e.room(maxVarintLen + extra) {
+		return false
+	}
+	e.putVarintFit((uint64(id) << 3) | uint64(t))
+	return true
+}
+
+// writeHeaderSlow handles a held error, an out-of-range id, and a pending lazy
+// sequence run. It is the out-of-line half of writeHeaderRoom.
+//
+//go:noinline
+func (e *Encoder) writeHeaderSlow(id ID, t WireType, extra int) bool {
 	if e.err != nil {
-		return
+		return false
 	}
 	if id > IDMax {
 		e.err = ErrArgument
+		return false
+	}
+	// Committing writes the enclosing sequence headers, consuming room, so the
+	// reservation below has to come after it.
+	e.commitPending()
+	if !e.room(maxVarintLen + extra) {
+		return false
+	}
+	e.putVarintFit((uint64(id) << 3) | uint64(t))
+	return true
+}
+
+// putVarintFit writes a varint into room the caller has already reserved. It is
+// the no-capacity-test half of putVarint; calling it without that reservation
+// panics on the slice bound rather than corrupting the stream.
+//
+// The single-byte case is the body, and the multi-byte call is pushed into
+// putVarintFitSlow, so this stays under the inline budget: nearly every varint a
+// message writes — field headers for id < 16, small counts, small scalars — then
+// costs a store and an increment at the call site with no call at all.
+func (e *Encoder) putVarintFit(v uint64) {
+	if v < 0x80 {
+		e.buf[e.n] = byte(v)
+		e.n++
 		return
 	}
-	if len(e.pending) != 0 {
-		e.commitPending()
-	}
-	e.putVarint((uint64(id) << 3) | uint64(t))
+	e.putVarintFitSlow(v)
+}
+
+// putVarintFitSlow is the out-of-line multi-byte half of putVarintFit.
+//
+// go:noinline is load-bearing: inlined, the putUvarint call it holds pushes
+// putVarintFit back over the budget and the fast path becomes a call again.
+//
+//go:noinline
+func (e *Encoder) putVarintFitSlow(v uint64) {
+	e.n = putUvarint(e.buf, e.n, v)
 }
 
 // commitPending writes out the held-back sequence headers, outermost first. It
 // runs at most once per non-default sequence, never per field — the per-field
-// cost of lazy framing is the length test in writeHeader that guards this call.
+// cost of lazy framing is the length test in writeHeaderRoom that routes here.
 //
-// Deliberately NOT marked go:noinline, unlike flushBuffered above: that
-// annotation exists to keep its *caller* (maybeFlush) inside the inline budget,
-// whereas writeHeader is over the budget either way, so forcing a call here
-// would only add one. Measured 11 Ir/op cheaper inlined on the typical-message
-// workload of bench/run_callgrind.sh.
+// It needs no go:noinline of its own: its callers are already out of line
+// (writeHeaderSlow) or off the hot path (WriteSequenceEndKeep), so inlining it
+// cannot push a hot function over the budget.
 func (e *Encoder) commitPending() {
 	for _, id := range e.pending {
 		e.putVarint((uint64(id) << 3) | uint64(TypeSequenceStart))
@@ -193,15 +331,17 @@ func (e *Encoder) commitPending() {
 
 // WriteUnsigned writes an unsigned-integer field.
 func (e *Encoder) WriteUnsigned(id ID, v uint64) error {
-	e.writeHeader(id, TypeVarintUnsigned)
-	e.putVarint(v)
+	if e.writeHeaderRoom(id, TypeVarintUnsigned, maxVarintLen) {
+		e.putVarintFit(v)
+	}
 	return e.err
 }
 
 // WriteSigned writes a signed-integer field (zigzag + varint).
 func (e *Encoder) WriteSigned(id ID, v int64) error {
-	e.writeHeader(id, TypeVarintSigned)
-	e.putVarint(zigzagEncode(v))
+	if e.writeHeaderRoom(id, TypeVarintSigned, maxVarintLen) {
+		e.putVarintFit(zigzagEncode(v))
+	}
 	return e.err
 }
 
@@ -216,24 +356,35 @@ func (e *Encoder) WriteBool(id ID, b bool) error {
 // writeFixlen writes a fixed-length field: the header, then a length-and-subtype
 // varint (len(data)<<3 | sub), then the raw bytes. sub selects float/string/blob.
 func (e *Encoder) writeFixlen(id ID, data []byte, sub uint64) {
-	e.writeHeader(id, TypeFixlen)
-	e.putVarint((uint64(len(data)) << 3) | sub)
-	e.putRaw(data)
+	if e.writeHeaderRoom(id, TypeFixlen, maxVarintLen) {
+		e.putVarintFit((uint64(len(data)) << 3) | sub)
+		e.putRaw(data)
+	}
 }
 
 // WriteFloat32 writes a 32-bit float field.
+//
+// The payload goes straight into the window rather than through a stack array
+// and putRaw: the array escaped to the heap (putRaw can hand a payload to the
+// out-of-line sink path), so the temporary cost an allocation per float on top
+// of the copy.
 func (e *Encoder) WriteFloat32(id ID, f float32) error {
-	var b [4]byte
-	binary.LittleEndian.PutUint32(b[:], math.Float32bits(f))
-	e.writeFixlen(id, b[:], fixFp32)
+	if e.writeHeaderRoom(id, TypeFixlen, maxVarintLen+4) {
+		e.putVarintFit((4 << 3) | fixFp32)
+		binary.LittleEndian.PutUint32(e.buf[e.n:], math.Float32bits(f))
+		e.n += 4
+	}
 	return e.err
 }
 
-// WriteFloat64 writes a 64-bit float field.
+// WriteFloat64 writes a 64-bit float field. See WriteFloat32 on the direct
+// window write.
 func (e *Encoder) WriteFloat64(id ID, f float64) error {
-	var b [8]byte
-	binary.LittleEndian.PutUint64(b[:], math.Float64bits(f))
-	e.writeFixlen(id, b[:], fixFp64)
+	if e.writeHeaderRoom(id, TypeFixlen, maxVarintLen+8) {
+		e.putVarintFit((8 << 3) | fixFp64)
+		binary.LittleEndian.PutUint64(e.buf[e.n:], math.Float64bits(f))
+		e.n += 8
+	}
 	return e.err
 }
 
@@ -255,13 +406,45 @@ func (e *Encoder) WriteString(id ID, s string) error {
 		e.setErr(ErrArgument)
 		return e.err
 	}
-	e.writeHeader(id, TypeFixlen)
-	e.putVarint((uint64(len(s)) << 3) | fixStr)
-	if e.err == nil {
-		e.buf = append(e.buf, s...)
-		e.maybeFlush()
+	if e.writeHeaderRoom(id, TypeFixlen, maxVarintLen) {
+		e.putVarintFit((uint64(len(s)) << 3) | fixStr)
+		e.putRawString(s)
 	}
 	return e.err
+}
+
+// putRawString is putRaw for a string, copied straight from the string with no
+// []byte(s) round trip.
+func (e *Encoder) putRawString(s string) {
+	if len(s) > flushThreshold {
+		e.putRawStringLarge(s)
+		return
+	}
+	if !e.room(len(s)) {
+		return
+	}
+	e.n += copy(e.buf[e.n:], s)
+}
+
+// putRawStringLarge is putRawLarge for a string. It prefers the sink's
+// WriteString (bytes.Buffer, strings.Builder, bufio.Writer all have one) so an
+// oversized payload still costs no []byte(s) copy.
+//
+//go:noinline
+func (e *Encoder) putRawStringLarge(s string) {
+	e.flushBuffered()
+	if e.err != nil {
+		return
+	}
+	var err error
+	if sw, ok := e.w.(io.StringWriter); ok {
+		_, err = sw.WriteString(s)
+	} else {
+		_, err = e.w.Write([]byte(s))
+	}
+	if err != nil {
+		e.err = err
+	}
 }
 
 // WriteBytes writes a binary blob field.
@@ -369,21 +552,206 @@ func (e *Encoder) WriteSequenceEndKeep() error {
 // WriteUnsignedArray writes an array of unsigned integers. An empty array is
 // valid and emits exactly [header][count=0] (§4.7).
 func WriteUnsignedArray[T Unsigned](e *Encoder, id ID, a []T) error {
-	e.writeHeader(id, TypeVarintArrayUnsigned)
-	e.putVarint(uint64(len(a)))
-	for _, x := range a {
-		e.putVarint(uint64(x))
+	if !e.writeHeaderRoom(id, TypeVarintArrayUnsigned, maxVarintLen) {
+		return e.err
 	}
-	return e.err
+	e.putVarintFit(uint64(len(a)))
+	return putUvarintRun(e, a)
 }
 
 // WriteSignedArray writes an array of signed integers. An empty array is valid
 // and emits exactly [header][count=0] (§4.7).
 func WriteSignedArray[T Signed](e *Encoder, id ID, a []T) error {
-	e.writeHeader(id, TypeVarintArraySigned)
-	e.putVarint(uint64(len(a)))
-	for _, x := range a {
-		e.putVarint(zigzagEncode(int64(x)))
+	if !e.writeHeaderRoom(id, TypeVarintArraySigned, maxVarintLen) {
+		return e.err
+	}
+	e.putVarintFit(uint64(len(a)))
+	return putZigzagRun(e, a)
+}
+
+// putUvarintRun and putZigzagRun write an integer array's elements.
+//
+// The varint writer is unrolled INTO each loop rather than called per element:
+// calling putUvarint cost argument setup, a call/return pair and a re-derived
+// window on every element — roughly a quarter of the array-encode profile — so
+// the bulk path pays none of it.
+//
+// The destination advances as a slice, and `len(w) >= maxVarintLen` is carried
+// in the LOOP CONDITION. That is what makes the ten stores bounds-check-free:
+// the prove pass knows w[0]..w[9] are in range, so no per-element slice is cut
+// from the window. It doubles as the refill test — the inner loop simply ends
+// when the window can no longer hold a full varint, and the outer loop drains
+// and re-enters.
+//
+// The two are a deliberate specialization pair, differing ONLY in how an element
+// maps to its wire value. Sharing one body and branching on the mapping was
+// measured 6-7 % slower whichever side of the inner loop the branch sat on.
+// Everything after that mapping is the same unrolled writer as putUvarint
+// (varint.go), which stays the single-value entry point for headers, counts and
+// scalars. All three copies must encode identically; TestVarintWritersAgree
+// holds them to that, so a change made to one and not the others fails the suite
+// rather than corrupting the wire.
+func putUvarintRun[T Unsigned](e *Encoder, a []T) error {
+	i := 0
+	for i < len(a) {
+		if !e.room(maxVarintLen) {
+			return e.err
+		}
+		buf := e.buf
+		w := buf[e.n:]
+		for i < len(a) && len(w) >= maxVarintLen {
+			x := uint64(a[i])
+			i++
+			if x < 0x80 {
+				w[0] = byte(x)
+				w = w[1:]
+				continue
+			}
+			w[0] = byte(x) | 0x80
+			x >>= 7
+			if x < 0x80 {
+				w[1] = byte(x)
+				w = w[2:]
+				continue
+			}
+			w[1] = byte(x) | 0x80
+			x >>= 7
+			if x < 0x80 {
+				w[2] = byte(x)
+				w = w[3:]
+				continue
+			}
+			w[2] = byte(x) | 0x80
+			x >>= 7
+			if x < 0x80 {
+				w[3] = byte(x)
+				w = w[4:]
+				continue
+			}
+			w[3] = byte(x) | 0x80
+			x >>= 7
+			if x < 0x80 {
+				w[4] = byte(x)
+				w = w[5:]
+				continue
+			}
+			w[4] = byte(x) | 0x80
+			x >>= 7
+			if x < 0x80 {
+				w[5] = byte(x)
+				w = w[6:]
+				continue
+			}
+			w[5] = byte(x) | 0x80
+			x >>= 7
+			if x < 0x80 {
+				w[6] = byte(x)
+				w = w[7:]
+				continue
+			}
+			w[6] = byte(x) | 0x80
+			x >>= 7
+			if x < 0x80 {
+				w[7] = byte(x)
+				w = w[8:]
+				continue
+			}
+			w[7] = byte(x) | 0x80
+			x >>= 7
+			if x < 0x80 {
+				w[8] = byte(x)
+				w = w[9:]
+				continue
+			}
+			w[8] = byte(x) | 0x80
+			x >>= 7
+			w[9] = byte(x)
+			w = w[10:]
+		}
+		e.n = len(buf) - len(w)
+	}
+	return e.err
+}
+
+// putZigzagRun is putUvarintRun for signed elements (zigzag, §4.2). See there.
+func putZigzagRun[T Signed](e *Encoder, a []T) error {
+	i := 0
+	for i < len(a) {
+		if !e.room(maxVarintLen) {
+			return e.err
+		}
+		buf := e.buf
+		w := buf[e.n:]
+		for i < len(a) && len(w) >= maxVarintLen {
+			x := zigzagEncode(int64(a[i]))
+			i++
+			if x < 0x80 {
+				w[0] = byte(x)
+				w = w[1:]
+				continue
+			}
+			w[0] = byte(x) | 0x80
+			x >>= 7
+			if x < 0x80 {
+				w[1] = byte(x)
+				w = w[2:]
+				continue
+			}
+			w[1] = byte(x) | 0x80
+			x >>= 7
+			if x < 0x80 {
+				w[2] = byte(x)
+				w = w[3:]
+				continue
+			}
+			w[2] = byte(x) | 0x80
+			x >>= 7
+			if x < 0x80 {
+				w[3] = byte(x)
+				w = w[4:]
+				continue
+			}
+			w[3] = byte(x) | 0x80
+			x >>= 7
+			if x < 0x80 {
+				w[4] = byte(x)
+				w = w[5:]
+				continue
+			}
+			w[4] = byte(x) | 0x80
+			x >>= 7
+			if x < 0x80 {
+				w[5] = byte(x)
+				w = w[6:]
+				continue
+			}
+			w[5] = byte(x) | 0x80
+			x >>= 7
+			if x < 0x80 {
+				w[6] = byte(x)
+				w = w[7:]
+				continue
+			}
+			w[6] = byte(x) | 0x80
+			x >>= 7
+			if x < 0x80 {
+				w[7] = byte(x)
+				w = w[8:]
+				continue
+			}
+			w[7] = byte(x) | 0x80
+			x >>= 7
+			if x < 0x80 {
+				w[8] = byte(x)
+				w = w[9:]
+				continue
+			}
+			w[8] = byte(x) | 0x80
+			x >>= 7
+			w[9] = byte(x)
+			w = w[10:]
+		}
+		e.n = len(buf) - len(w)
 	}
 	return e.err
 }
@@ -392,13 +760,27 @@ func WriteSignedArray[T Signed](e *Encoder, id ID, a []T) error {
 // and emits exactly [header][count=0][fixlen_word] — the fixlen_word is always
 // present (even when empty) so the element subtype is never ambiguous (§4.8).
 func (e *Encoder) WriteFloat32Array(id ID, a []float32) error {
-	e.writeHeader(id, TypeFixlenArray)
-	e.putVarint(uint64(len(a)))
-	e.putVarint((4 << 3) | fixFp32)
-	var b [4]byte
-	for _, f := range a {
-		binary.LittleEndian.PutUint32(b[:], math.Float32bits(f))
-		e.putRaw(b[:])
+	if !e.writeHeaderRoom(id, TypeFixlenArray, 2*maxVarintLen) {
+		return e.err
+	}
+	e.putVarintFit(uint64(len(a)))
+	e.putVarintFit((4 << 3) | fixFp32)
+	// Same advancing-window shape as the varint runs: carrying the width test
+	// in the loop condition both proves the store in bounds and serves as the
+	// refill test, so no per-element slice is cut from the window.
+	i := 0
+	for i < len(a) {
+		if !e.room(4) {
+			return e.err
+		}
+		buf := e.buf
+		w := buf[e.n:]
+		for i < len(a) && len(w) >= 4 {
+			binary.LittleEndian.PutUint32(w, math.Float32bits(a[i]))
+			w = w[4:]
+			i++
+		}
+		e.n = len(buf) - len(w)
 	}
 	return e.err
 }
@@ -407,13 +789,27 @@ func (e *Encoder) WriteFloat32Array(id ID, a []float32) error {
 // and emits exactly [header][count=0][fixlen_word] — the fixlen_word is always
 // present (even when empty) so the element subtype is never ambiguous (§4.8).
 func (e *Encoder) WriteFloat64Array(id ID, a []float64) error {
-	e.writeHeader(id, TypeFixlenArray)
-	e.putVarint(uint64(len(a)))
-	e.putVarint((8 << 3) | fixFp64)
-	var b [8]byte
-	for _, f := range a {
-		binary.LittleEndian.PutUint64(b[:], math.Float64bits(f))
-		e.putRaw(b[:])
+	if !e.writeHeaderRoom(id, TypeFixlenArray, 2*maxVarintLen) {
+		return e.err
+	}
+	e.putVarintFit(uint64(len(a)))
+	e.putVarintFit((8 << 3) | fixFp64)
+	// Same advancing-window shape as the varint runs: carrying the width test
+	// in the loop condition both proves the store in bounds and serves as the
+	// refill test, so no per-element slice is cut from the window.
+	i := 0
+	for i < len(a) {
+		if !e.room(8) {
+			return e.err
+		}
+		buf := e.buf
+		w := buf[e.n:]
+		for i < len(a) && len(w) >= 8 {
+			binary.LittleEndian.PutUint64(w, math.Float64bits(a[i]))
+			w = w[8:]
+			i++
+		}
+		e.n = len(buf) - len(w)
 	}
 	return e.err
 }
