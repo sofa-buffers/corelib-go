@@ -205,20 +205,43 @@ func cpuNow() float64 {
 	return sec + usec/1e6
 }
 
+// batchSeconds is how long one batch of operations should span before the
+// clock is read again. cpuNow() is a getrusage syscall costing on the order of
+// a microsecond, so reading it once per operation would time the clock rather
+// than the codec; ~10 ms of work per read pushes that below 0.01%.
+const batchSeconds = 0.01
+
+// calibrateBatch grows a batch until it spans batchSeconds, so the single clock
+// read that ends it is a rounding error against the work it timed. Calibration
+// doubles as extra warmup.
+func calibrateBatch(fn func()) int {
+	for batch := 1; ; batch *= 2 {
+		t0 := cpuNow()
+		for k := 0; k < batch; k++ {
+			fn()
+		}
+		if cpuNow()-t0 >= batchSeconds {
+			return batch
+		}
+	}
+}
+
 // timeLoop runs fn for ~1s of CPU time (after a warmup) and returns throughput
-// in MB/s (MB = 1e6 bytes) for messages of the given byte size.
+// in MB/s (MB = 1e6 bytes) for messages of the given byte size. The clock is
+// read once per batch, never per operation, so the reported time is the work
+// and not the measurement.
 func timeLoop(fn func(), msgBytes int) float64 {
 	fn() // warmup
+	batch := calibrateBatch(fn)
 	t0 := cpuNow()
 	iters := 0
 	var el float64
-	for {
-		fn()
-		iters++
-		el = cpuNow() - t0
-		if el >= 1.0 {
-			break
+	for el < 1.0 {
+		for k := 0; k < batch; k++ {
+			fn()
 		}
+		iters += batch
+		el = cpuNow() - t0
 	}
 	return float64(msgBytes) * float64(iters) / el / 1e6
 }
@@ -349,44 +372,52 @@ func perfMeasureEncode() (perfResult, int) {
 	enc.Flush()
 	msg := len(sw.buf)
 
-	for i := 0; i < 1000; i++ { // warmup
+	// The fresh encoder per iteration is part of the measured op.
+	op := func() {
 		sw.buf = sw.buf[:0]
 		enc = sofab.NewEncoder(sw)
 		perfEncode(enc)
 		enc.Flush()
 	}
 
+	for i := 0; i < 1000; i++ { // warmup
+		op()
+	}
+	batch := calibrateBatch(op)
+
 	var it uint64
 	t0 := cpuNow()
 	var el float64
-	for {
-		sw.buf = sw.buf[:0]
-		enc = sofab.NewEncoder(sw)
-		perfEncode(enc)
-		enc.Flush()
-		it++
-		el = cpuNow() - t0
-		if el >= 1.0 {
-			break
+	for el < 1.0 {
+		for k := 0; k < batch; k++ {
+			op()
 		}
+		it += uint64(batch)
+		el = cpuNow() - t0
 	}
 	return perfResult{it, el / float64(it) * 1e9, float64(msg) * float64(it) / el / 1e6}, msg
 }
 
 func perfMeasureDecode(buf []byte) perfResult {
-	for i := 0; i < 1000; i++ { // warmup
+	// The fresh decoder per iteration is part of the measured op.
+	op := func() {
 		_ = sofab.NewDecoder(bytes.NewReader(buf)).Accept(perfVisitor{})
 	}
+
+	for i := 0; i < 1000; i++ { // warmup
+		op()
+	}
+	batch := calibrateBatch(op)
+
 	var it uint64
 	t0 := cpuNow()
 	var el float64
-	for {
-		_ = sofab.NewDecoder(bytes.NewReader(buf)).Accept(perfVisitor{})
-		it++
-		el = cpuNow() - t0
-		if el >= 1.0 {
-			break
+	for el < 1.0 {
+		for k := 0; k < batch; k++ {
+			op()
 		}
+		it += uint64(batch)
+		el = cpuNow() - t0
 	}
 	return perfResult{it, el / float64(it) * 1e9, float64(len(buf)) * float64(it) / el / 1e6}
 }
