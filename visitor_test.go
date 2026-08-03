@@ -313,11 +313,11 @@ func TestVisitorMalformed(t *testing.T) {
 		// its over-ceiling id is the sole reason this is INVALID, isolating the
 		// bound from the dangling-end check. Bytes: 76 87 80 80 80 40 (id 2^31).
 		"seq-end id above max": {append(vhdr(14, sofab.TypeSequenceStart), vhdr(sofab.IDMax+1, sofab.TypeSequenceEnd)...), sofab.ErrInvalidMsg},
-		"truncated signed":      {append(vhdr(1, sofab.TypeVarintSigned), 0x80), sofab.ErrIncomplete},
-		"signed array count":    {append(vhdr(1, sofab.TypeVarintArraySigned), 0x80), sofab.ErrIncomplete},
-		"fixlen array count":    {append(vhdr(1, sofab.TypeFixlenArray), 0x80), sofab.ErrIncomplete},
-		"fixlen array header":   {append(vhdr(1, sofab.TypeFixlenArray), append(vbytes(1), 0x80)...), sofab.ErrIncomplete},
-		"fp64 array payload":    {append(vhdr(1, sofab.TypeFixlenArray), append(vbytes(1), append(vbytes((8<<3)|0x1), 0, 0, 0, 0, 0, 0, 0)...)...), sofab.ErrIncomplete},
+		"truncated signed":     {append(vhdr(1, sofab.TypeVarintSigned), 0x80), sofab.ErrIncomplete},
+		"signed array count":   {append(vhdr(1, sofab.TypeVarintArraySigned), 0x80), sofab.ErrIncomplete},
+		"fixlen array count":   {append(vhdr(1, sofab.TypeFixlenArray), 0x80), sofab.ErrIncomplete},
+		"fixlen array header":  {append(vhdr(1, sofab.TypeFixlenArray), append(vbytes(1), 0x80)...), sofab.ErrIncomplete},
+		"fp64 array payload":   {append(vhdr(1, sofab.TypeFixlenArray), append(vbytes(1), append(vbytes((8<<3)|0x1), 0, 0, 0, 0, 0, 0, 0)...)...), sofab.ErrIncomplete},
 		// cursor-specific boundaries: a value expected exactly at end-of-buffer,
 		// a varint that overflows 64 bits while reading the next header, and a
 		// fixlen length past the cap. (A zero-count array is no longer malformed
