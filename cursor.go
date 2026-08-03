@@ -143,6 +143,30 @@ func (c *cursor) fillSigned(out []int64) error {
 	return nil
 }
 
+// scanTruncatedArray decides the outcome for an integer array whose element
+// count exceeds the bytes remaining. Because every element is at least one byte,
+// the count can never be satisfied, so the array is truncated (INCOMPLETE, §7) —
+// UNLESS an element already in hand is malformed, since INVALID dominates
+// INCOMPLETE (§5.2). The elements are walked as varints (no allocation from the
+// untrusted count — see issue #40): an overlong one (>64 bits) is INVALID, and
+// running off the end mid-element or exhausting the buffer is the expected
+// truncation. This is what keeps `count=11` over ten all-continuation bytes
+// INVALID rather than INCOMPLETE (issue #66).
+func (c *cursor) scanTruncatedArray() error {
+	buf, p := c.buf, c.pos
+	for p < len(buf) {
+		_, np, st := uvarintTail(buf, p)
+		switch st {
+		case varintOverflow:
+			return ErrInvalidMsg
+		case varintTruncated:
+			return ErrIncomplete // ran off the end mid-element (§7)
+		}
+		p = np
+	}
+	return ErrIncomplete
+}
+
 // tailErr maps a non-OK tail status to its outcome: overflow is malformed
 // (INVALID), running off the end is truncation (INCOMPLETE) — §5.2.
 func tailErr(st varintTailStatus) error {
@@ -285,10 +309,13 @@ func (c *cursor) accept(v Visitor, depth int) error {
 				}
 			}
 			// Each varint element is at least one byte, so a count exceeding the
-			// bytes left cannot be satisfied: fail fast as INCOMPLETE (§7) instead
-			// of allocating a huge slice from the untrusted count (issue #40).
+			// bytes left can never be satisfied — the array is truncated. Rather
+			// than allocate a huge slice from the untrusted count (issue #40),
+			// scan the elements in hand: INVALID dominates INCOMPLETE (§5.2), so an
+			// element varint already provably overlong is INVALID, not truncation
+			// (issue #66).
 			if n > uint64(len(c.buf)-c.pos) {
-				return ErrIncomplete
+				return c.scanTruncatedArray()
 			}
 			out := make([]uint64, n)
 			if err := c.fillUnsigned(out); err != nil {
@@ -307,10 +334,11 @@ func (c *cursor) accept(v Visitor, depth int) error {
 					return err
 				}
 			}
-			// See TypeVarintArrayUnsigned: reject a count larger than the bytes
-			// remaining before allocating from it (issue #40).
+			// See TypeVarintArrayUnsigned: a count larger than the bytes remaining
+			// is truncated, but scan the elements in hand first so a provably
+			// overlong varint stays INVALID (§5.2, issues #40 and #66).
 			if n > uint64(len(c.buf)-c.pos) {
-				return ErrIncomplete
+				return c.scanTruncatedArray()
 			}
 			out := make([]int64, n)
 			if err := c.fillSigned(out); err != nil {
