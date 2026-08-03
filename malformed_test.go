@@ -85,6 +85,84 @@ func TestOversizedCountLengthInvalid(t *testing.T) {
 	}
 }
 
+// TestArrayCountOverRemainingScansElements covers Crucible F-0053 (issue #66): an
+// integer array whose declared element count exceeds the bytes remaining is
+// truncated, but INVALID dominates INCOMPLETE (§5.2), so an element varint already
+// provably overlong from the bytes in hand must be reported as INVALID rather than
+// short-circuiting to INCOMPLETE on the count-vs-remaining pre-check.
+//
+// The array field carries an undeclared id, so the whole field is skipped by the
+// corelib with no schema knowledge (§5.2) — the path any forward-compatible
+// decoder must accept. Controls pin the neighbours: the same bytes one shorter
+// stay INVALID via the ordinary element decode, a genuinely truncated (but
+// well-formed) run stays INCOMPLETE, and enough legal elements decode cleanly.
+func TestArrayCountOverRemainingScansElements(t *testing.T) {
+	// Ten bytes each with the continuation flag set: an element varint that cannot
+	// terminate before an eleventh byte, which exceeds the 10-byte/64-bit maximum.
+	tenCont := bytes.Repeat([]byte{0x80}, 10)
+
+	// hdr opens field id 8 (undeclared) as an unsigned integer array.
+	hdr := vhdr(8, sofab.TypeVarintArrayUnsigned)
+
+	cases := []struct {
+		name string
+		in   []byte
+		want error // ErrInvalidMsg, ErrIncomplete, or nil for a clean decode
+	}{
+		{
+			// The isolate: count 11 > 10 bytes remaining, and those 10 bytes are a
+			// provably-overlong varint. INVALID, not INCOMPLETE.
+			name: "count over remaining, overlong element",
+			in:   append(append(hdr, vbytes(11)...), tenCont...),
+			want: sofab.ErrInvalidMsg,
+		},
+		{
+			// ctl_count10_same_bytes: count fits the bytes, so the ordinary element
+			// decode reads the same ten bytes as one overlong varint — still INVALID.
+			name: "count fits, overlong element",
+			in:   append(append(hdr, vbytes(10)...), tenCont...),
+			want: sofab.ErrInvalidMsg,
+		},
+		{
+			// Count over remaining but every element in hand is well-formed: the
+			// buffer simply runs out. Genuine truncation stays INCOMPLETE.
+			name: "count over remaining, well-formed elements",
+			in:   append(append(hdr, vbytes(11)...), bytes.Repeat([]byte{0x00}, 10)...),
+			want: sofab.ErrIncomplete,
+		},
+		{
+			// ctl_count11_enough_bytes: eleven legal one-byte elements decode cleanly.
+			name: "count matches, well-formed elements",
+			in:   append(append(hdr, vbytes(11)...), bytes.Repeat([]byte{0x00}, 11)...),
+			want: nil,
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			err := sofab.AcceptBytes(c.in, baseV{})
+			if c.want == nil {
+				if err != nil {
+					t.Fatalf("AcceptBytes = %v, want clean decode", err)
+				}
+				return
+			}
+			if !errors.Is(err, c.want) {
+				t.Fatalf("AcceptBytes = %v, want %v", err, c.want)
+			}
+			// INVALID and INCOMPLETE are mutually exclusive outcomes here; guard the
+			// one this case is not, so a regression that swaps them is caught.
+			other := sofab.ErrIncomplete
+			if c.want == sofab.ErrIncomplete {
+				other = sofab.ErrInvalidMsg
+			}
+			if errors.Is(err, other) {
+				t.Fatalf("AcceptBytes = %v, must not also match %v", err, other)
+			}
+		})
+	}
+}
+
 // TestDeepNestingEncoderWritesNoBytes pins the byte-level half of the encoder's
 // MAX_DEPTH guarantee (§4.9): the rejected MaxDepth+1 open must return ErrArgument
 // AND emit nothing, so a flushed stream never nests deeper than MaxDepth.
