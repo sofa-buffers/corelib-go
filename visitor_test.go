@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -307,6 +308,11 @@ func TestVisitorMalformed(t *testing.T) {
 		"signed array trunc":    {append(vhdr(1, sofab.TypeVarintArraySigned), append(vbytes(2), 0x02, 0x80)...), sofab.ErrIncomplete},
 		"array count truncated": {append(vhdr(1, sofab.TypeVarintArrayUnsigned), 0x80), sofab.ErrIncomplete},
 		"id above max":          {append(vhdr(sofab.IDMax+1, sofab.TypeVarintUnsigned), 0x00), sofab.ErrInvalidMsg},
+		// The ID_MAX ceiling binds the sequence-end header too (§4.9, §6.2). The
+		// end marker sits in a valid position — it closes the open sequence — so
+		// its over-ceiling id is the sole reason this is INVALID, isolating the
+		// bound from the dangling-end check. Bytes: 76 87 80 80 80 40 (id 2^31).
+		"seq-end id above max": {append(vhdr(14, sofab.TypeSequenceStart), vhdr(sofab.IDMax+1, sofab.TypeSequenceEnd)...), sofab.ErrInvalidMsg},
 		"truncated signed":      {append(vhdr(1, sofab.TypeVarintSigned), 0x80), sofab.ErrIncomplete},
 		"signed array count":    {append(vhdr(1, sofab.TypeVarintArraySigned), 0x80), sofab.ErrIncomplete},
 		"fixlen array count":    {append(vhdr(1, sofab.TypeFixlenArray), 0x80), sofab.ErrIncomplete},
@@ -328,6 +334,66 @@ func TestVisitorMalformed(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestSequenceEndIDCeilingAndTolerance pins both edges of the id bound on a
+// sequence-end header (§4.9, §6.2). The bound is on the id's value, not its
+// spelling: an id at or below ID_MAX — even a non-zero one, or a non-minimally
+// spelled zero — is discarded and the marker closes the open sequence (§4.1
+// untouched); only ID_MAX+1 is INVALID. Both decode surfaces must agree, so the
+// pull Decoder is checked alongside the visitor path. Mirrors the accepting
+// controls and the one moving point in the finding (F-0054).
+func TestSequenceEndIDCeilingAndTolerance(t *testing.T) {
+	// A sequence-end header carrying the given id bytes, wrapped in a sequence
+	// start (id 14) so the end sits in a valid position and only its id is at
+	// issue.
+	wrap := func(endHeader []byte) []byte {
+		return append(vhdr(14, sofab.TypeSequenceStart), endHeader...)
+	}
+	tolerated := map[string][]byte{
+		"id 0 canonical (0x07)": {0x07},
+		"id 0 non-minimal":      {0x87, 0x00}, // §4.1: overlong spelling of id 0
+		"id 3":                  vhdr(3, sofab.TypeSequenceEnd),
+		"id at ID_MAX":          vhdr(sofab.IDMax, sofab.TypeSequenceEnd),
+	}
+	for name, endHeader := range tolerated {
+		t.Run("accept/"+name, func(t *testing.T) {
+			// Visitor path: accepted, and the id is discarded — the recorder
+			// sees a bare seqend, never the id it was spelled with.
+			var log []string
+			if err := newDec(wrap(endHeader)).Accept(recorder{&log}); err != nil {
+				t.Fatalf("Accept = %v, want nil", err)
+			}
+			if want := []string{"seqbegin/14", "seqend"}; !reflect.DeepEqual(log, want) {
+				t.Fatalf("log = %v, want %v", log, want)
+			}
+			// Pull path: the same bytes read as start then an ordinary end.
+			d := newDec(wrap(endHeader))
+			if f := mustNext(t, d); f.Type != sofab.TypeSequenceStart {
+				t.Fatalf("first = %v, want SequenceStart", f.Type)
+			}
+			if f := mustNext(t, d); f.Type != sofab.TypeSequenceEnd {
+				t.Fatalf("second = %v, want SequenceEnd", f.Type)
+			}
+		})
+	}
+	// ID_MAX+1 is the one point that moves to INVALID, on both surfaces.
+	over := wrap(vhdr(sofab.IDMax+1, sofab.TypeSequenceEnd))
+	t.Run("reject/id above ID_MAX/visitor", func(t *testing.T) {
+		var log []string
+		if err := newDec(over).Accept(recorder{&log}); !errors.Is(err, sofab.ErrInvalidMsg) {
+			t.Fatalf("Accept = %v, want ErrInvalidMsg", err)
+		}
+	})
+	t.Run("reject/id above ID_MAX/pull", func(t *testing.T) {
+		d := newDec(over)
+		if f := mustNext(t, d); f.Type != sofab.TypeSequenceStart {
+			t.Fatalf("first = %v, want SequenceStart", f.Type)
+		}
+		if _, err := d.Next(); !errors.Is(err, sofab.ErrInvalidMsg) {
+			t.Fatalf("Next = %v, want ErrInvalidMsg", err)
+		}
+	})
 }
 
 // TestVisitorEmptyArrays confirms the visitor path delivers zero-count arrays as

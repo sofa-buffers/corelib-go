@@ -269,7 +269,11 @@ func (c *cursor) accept(v Visitor, depth int) error {
 		}
 		t := WireType(h & 0x07)
 		id := ID(h >> 3)
-		if t != TypeSequenceEnd && (h>>3) > uint64(IDMax) {
+		// The id ceiling binds every header without exception, the sequence-end
+		// marker included: its id is discarded (§4.9) but discarded is not
+		// unvalidated, so an id above ID_MAX is INVALID here as anywhere else
+		// (§5.2, §6.2). One unconditional check, no branch on the wire type.
+		if (h >> 3) > uint64(IDMax) {
 			return ErrInvalidMsg
 		}
 		switch t {
