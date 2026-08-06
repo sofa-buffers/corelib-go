@@ -80,6 +80,102 @@ type HeaderVisitor interface {
 	FixlenHeader(id ID, subtype int, length int) error
 }
 
+// ElemBoundVisitor is a second optional extension a Visitor may implement, to
+// declare the value range an INTEGER ARRAY's elements may take under the schema.
+//
+// It exists for the same reason HeaderVisitor does, one level down. The array
+// callbacks hand over the whole slice, so the generated `for _, x := range v`
+// width guard can only run once every element has arrived — and an array that
+// is truncated never arrives. MESSAGE_SPEC §5.2 has INVALID dominate INCOMPLETE,
+// so an element that is already outside its declared width and fully on the wire
+// must keep the message INVALID however little follows it. Only the decoder can
+// apply that bound while the elements go past, and only the schema knows what
+// the bound is; this is how the two meet (generator#267, Crucible F-0043).
+//
+// SEPARATE from HeaderVisitor, deliberately. Both are reached by a type
+// assertion, so a visitor that implements only part of an interface implements
+// none of it — adding a third method to HeaderVisitor would silently switch
+// ArrayBegin and FixlenHeader off for every visitor generated before it existed.
+// As its own interface it is purely additive: a visitor that does not implement
+// it decodes exactly as before.
+//
+// Asked once per array FIELD, never per element: the answer is resolved at the
+// count word and the decoder applies it afterwards, so a long array costs one
+// call, not one per value. A scope holding no array never even makes the type
+// assertion. And the bound only changes an outcome where the whole-slice
+// callback does not fire — where the array completes, the visitor's own guard
+// sees every element and reaches the same verdict — so it is applied on the
+// failure path and the element loops stay a pure decode.
+type ElemBoundVisitor interface {
+	// ArrayElemBound reports the inclusive range an element of the integer array
+	// field id may take, and whether the schema narrows it at all (false for u64
+	// and i64, which span the value domain, and for an id this scope does not
+	// declare). Both bounds are int64: the widest NARROWED unsigned kind is u32,
+	// so every bound that exists fits, and an unsigned element is compared
+	// against uint64(max).
+	//
+	// kind is the kind the WIRE declares. A field whose wire kind contradicts the
+	// declared element type is skipped whole (§7.3) — the value was never this
+	// field's — so an implementation must return false for a kind it does not
+	// declare rather than measure another field's elements against this bound.
+	// Same rule as HeaderVisitor.ArrayBegin.
+	ArrayElemBound(id ID, kind ArrayKind) (min, max int64, ok bool)
+}
+
+// ebCache resolves a visitor's optional ElemBoundVisitor exactly as hvCache
+// resolves HeaderVisitor, and for the same reason: the assertion is an itab
+// lookup that walks the whole method list when it fails, so it is asked at most
+// once per scope and only where the answer can matter.
+type ebCache struct {
+	eb    ElemBoundVisitor
+	known bool
+}
+
+func (c *ebCache) of(v Visitor) ElemBoundVisitor {
+	if !c.known {
+		c.eb, _ = v.(ElemBoundVisitor)
+		c.known = true
+	}
+	return c.eb
+}
+
+// elemBound is one array field's answer, resolved once and then applied per
+// element — the interface call stays out of the element loop.
+type elemBound struct {
+	lo, hi int64
+	signed bool
+	ok     bool
+}
+
+// elemBoundOf asks v for the bound on field id, given the kind the wire
+// declares. A visitor without the extension, or a field it does not narrow,
+// yields a bound that never breaches.
+func elemBoundOf(eb ElemBoundVisitor, id ID, kind ArrayKind) elemBound {
+	if eb == nil {
+		return elemBound{}
+	}
+	lo, hi, ok := eb.ArrayElemBound(id, kind)
+	return elemBound{lo: lo, hi: hi, signed: kind == ArraySigned, ok: ok}
+}
+
+// breached reports whether the raw wire value x is outside the declared width.
+// x is the varint as read: zigzag is undone here for a signed array, so a caller
+// walking undecoded elements passes the same value whatever the kind.
+func (b elemBound) breached(x uint64) bool {
+	if !b.ok {
+		return false
+	}
+	if b.signed {
+		return b.breachedSigned(zigzagDecode(x))
+	}
+	return x > uint64(b.hi)
+}
+
+// breachedSigned is breached for an element a caller has already zigzag-decoded.
+func (b elemBound) breachedSigned(s int64) bool {
+	return b.ok && (s < b.lo || s > b.hi)
+}
+
 // Accept decodes the entire top-level stream into v. It slurps the remaining
 // input into one contiguous buffer and advances a cursor over it (see cursor),
 // so dispatch never re-enters the io.Reader per byte. It returns nil at a clean

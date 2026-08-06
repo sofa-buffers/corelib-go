@@ -227,7 +227,7 @@ func TestFillRoundTripsEveryProbe(t *testing.T) {
 		t.Fatalf("count = %d (%v), want %d", n, err, len(probes))
 	}
 	gotU := make([]uint64, n)
-	if err := c.fillUnsigned(gotU); err != nil {
+	if err := c.fillUnsigned(gotU, elemBound{}); err != nil {
 		t.Fatalf("fillUnsigned: %v", err)
 	}
 	for i, v := range probes {
@@ -243,7 +243,7 @@ func TestFillRoundTripsEveryProbe(t *testing.T) {
 		t.Fatalf("signed count = %d (%v), want %d", n, err, len(signed))
 	}
 	gotS := make([]int64, n)
-	if err := c.fillSigned(gotS); err != nil {
+	if err := c.fillSigned(gotS, elemBound{}); err != nil {
 		t.Fatalf("fillSigned: %v", err)
 	}
 	for i, v := range signed {

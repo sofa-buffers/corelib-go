@@ -86,13 +86,19 @@ func (c *cursor) uvarintSlow(eofOK bool) (uint64, error) {
 // Calling c.uvarint per element instead would pay three layers — the inlined
 // single-byte probe, the out-of-line uvarintSlow dispatch, and uvarintFast
 // itself — plus a reload of c.buf/c.pos from memory each time.
-func (c *cursor) fillUnsigned(out []uint64) error {
+// `bound` is the schema's declared element width, applied ONLY when the fill
+// fails: the elements already decoded are on the wire, and §5.2 makes one
+// outside its width outrank the truncation that stopped the read
+// (generator#267). Checking there rather than per element keeps the bulk decoder
+// a pure decode — where the array completes, the visitor's own guard sees every
+// element and reaches the same verdict.
+func (c *cursor) fillUnsigned(out []uint64, bound elemBound) error {
 	buf, p := c.buf, c.pos
 	// Unsigned elements are the bulk decoder's own output type, so it fills the
 	// destination in place — no staging, no copy.
 	got, np, st := decodeUvarintRun(buf, p, out)
 	if st != varintOK {
-		return tailErr(st)
+		return unsignedBoundErr(out[:got], bound, tailErr(st))
 	}
 	p = np
 	// decodeUvarintRun stops on reaching the last maxVarintLen bytes of the
@@ -101,7 +107,7 @@ func (c *cursor) fillUnsigned(out []uint64) error {
 	for i := got; i < len(out); i++ {
 		v, np, st := uvarintTail(buf, p)
 		if st != varintOK {
-			return tailErr(st)
+			return unsignedBoundErr(out[:i], bound, tailErr(st))
 		}
 		out[i], p = v, np
 	}
@@ -110,7 +116,7 @@ func (c *cursor) fillUnsigned(out []uint64) error {
 }
 
 // fillSigned is fillUnsigned for a zigzag-encoded signed array.
-func (c *cursor) fillSigned(out []int64) error {
+func (c *cursor) fillSigned(out []int64, bound elemBound) error {
 	buf, p := c.buf, c.pos
 	// Signed elements are not the bulk decoder's output type, so a chunk is
 	// staged on the stack and zigzag-mapped out. varintChunk is sized so that
@@ -122,7 +128,10 @@ func (c *cursor) fillSigned(out []int64) error {
 		want := min(len(out)-i, varintChunk)
 		got, np, st := decodeUvarintRun(buf, p, stage[:want])
 		if st != varintOK {
-			return tailErr(st)
+			for k, v := range stage[:got] {
+				out[i+k] = zigzagDecode(v)
+			}
+			return signedBoundErr(out[:i+got], bound, tailErr(st))
 		}
 		for k, v := range stage[:got] {
 			out[i+k] = zigzagDecode(v)
@@ -135,12 +144,40 @@ func (c *cursor) fillSigned(out []int64) error {
 	for ; i < len(out); i++ {
 		v, np, st := uvarintTail(buf, p)
 		if st != varintOK {
-			return tailErr(st)
+			return signedBoundErr(out[:i], bound, tailErr(st))
 		}
 		out[i], p = zigzagDecode(v), np
 	}
 	c.pos = p
 	return nil
+}
+
+// unsignedBoundErr upgrades a failed fill to INVALID when an element already
+// decoded breaches the declared width, and otherwise reports the fill's own
+// outcome unchanged. §5.2: INVALID dominates INCOMPLETE.
+func unsignedBoundErr(got []uint64, bound elemBound, err error) error {
+	if !bound.ok {
+		return err
+	}
+	for _, x := range got {
+		if bound.breached(x) {
+			return ErrInvalidMsg
+		}
+	}
+	return err
+}
+
+// signedBoundErr is unsignedBoundErr for elements already zigzag-decoded.
+func signedBoundErr(got []int64, bound elemBound, err error) error {
+	if !bound.ok {
+		return err
+	}
+	for _, x := range got {
+		if bound.breachedSigned(x) {
+			return ErrInvalidMsg
+		}
+	}
+	return err
 }
 
 // scanTruncatedArray decides the outcome for an integer array whose element
@@ -152,15 +189,25 @@ func (c *cursor) fillSigned(out []int64) error {
 // running off the end mid-element or exhausting the buffer is the expected
 // truncation. This is what keeps `count=11` over ten all-continuation bytes
 // INVALID rather than INCOMPLETE (issue #66).
-func (c *cursor) scanTruncatedArray() error {
+//
+// bound extends the same rule from the FORMAT bound to the SCHEMA one: an
+// element outside its declared width is INVALID by §7.1 and, being fully on the
+// wire, likewise dominates the truncation (generator#267). It is applied only
+// here because this is the only branch in which the whole-slice callback never
+// fires — where the array does complete, the visitor's own guard sees every
+// element and reaches the same verdict, so the hot path stays untouched.
+func (c *cursor) scanTruncatedArray(bound elemBound) error {
 	buf, p := c.buf, c.pos
 	for p < len(buf) {
-		_, np, st := uvarintTail(buf, p)
+		x, np, st := uvarintTail(buf, p)
 		switch st {
 		case varintOverflow:
 			return ErrInvalidMsg
 		case varintTruncated:
 			return ErrIncomplete // ran off the end mid-element (§7)
+		}
+		if bound.breached(x) {
+			return ErrInvalidMsg
 		}
 		p = np
 	}
@@ -254,8 +301,10 @@ func (c *cursor) accept(v Visitor, depth int) error {
 	nested := depth > 0
 	// The header hooks are resolved lazily — see hvCache. Still at most one
 	// assertion per scope, and none at all in a scope that holds no array or
-	// fixlen field.
+	// fixlen field. The element-bound extension is resolved the same way and
+	// asked even later: only where an integer array is truncated (see ebCache).
 	var hooks hvCache
+	var bounds ebCache
 	for {
 		h, err := c.uvarint(true)
 		if err != nil {
@@ -317,12 +366,14 @@ func (c *cursor) accept(v Visitor, depth int) error {
 			// than allocate a huge slice from the untrusted count (issue #40),
 			// scan the elements in hand: INVALID dominates INCOMPLETE (§5.2), so an
 			// element varint already provably overlong is INVALID, not truncation
-			// (issue #66).
+			// (issue #66) — and likewise one already outside its declared width
+			// (generator#267).
+			ub := elemBoundOf(bounds.of(v), id, ArrayUnsigned)
 			if n > uint64(len(c.buf)-c.pos) {
-				return c.scanTruncatedArray()
+				return c.scanTruncatedArray(ub)
 			}
 			out := make([]uint64, n)
-			if err := c.fillUnsigned(out); err != nil {
+			if err := c.fillUnsigned(out, ub); err != nil {
 				return err
 			}
 			if err := v.UnsignedArray(id, out); err != nil {
@@ -340,12 +391,14 @@ func (c *cursor) accept(v Visitor, depth int) error {
 			}
 			// See TypeVarintArrayUnsigned: a count larger than the bytes remaining
 			// is truncated, but scan the elements in hand first so a provably
-			// overlong varint stays INVALID (§5.2, issues #40 and #66).
+			// overlong varint — or one outside its declared width — stays INVALID
+			// (§5.2, issues #40 and #66, generator#267).
+			sb := elemBoundOf(bounds.of(v), id, ArraySigned)
 			if n > uint64(len(c.buf)-c.pos) {
-				return c.scanTruncatedArray()
+				return c.scanTruncatedArray(sb)
 			}
 			out := make([]int64, n)
-			if err := c.fillSigned(out); err != nil {
+			if err := c.fillSigned(out, sb); err != nil {
 				return err
 			}
 			if err := v.SignedArray(id, out); err != nil {
