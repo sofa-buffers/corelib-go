@@ -41,7 +41,10 @@ func (d *Decoder) acceptStream(v Visitor, depth int) error {
 	nested := depth > 0
 	// Header hooks resolved lazily, as on the cursor path (see hvCache): at most
 	// one type assertion per scope, and none in a scope holding no array/fixlen.
+	// The element-bound extension likewise, asked only where an integer array
+	// fails to complete (see ebCache).
 	var hooks hvCache
+	var bounds ebCache
 	for {
 		h, err := d.readVarint(true)
 		if err != nil {
@@ -84,11 +87,11 @@ func (d *Decoder) acceptStream(v Visitor, depth int) error {
 				return err
 			}
 		case TypeVarintArrayUnsigned:
-			if err := d.acceptStreamUnsignedArray(v, hooks.of(v), id); err != nil {
+			if err := d.acceptStreamUnsignedArray(v, hooks.of(v), &bounds, id); err != nil {
 				return err
 			}
 		case TypeVarintArraySigned:
-			if err := d.acceptStreamSignedArray(v, hooks.of(v), id); err != nil {
+			if err := d.acceptStreamSignedArray(v, hooks.of(v), &bounds, id); err != nil {
 				return err
 			}
 		case TypeFixlenArray:
@@ -173,7 +176,7 @@ func (d *Decoder) acceptStreamFixlen(v Visitor, hv HeaderVisitor, id ID) error {
 	}
 }
 
-func (d *Decoder) acceptStreamUnsignedArray(v Visitor, hv HeaderVisitor, id ID) error {
+func (d *Decoder) acceptStreamUnsignedArray(v Visitor, hv HeaderVisitor, eb *ebCache, id ID) error {
 	n, err := d.arrayCount()
 	if err != nil {
 		return err
@@ -189,12 +192,24 @@ func (d *Decoder) acceptStreamUnsignedArray(v Visitor, hv HeaderVisitor, id ID) 
 	}
 	out, err := d.readUnsignedElements(n)
 	if err != nil {
+		// The array never completes, so v.UnsignedArray below never fires and the
+		// visitor's own width guard never runs. The elements that DID decode are
+		// on the wire all the same, and §5.2 makes one outside its declared width
+		// INVALID over the truncation — the reader-driven twin of the bound
+		// cursor.scanTruncatedArray applies (generator#267). Nothing is asked on
+		// the path where the array arrives whole.
+		b := elemBoundOf(eb.of(v), id, ArrayUnsigned)
+		for _, x := range out {
+			if b.breached(x) {
+				return ErrInvalidMsg
+			}
+		}
 		return err
 	}
 	return v.UnsignedArray(id, out)
 }
 
-func (d *Decoder) acceptStreamSignedArray(v Visitor, hv HeaderVisitor, id ID) error {
+func (d *Decoder) acceptStreamSignedArray(v Visitor, hv HeaderVisitor, eb *ebCache, id ID) error {
 	n, err := d.arrayCount()
 	if err != nil {
 		return err
@@ -206,6 +221,14 @@ func (d *Decoder) acceptStreamSignedArray(v Visitor, hv HeaderVisitor, id ID) er
 	}
 	out, err := d.readSignedElements(n)
 	if err != nil {
+		// See acceptStreamUnsignedArray. These elements are already zigzag-mapped,
+		// so they take the bound's decoded form.
+		b := elemBoundOf(eb.of(v), id, ArraySigned)
+		for _, x := range out {
+			if b.breachedSigned(x) {
+				return ErrInvalidMsg
+			}
+		}
 		return err
 	}
 	return v.SignedArray(id, out)
@@ -276,6 +299,11 @@ func (d *Decoder) acceptStreamFixlenArray(v Visitor, hv HeaderVisitor, id ID) er
 // ReadUnsignedArray, and a truncated or overlong element surfaces its outcome
 // (ErrIncomplete / ErrInvalidMsg) exactly where readVarint decides it — the
 // reader-side analogue of cursor.scanTruncatedArray (issue #66).
+//
+// On failure it returns the elements decoded so far ALONGSIDE the error, so the
+// caller can apply the schema's declared-width bound to them: they are on the
+// wire, and §5.2 has an out-of-width element outrank the truncation that
+// stopped the read (generator#267).
 func (d *Decoder) readUnsignedElements(n uint64) ([]uint64, error) {
 	out := make([]uint64, 0, initialArrayCap(n))
 	var stage [varintChunk]uint64
@@ -283,14 +311,14 @@ func (d *Decoder) readUnsignedElements(n uint64) ([]uint64, error) {
 		want := min(n-uint64(len(out)), uint64(varintChunk))
 		got, err := d.readVarintBatch(stage[:want])
 		if err != nil {
-			return nil, err
+			return out, err
 		}
 		if got == 0 {
 			// Near the end of the buffer or the stream: one element at a time,
 			// where truncation and end-of-stream are decided.
 			x, err := d.readVarint(false)
 			if err != nil {
-				return nil, err
+				return out, err
 			}
 			out = append(out, x)
 			continue
@@ -308,12 +336,12 @@ func (d *Decoder) readSignedElements(n uint64) ([]int64, error) {
 		want := min(n-uint64(len(out)), uint64(varintChunk))
 		got, err := d.readVarintBatch(stage[:want])
 		if err != nil {
-			return nil, err
+			return out, err
 		}
 		if got == 0 {
 			x, err := d.readVarint(false)
 			if err != nil {
-				return nil, err
+				return out, err
 			}
 			out = append(out, zigzagDecode(x))
 			continue
