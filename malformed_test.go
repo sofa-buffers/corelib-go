@@ -14,6 +14,116 @@ import (
 // value that passes the range check; +1 is the first that fails it.
 const overArrayMax = arrayMaxCount + 1
 
+// malformedCase is one malformed-input vector plus the single verdict every
+// decode surface owes it.
+type malformedCase struct {
+	in   []byte
+	want error // ErrInvalidMsg or ErrIncomplete
+}
+
+// malformedCases is the one table of malformed and truncated inputs for the
+// "malformed input" and "truncation" obligations of CORELIB_PLAN §7.2 (items 5
+// and 6). Every decode surface reaches the same three-valued verdict on the same
+// bytes (§5.2), so the table is declared once here and driven through each
+// surface by runMalformedCases: the cursor path (Decoder.Accept and the zero-copy
+// AcceptBytes) in TestVisitorMalformed, the reader-driven path
+// (Decoder.AcceptStream, byte at a time) in TestAcceptStreamMalformed, and the
+// pull API (Next/Skip) in TestPullMalformed. A new case therefore lands on every
+// surface by construction — it cannot be added to one copy and forgotten in
+// another, which is how "overlong element vs truncation" below came to hold only
+// the streaming path.
+//
+// Receiver-side limits are deliberately absent: those are ErrLimitExceeded and
+// not a wire-format verdict (§6.2.1, limits_test.go). Oversized counts/lengths
+// live here only in their structural form (over ID_MAX / over arrayMax).
+var malformedCases = map[string]malformedCase{
+	"truncated unsigned":    {append(vhdr(1, sofab.TypeVarintUnsigned), 0x80), sofab.ErrIncomplete},
+	"truncated fixlen":      {append(vhdr(1, sofab.TypeFixlen), 0x80), sofab.ErrIncomplete},
+	"bad fixlen subtype":    {append(vhdr(1, sofab.TypeFixlen), vbytes((4<<3)|0x4)...), sofab.ErrInvalidMsg},
+	"truncated array":       {append(vhdr(1, sofab.TypeVarintArrayUnsigned), append(vbytes(2), 0x01, 0x80)...), sofab.ErrIncomplete},
+	"bad fixlen-array elem": {append(vhdr(1, sofab.TypeFixlenArray), append(vbytes(1), vbytes((2<<3)|0x0)...)...), sofab.ErrInvalidMsg},
+	"dangling sequence end": {vhdr(0, sofab.TypeSequenceEnd), sofab.ErrInvalidMsg},
+	"unterminated sequence": {vhdr(3, sofab.TypeSequenceStart), sofab.ErrIncomplete},
+	"fp32 wrong length":     {append(vhdr(1, sofab.TypeFixlen), vbytes((2<<3)|0x0)...), sofab.ErrInvalidMsg},
+	"fp64 wrong length":     {append(vhdr(1, sofab.TypeFixlen), vbytes((4<<3)|0x1)...), sofab.ErrInvalidMsg},
+	"truncated fp32":        {append(vhdr(1, sofab.TypeFixlen), append(vbytes((4<<3)|0x0), 0xAA, 0xBB)...), sofab.ErrIncomplete},
+	"truncated fp64":        {append(vhdr(1, sofab.TypeFixlen), append(vbytes((8<<3)|0x1), 0x01)...), sofab.ErrIncomplete},
+	"truncated string":      {append(vhdr(1, sofab.TypeFixlen), append(vbytes((4<<3)|0x2), 'h', 'i')...), sofab.ErrIncomplete},
+	"truncated blob":        {append(vhdr(1, sofab.TypeFixlen), append(vbytes((4<<3)|0x3), 0x01)...), sofab.ErrIncomplete},
+	"fp32 array truncated":  {append(vhdr(1, sofab.TypeFixlenArray), append(vbytes(1), append(vbytes((4<<3)|0x0), 0x00, 0x00)...)...), sofab.ErrIncomplete},
+	"fp64 array bad elem":   {append(vhdr(1, sofab.TypeFixlenArray), append(vbytes(1), vbytes((4<<3)|0x1)...)...), sofab.ErrInvalidMsg},
+	"signed array trunc":    {append(vhdr(1, sofab.TypeVarintArraySigned), append(vbytes(2), 0x02, 0x80)...), sofab.ErrIncomplete},
+	"array count truncated": {append(vhdr(1, sofab.TypeVarintArrayUnsigned), 0x80), sofab.ErrIncomplete},
+	"id above max":          {append(vhdr(sofab.IDMax+1, sofab.TypeVarintUnsigned), 0x00), sofab.ErrInvalidMsg},
+	// The ID_MAX ceiling binds the sequence-end header too (§4.9, §6.2). The
+	// end marker sits in a valid position — it closes the open sequence — so
+	// its over-ceiling id is the sole reason this is INVALID, isolating the
+	// bound from the dangling-end check. Bytes: 76 87 80 80 80 40 (id 2^31).
+	"seq-end id above max": {append(vhdr(14, sofab.TypeSequenceStart), vhdr(sofab.IDMax+1, sofab.TypeSequenceEnd)...), sofab.ErrInvalidMsg},
+	"truncated signed":     {append(vhdr(1, sofab.TypeVarintSigned), 0x80), sofab.ErrIncomplete},
+	"signed array count":   {append(vhdr(1, sofab.TypeVarintArraySigned), 0x80), sofab.ErrIncomplete},
+	"fixlen array count":   {append(vhdr(1, sofab.TypeFixlenArray), 0x80), sofab.ErrIncomplete},
+	"fixlen array header":  {append(vhdr(1, sofab.TypeFixlenArray), append(vbytes(1), 0x80)...), sofab.ErrIncomplete},
+	"fp64 array payload":   {append(vhdr(1, sofab.TypeFixlenArray), append(vbytes(1), append(vbytes((8<<3)|0x1), 0, 0, 0, 0, 0, 0, 0)...)...), sofab.ErrIncomplete},
+	// Boundary cases first found on the cursor: a value expected exactly at
+	// end-of-buffer, a varint that overflows 64 bits while reading the next
+	// header, and a fixlen length past the cap. (A zero-count array is no longer
+	// malformed — see TestVisitorEmptyArrays — so it is not listed here.)
+	"value at buffer end":    {vhdr(1, sofab.TypeVarintUnsigned), sofab.ErrIncomplete},
+	"header varint overflow": {bytes.Repeat([]byte{0x80}, 11), sofab.ErrInvalidMsg},
+	"fixlen length over max": {append(vhdr(1, sofab.TypeFixlen), vbytes((uint64(sofab.IDMax+1)<<3)|subStr)...), sofab.ErrInvalidMsg},
+	// count 11 over ten all-continuation bytes: INVALID (overlong element)
+	// dominates the truncation, the reader-side twin of issue #66.
+	"overlong element vs truncation": {append(vhdr(1, sofab.TypeVarintArrayUnsigned), append(vbytes(11), bytes.Repeat([]byte{0x80}, 10)...)...), sofab.ErrInvalidMsg},
+}
+
+// runMalformedCases drives every entry of malformedCases through one decode
+// surface and holds it to the table's verdict. INVALID and INCOMPLETE are
+// mutually exclusive outcomes (§5.2), so the verdict the case is *not* is
+// asserted against as well: a regression that swaps them cannot pass.
+func runMalformedCases(t *testing.T, decode func(in []byte, v sofab.Visitor) error) {
+	t.Helper()
+	for name, c := range malformedCases {
+		c := c
+		t.Run(name, func(t *testing.T) {
+			var log []string
+			err := decode(c.in, recorder{&log})
+			if !errors.Is(err, c.want) {
+				t.Fatalf("decode = %v, want %v", err, c.want)
+			}
+			other := sofab.ErrIncomplete
+			if errors.Is(c.want, sofab.ErrIncomplete) {
+				other = sofab.ErrInvalidMsg
+			}
+			if errors.Is(err, other) {
+				t.Fatalf("decode = %v, must not also match %v", err, other)
+			}
+		})
+	}
+}
+
+// TestPullMalformed holds the third decode surface — the pull API (Next plus
+// Skip) — to the same table as the two visitor surfaces. §5.2 defines one
+// outcome per message, not one per entry point, so a walk that skips every field
+// must reach exactly the verdict the cursor and the streaming visitor reach.
+func TestPullMalformed(t *testing.T) {
+	runMalformedCases(t, func(in []byte, _ sofab.Visitor) error {
+		d := newDec(in)
+		for {
+			_, err := d.Next()
+			if errors.Is(err, io.EOF) {
+				return nil
+			}
+			if err != nil {
+				return err
+			}
+			if err := d.Skip(); err != nil {
+				return err
+			}
+		}
+	})
+}
+
 // TestOversizedCountLengthInvalid covers the "oversized count / length" malformed
 // category (CORELIB_PLAN §7): a fixlen length or an array element count strictly
 // greater than arrayMax (INT32_MAX) is a structural wire-format violation and is

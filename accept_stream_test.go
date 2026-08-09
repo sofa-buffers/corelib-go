@@ -54,51 +54,11 @@ func TestAcceptStreamMatchesAccept(t *testing.T) {
 // verdicts as the cursor path (TestVisitorMalformed), and does so at a byte-at-a-
 // time boundary so a wrong outcome cannot hide behind a lucky chunk size.
 func TestAcceptStreamMalformed(t *testing.T) {
-	cases := map[string]struct {
-		in   []byte
-		want error
-	}{
-		"truncated unsigned":     {append(vhdr(1, sofab.TypeVarintUnsigned), 0x80), sofab.ErrIncomplete},
-		"truncated fixlen":       {append(vhdr(1, sofab.TypeFixlen), 0x80), sofab.ErrIncomplete},
-		"bad fixlen subtype":     {append(vhdr(1, sofab.TypeFixlen), vbytes((4<<3)|0x4)...), sofab.ErrInvalidMsg},
-		"truncated array":        {append(vhdr(1, sofab.TypeVarintArrayUnsigned), append(vbytes(2), 0x01, 0x80)...), sofab.ErrIncomplete},
-		"bad fixlen-array elem":  {append(vhdr(1, sofab.TypeFixlenArray), append(vbytes(1), vbytes((2<<3)|0x0)...)...), sofab.ErrInvalidMsg},
-		"dangling sequence end":  {vhdr(0, sofab.TypeSequenceEnd), sofab.ErrInvalidMsg},
-		"unterminated sequence":  {vhdr(3, sofab.TypeSequenceStart), sofab.ErrIncomplete},
-		"fp32 wrong length":      {append(vhdr(1, sofab.TypeFixlen), vbytes((2<<3)|0x0)...), sofab.ErrInvalidMsg},
-		"fp64 wrong length":      {append(vhdr(1, sofab.TypeFixlen), vbytes((4<<3)|0x1)...), sofab.ErrInvalidMsg},
-		"truncated fp32":         {append(vhdr(1, sofab.TypeFixlen), append(vbytes((4<<3)|0x0), 0xAA, 0xBB)...), sofab.ErrIncomplete},
-		"truncated fp64":         {append(vhdr(1, sofab.TypeFixlen), append(vbytes((8<<3)|0x1), 0x01)...), sofab.ErrIncomplete},
-		"truncated string":       {append(vhdr(1, sofab.TypeFixlen), append(vbytes((4<<3)|0x2), 'h', 'i')...), sofab.ErrIncomplete},
-		"truncated blob":         {append(vhdr(1, sofab.TypeFixlen), append(vbytes((4<<3)|0x3), 0x01)...), sofab.ErrIncomplete},
-		"fp32 array truncated":   {append(vhdr(1, sofab.TypeFixlenArray), append(vbytes(1), append(vbytes((4<<3)|0x0), 0x00, 0x00)...)...), sofab.ErrIncomplete},
-		"fp64 array bad elem":    {append(vhdr(1, sofab.TypeFixlenArray), append(vbytes(1), vbytes((4<<3)|0x1)...)...), sofab.ErrInvalidMsg},
-		"signed array trunc":     {append(vhdr(1, sofab.TypeVarintArraySigned), append(vbytes(2), 0x02, 0x80)...), sofab.ErrIncomplete},
-		"array count truncated":  {append(vhdr(1, sofab.TypeVarintArrayUnsigned), 0x80), sofab.ErrIncomplete},
-		"id above max":           {append(vhdr(sofab.IDMax+1, sofab.TypeVarintUnsigned), 0x00), sofab.ErrInvalidMsg},
-		"seq-end id above max":   {append(vhdr(14, sofab.TypeSequenceStart), vhdr(sofab.IDMax+1, sofab.TypeSequenceEnd)...), sofab.ErrInvalidMsg},
-		"truncated signed":       {append(vhdr(1, sofab.TypeVarintSigned), 0x80), sofab.ErrIncomplete},
-		"signed array count":     {append(vhdr(1, sofab.TypeVarintArraySigned), 0x80), sofab.ErrIncomplete},
-		"fixlen array count":     {append(vhdr(1, sofab.TypeFixlenArray), 0x80), sofab.ErrIncomplete},
-		"fixlen array header":    {append(vhdr(1, sofab.TypeFixlenArray), append(vbytes(1), 0x80)...), sofab.ErrIncomplete},
-		"fp64 array payload":     {append(vhdr(1, sofab.TypeFixlenArray), append(vbytes(1), append(vbytes((8<<3)|0x1), 0, 0, 0, 0, 0, 0, 0)...)...), sofab.ErrIncomplete},
-		"value at buffer end":    {vhdr(1, sofab.TypeVarintUnsigned), sofab.ErrIncomplete},
-		"header varint overflow": {bytes.Repeat([]byte{0x80}, 11), sofab.ErrInvalidMsg},
-		"fixlen length over max": {append(vhdr(1, sofab.TypeFixlen), vbytes((uint64(sofab.IDMax+1)<<3)|subStr)...), sofab.ErrInvalidMsg},
-		// count 11 over ten all-continuation bytes: INVALID (overlong element)
-		// dominates the truncation, the reader-side twin of issue #66.
-		"overlong element vs truncation": {append(vhdr(1, sofab.TypeVarintArrayUnsigned), append(vbytes(11), bytes.Repeat([]byte{0x80}, 10)...)...), sofab.ErrInvalidMsg},
-	}
-	for name, c := range cases {
-		c := c
-		t.Run(name, func(t *testing.T) {
-			// One-byte reader: forces every suspend/resume boundary.
-			r := iotest.OneByteReader(bytes.NewReader(c.in))
-			if err := sofab.NewDecoder(r).AcceptStream(recorder{new([]string)}); !errors.Is(err, c.want) {
-				t.Fatalf("AcceptStream = %v, want %v", err, c.want)
-			}
-		})
-	}
+	// The cases live in malformedCases (malformed_test.go), shared with the
+	// cursor and pull surfaces, so a case can never hold one surface only.
+	runMalformedCases(t, func(in []byte, v sofab.Visitor) error {
+		return sofab.NewDecoder(iotest.OneByteReader(bytes.NewReader(in))).AcceptStream(v)
+	})
 }
 
 // TestAcceptStreamHeaderHookAntiFolding mirrors TestHeaderHookAntiFolding on the
