@@ -56,7 +56,7 @@ func TestDecodeOutcome(t *testing.T) {
 
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			// Visitor path (what generated Unmarshal uses).
+			// Visitor path (what a generated Decode<Name> uses).
 			check(t, "AcceptBytes", sofab.AcceptBytes(c.in, baseV{}), c.want)
 
 			if c.visitorOnly {

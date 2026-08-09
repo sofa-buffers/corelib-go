@@ -172,7 +172,7 @@ func TestOversizedCountLengthInvalid(t *testing.T) {
 
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			// Visitor path (what generated Unmarshal uses).
+			// Visitor path (what a generated Decode<Name> uses).
 			verr := sofab.AcceptBytes(c.in, baseV{})
 			if !errors.Is(verr, sofab.ErrInvalidMsg) {
 				t.Fatalf("AcceptBytes = %v, want ErrInvalidMsg", verr)

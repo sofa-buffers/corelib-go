@@ -10,8 +10,8 @@ import (
 // Encoder writes Sofab fields into an output buffer, draining it downstream as
 // it fills. It advances over a contiguous buffer instead of pushing each byte
 // through a bufio.Writer interface call. Errors are sticky: once a write fails,
-// subsequent writes are no-ops and the same error is returned, so generated
-// Marshal code can issue a run of writes and check only the final Flush.
+// subsequent writes are no-ops and the same error is returned, so a generated
+// Serialize can issue a run of writes and check only the final Flush.
 //
 // There are three ways to give it somewhere to write (CORELIB_PLAN §5.1):
 //

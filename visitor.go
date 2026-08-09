@@ -193,7 +193,7 @@ func (d *Decoder) Accept(v Visitor) error {
 // AcceptBytes decodes a complete message already held in one contiguous buffer,
 // dispatching each field to v. It is the zero-copy form of Accept: the cursor
 // advances directly over buf with no input slurp, so it is the fastest entry
-// point when the message is already in memory (e.g. generated Unmarshal code).
+// point when the message is already in memory (e.g. a generated Decode<Name>).
 // buf is not retained, but byte/blob fields handed to v alias it, so the visitor
 // must copy any it keeps past the call.
 //

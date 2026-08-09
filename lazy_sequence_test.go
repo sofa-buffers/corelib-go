@@ -217,7 +217,7 @@ func TestLazySequenceArgumentErrors(t *testing.T) {
 
 // TestLazySequenceCallsAreNoOpsAfterAnError: like every other writer, the three
 // sequence calls turn into no-ops once the encoder holds a sticky error, so
-// generated Marshal code can issue a run of writes and check once at Flush.
+// a generated Serialize can issue a run of writes and check once at Flush.
 func TestLazySequenceCallsAreNoOpsAfterAnError(t *testing.T) {
 	e := sofab.NewEncoder(failWriter{io.ErrClosedPipe})
 	e.WriteBytes(1, make([]byte, 16*1024)) // forces a flush -> sink fails

@@ -290,7 +290,7 @@ func TestVisitorReaderError(t *testing.T) {
 // visitor and the pull API, so a case can never hold one surface only.
 func TestVisitorMalformed(t *testing.T) {
 	// Both cursor entry points: the slurping Decoder.Accept and the zero-copy
-	// AcceptBytes that generated Unmarshal code uses.
+	// AcceptBytes that a generated Decode<Name> uses.
 	t.Run("Accept", func(t *testing.T) {
 		runMalformedCases(t, func(in []byte, v sofab.Visitor) error {
 			return newDec(in).Accept(v)
@@ -535,7 +535,7 @@ func TestVisitorAcceptAfterPullParser(t *testing.T) {
 	}
 }
 
-// Example_visitor shows how generated Unmarshal code consumes a message with
+// Example_visitor shows how a generated Decode<Name> consumes a message with
 // the visitor: each field binds straight into a struct member.
 func Example_visitor() {
 	msg := mustEncode(func(e *sofab.Encoder) {
