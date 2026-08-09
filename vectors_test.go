@@ -43,10 +43,26 @@ type vector struct {
 	} `json:"serialized"`
 }
 
+// utf8Vector is one row of the shared file's `invalid_utf8` group: a `string`
+// field whose payload is not valid UTF-8, with the outcome §6.4 requires on each
+// side. The rows are shaped differently from `vectors` — one hand-written field
+// rather than a field list — because they exist to pin a validation verdict, not
+// a layout.
+type utf8Vector struct {
+	Name          string `json:"name"`
+	Description   string `json:"description"`
+	ID            uint32 `json:"id"`
+	StringHex     string `json:"string_hex"`     // the raw (invalid) payload
+	SerializedHex string `json:"serialized_hex"` // the whole field, header included
+	DecodeOutcome string `json:"decode_outcome"` // "invalid"
+	EncodeOutcome string `json:"encode_outcome"` // "invalid_argument"
+}
+
 type vectorFile struct {
-	Format  string   `json:"format"`
-	Version int      `json:"version"`
-	Vectors []vector `json:"vectors"`
+	Format      string       `json:"format"`
+	Version     int          `json:"version"`
+	Vectors     []vector     `json:"vectors"`
+	InvalidUTF8 []utf8Vector `json:"invalid_utf8"`
 }
 
 // loadVectors reads the shared vector file.
@@ -770,5 +786,78 @@ func TestVectorRequires(t *testing.T) {
 	}
 	if withRequires == 0 {
 		t.Fatal("no vectors declared requires; expected the suite to exercise the capability tags")
+	}
+}
+
+// --- the shared invalid-UTF-8 group ------------------------------------------
+
+// TestVectorInvalidUTF8 replays the shared file's `invalid_utf8` group, which
+// nothing in this repo read before (issue #88): the vectors were shipped in
+// assets/test_vectors.json and silently unused, so the one corpus that states
+// the §6.4 verdict in a language-agnostic form was not asserting anything here.
+//
+// It is deliberately written against the build rather than against the ON
+// verdict alone. §6.4 gives a footprint build permission to compile the
+// validator out, and the identical corpus then has to hold the other half of
+// the contract: not "anything goes", but accepted with the wire bytes kept
+// VERBATIM — the same bytes the vector declares, on both sides, never a
+// replacement character and never an empty value. Whichever build CI runs, one
+// of the two verdicts is checked over every row.
+func TestVectorInvalidUTF8(t *testing.T) {
+	vf := loadVectors(t)
+	if len(vf.InvalidUTF8) == 0 {
+		t.Fatal("no invalid_utf8 vectors; the shared file is expected to carry the §6.4 group")
+	}
+	for _, v := range vf.InvalidUTF8 {
+		t.Run(v.Name, func(t *testing.T) {
+			if v.DecodeOutcome != "invalid" || v.EncodeOutcome != "invalid_argument" {
+				t.Fatalf("unexpected outcomes: decode=%q encode=%q", v.DecodeOutcome, v.EncodeOutcome)
+			}
+			payload, err := hex.DecodeString(v.StringHex)
+			if err != nil {
+				t.Fatalf("string_hex: %v", err)
+			}
+			wire, err := hex.DecodeString(v.SerializedHex)
+			if err != nil {
+				t.Fatalf("serialized_hex: %v", err)
+			}
+			id := sofab.ID(v.ID)
+
+			// Encode: ErrArgument, symmetrically with decode (§6.4). With the
+			// validator compiled out the bytes must reproduce the vector.
+			var buf bytes.Buffer
+			e := sofab.NewEncoder(&buf)
+			checkUTF8Encode(t, "WriteString", e.WriteString(id, string(payload)))
+			if !utf8CheckCompiled {
+				if err := e.Flush(); err != nil {
+					t.Fatalf("flush: %v", err)
+				}
+				if got := hex.EncodeToString(buf.Bytes()); got != v.SerializedHex {
+					t.Fatalf("encode mismatch\n got: %s\nwant: %s", got, v.SerializedHex)
+				}
+			}
+
+			// Decode, pull: Decoder.String is a materializing read.
+			d := sofab.NewDecoder(bytes.NewReader(wire))
+			mustNext(t, d)
+			got, err := d.String()
+			checkUTF8Decode(t, "pull String", err)
+			if err == nil && got != string(payload) {
+				t.Fatalf("pull String = % X, want % X verbatim", got, payload)
+			}
+
+			// Decode, visitor: the destination is where the check runs.
+			bind := &bindStrV{id: id}
+			checkUTF8Decode(t, "visitor destination", sofab.AcceptBytes(wire, bind))
+			if !utf8CheckCompiled && bind.got != string(payload) {
+				t.Fatalf("destination bound % X, want % X verbatim", bind.got, payload)
+			}
+
+			// A visitor with no destination for the id skips the payload, and a
+			// skip is never validated — in either build (§6.4).
+			if err := sofab.AcceptBytes(wire, &bindStrV{id: id + 1}); err != nil {
+				t.Fatalf("skipped payload = %v, want nil", err)
+			}
+		})
 	}
 }

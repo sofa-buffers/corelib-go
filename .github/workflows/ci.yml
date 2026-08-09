@@ -53,6 +53,40 @@ jobs:
       - name: Test (race)
         run: go test -race ./...
 
+  no-strict-utf8:
+    # CORELIB_PLAN §6.4 lets a footprint profile "compile the check out
+    # entirely", and the README documents `-tags sofab_no_strict_utf8` as
+    # exactly that build. A documented build that is never compiled rots: this
+    # leg keeps it building, and keeps its own contract green — the validator is
+    # really folded away, and the wire bytes still survive verbatim.
+    #
+    # It does NOT replace the matrix above. §6.4 is normative that "the target's
+    # CI MUST still build and conformance-test the check-ON configuration", so
+    # the default build stays the one the shared vectors and the differential
+    # fuzzer run in; this is one extra leg beside it, never a substitute.
+    name: build & test (-tags sofab_no_strict_utf8)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: stable
+          check-latest: true
+
+      - name: Download modules
+        run: go mod download
+
+      - name: Vet
+        run: go vet -tags sofab_no_strict_utf8 ./...
+
+      - name: Build
+        run: go build -tags sofab_no_strict_utf8 ./...
+
+      - name: Test (race)
+        run: go test -race -tags sofab_no_strict_utf8 ./...
+
   coverage:
     name: Coverage
     runs-on: ubuntu-latest

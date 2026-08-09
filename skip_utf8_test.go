@@ -145,6 +145,20 @@ func (e *probeStructElemV) String(id sofab.ID, v string) error {
 
 func (e *probeStructElemV) BeginSequence(sofab.ID) (sofab.Visitor, error) { return baseV{}, nil }
 
+// materializedStrings returns every string this probe bound into a destination.
+// It is what lets the isolates below assert the OTHER half of §6.4: where the
+// validator is compiled out (`-tags sofab_no_strict_utf8`) the payload is not
+// rejected, and it must then arrive VERBATIM — waiving validation never licenses
+// replacing, dropping or emptying the bytes.
+func (p *probeV) materializedStrings() []string {
+	var out []string
+	if p.nested.strSet {
+		out = append(out, p.nested.str)
+	}
+	out = append(out, p.strArray...)
+	return append(out, p.structV...)
+}
+
 // --- the F-0038 isolates ----------------------------------------------------
 
 // TestF0038SkippedStringNotValidated runs the exact wire isolates from issue #57
@@ -154,6 +168,14 @@ func TestF0038SkippedStringNotValidated(t *testing.T) {
 		name string
 		in   []byte
 		want error // nil = accepted
+		// materialized, when non-nil, marks a case whose invalid-UTF-8 payload
+		// reaches a DECLARED destination, and carries the bytes that
+		// destination must receive. Those are the only cases whose verdict
+		// depends on the build: `want` holds the default build's INVALID, and
+		// where §6.4 let the validator be compiled out the case is accepted and
+		// these exact bytes must arrive verbatim (issue #88). Every other case
+		// here is a skip, and a skip is never validated in either build.
+		materialized []byte
 	}{
 		{
 			// THE PRIMARY VECTOR. 4a = id 9, FIXLEN. 0a = fixlen_word len 1,
@@ -188,25 +210,28 @@ func TestF0038SkippedStringNotValidated(t *testing.T) {
 			// 8a = invalid UTF-8. 07 = SEQUENCE_END. The field IS declared, so
 			// the payload is materialized and the check MUST fire. If this
 			// flips to accepted, the check was deleted instead of moved.
-			name: "C1 declared nested.str, invalid utf8",
-			in:   []byte{0x56, 0x12, 0x0a, 0x8a, 0x07},
-			want: sofab.ErrInvalidMsg,
+			name:         "C1 declared nested.str, invalid utf8",
+			in:           []byte{0x56, 0x12, 0x0a, 0x8a, 0x07},
+			want:         sofab.ErrInvalidMsg,
+			materialized: []byte{0x8a},
 		},
 		{
 			// A string_array element (wrapper id 200) is a materialized
 			// destination too. c6 0c = id 200 SEQUENCE_START; 02 = element 0
 			// FIXLEN; 0a = len 1 STRING; 8a; 07 = SEQUENCE_END.
-			name: "string_array element, invalid utf8",
-			in:   []byte{0xc6, 0x0c, 0x02, 0x0a, 0x8a, 0x07},
-			want: sofab.ErrInvalidMsg,
+			name:         "string_array element, invalid utf8",
+			in:           []byte{0xc6, 0x0c, 0x02, 0x0a, 0x8a, 0x07},
+			want:         sofab.ErrInvalidMsg,
+			materialized: []byte{0x8a},
 		},
 		{
 			// A struct_array element's `v` (id 202 -> element seq -> id 1).
 			// d6 0c = id 202 SEQUENCE_START; 06 = element 0 SEQUENCE_START;
 			// 0a = id 1 FIXLEN; 0a = len 1 STRING; 8a; 07 07 = both ends.
-			name: "struct_array element v, invalid utf8",
-			in:   []byte{0xd6, 0x0c, 0x06, 0x0a, 0x0a, 0x8a, 0x07, 0x07},
-			want: sofab.ErrInvalidMsg,
+			name:         "struct_array element v, invalid utf8",
+			in:           []byte{0xd6, 0x0c, 0x06, 0x0a, 0x0a, 0x8a, 0x07, 0x07},
+			want:         sofab.ErrInvalidMsg,
+			materialized: []byte{0x8a},
 		},
 		{
 			// FRAMING STAYS ON THE SKIP PATH (the F-0012 half). fixlen_word
@@ -234,9 +259,10 @@ func TestF0038SkippedStringNotValidated(t *testing.T) {
 			// The same overlong C0 80 in the DECLARED nested.str is still
 			// rejected: relocating the call must not downgrade the validator to
 			// a byte-range shortcut.
-			name: "overlong C0 80 at nested.str",
-			in:   []byte{0x56, 0x12, 0x12, 0xc0, 0x80, 0x07},
-			want: sofab.ErrInvalidMsg,
+			name:         "overlong C0 80 at nested.str",
+			in:           []byte{0x56, 0x12, 0x12, 0xc0, 0x80, 0x07},
+			want:         sofab.ErrInvalidMsg,
+			materialized: []byte{0xc0, 0x80},
 		},
 		{
 			// An undeclared id nested INSIDE a declared sequence is skipped the
@@ -269,6 +295,19 @@ func TestF0038SkippedStringNotValidated(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			var p probeV
 			err := sofab.AcceptBytes(tc.in, &p)
+
+			// A materialized invalid-UTF-8 payload is INVALID only where the
+			// validator is compiled in; otherwise it is accepted verbatim.
+			if tc.materialized != nil && !utf8CheckCompiled {
+				if err != nil {
+					t.Fatalf("AcceptBytes(% X) = %v, want nil (validator compiled out)", tc.in, err)
+				}
+				got := p.materializedStrings()
+				if len(got) != 1 || got[0] != string(tc.materialized) {
+					t.Fatalf("destination got %q, want [% X] verbatim", got, tc.materialized)
+				}
+				return
+			}
 			if tc.want == nil {
 				if err != nil {
 					t.Fatalf("AcceptBytes(% X) = %v, want nil", tc.in, err)
@@ -320,6 +359,9 @@ func TestF0038MaterializedStillBinds(t *testing.T) {
 // TestF0038ChunkBoundaryDeterminism covers the §6.4 normative rule that a chunk
 // boundary MUST NOT change any verdict: the same isolates fed one byte at a time
 // through Decoder.Accept produce the same outcomes as the one-shot AcceptBytes.
+// The two materialized rows take their expectation from utf8Invalid(), so the
+// rule is asserted in whichever build is running — a chunk boundary must not
+// change the verdict in the footprint build either (issue #88).
 func TestF0038ChunkBoundaryDeterminism(t *testing.T) {
 	cases := []struct {
 		name string
@@ -328,12 +370,12 @@ func TestF0038ChunkBoundaryDeterminism(t *testing.T) {
 	}{
 		{"V1 skipped invalid utf8", []byte{0x4a, 0x0a, 0x8a}, nil},
 		{"V1 then a following field", []byte{0x4a, 0x0a, 0x8a, 0x00, 0x2a}, nil},
-		{"C1 declared nested.str", []byte{0x56, 0x12, 0x0a, 0x8a, 0x07}, sofab.ErrInvalidMsg},
+		{"C1 declared nested.str", []byte{0x56, 0x12, 0x0a, 0x8a, 0x07}, utf8Invalid()},
 		{"V2 §7.3 mistyped slot", []byte{0xd6, 0x0c, 0x02, 0x12, 0xff, 0xff, 0x07}, nil},
 		{"truncated skipped string", []byte{0x4a, 0x12, 0xff}, sofab.ErrIncomplete},
 		{"§7.3 declared string id as blob", []byte{0x56, 0x12, 0x0b, 0x8a, 0x07}, nil},
 		{"§7.3 declared blob id as string", []byte{0x56, 0x1a, 0x0a, 0x8a, 0x07}, nil},
-		{"materialized string_array element", []byte{0xc6, 0x0c, 0x02, 0x0a, 0x8a, 0x07}, sofab.ErrInvalidMsg},
+		{"materialized string_array element", []byte{0xc6, 0x0c, 0x02, 0x0a, 0x8a, 0x07}, utf8Invalid()},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -362,8 +404,10 @@ func TestF0038PullPathUnchanged(t *testing.T) {
 
 	d := sofab.NewDecoder(bytes.NewReader(in))
 	mustNext(t, d)
-	if _, err := d.String(); !errors.Is(err, sofab.ErrInvalidMsg) {
-		t.Fatalf("pull String = %v, want ErrInvalidMsg (a materializing read)", err)
+	got, err := d.String()
+	checkUTF8Decode(t, "pull String (a materializing read)", err)
+	if err == nil && got != "\x8a" {
+		t.Fatalf("pull String = % X, want 8A verbatim", got)
 	}
 
 	d = sofab.NewDecoder(bytes.NewReader(in))
@@ -375,9 +419,9 @@ func TestF0038PullPathUnchanged(t *testing.T) {
 	if f.ID != 0 {
 		t.Fatalf("resync field id = %d, want 0", f.ID)
 	}
-	v, err := d.Unsigned()
-	if err != nil || v != 42 {
-		t.Fatalf("after Skip Unsigned = (%d, %v), want (42, nil)", v, err)
+	v, uerr := d.Unsigned()
+	if uerr != nil || v != 42 {
+		t.Fatalf("after Skip Unsigned = (%d, %v), want (42, nil)", v, uerr)
 	}
 }
 

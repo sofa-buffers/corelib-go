@@ -149,6 +149,22 @@ func newLimits(opts []Option) limits {
 	return l
 }
 
+// strictUTF8On reports whether this encode/decode validates string payloads. It
+// is the §6.4 gate in full, in the order the section states it: the COMPILE-TIME
+// half first (a `sofab_no_strict_utf8` build folds strictUTF8Compiled to a false
+// constant, and with it every caller's utf8.Valid call becomes dead code —
+// "compiled OFF means the validation code is not compiled in"), then the RUNTIME
+// half (WithStrictUTF8). Both halves belong at every site that validates: gating
+// only the generated-code primitive (utf8.go) on the build tag would leave a
+// footprint build in which the corelib's own paths still validate, so the pull
+// parser and the visitor path would reach different verdicts on the same bytes
+// in the same build (issue #88).
+//
+// It costs nothing in the default build: strictUTF8Compiled is a true constant
+// there, the call inlines, and `true && l.strictUTF8` folds to the field load
+// the callers did before.
+func (l limits) strictUTF8On() bool { return strictUTF8Compiled && l.strictUTF8 }
+
 // stringCheck is the SOFAB_STRICT_UTF8 policy (§6.4) in the form a destination
 // can hold. The decoder hands it to a scope's StringPolicyVisitor so that
 // WithStrictUTF8 reaches the check generated code runs where it materializes a

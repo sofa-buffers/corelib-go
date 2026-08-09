@@ -780,8 +780,9 @@ func (e *Encoder) WriteFloat64(id ID, f float64) error {
 // When strict UTF-8 is enabled (SOFAB_STRICT_UTF8, the default; §6.4), a Go
 // string that is not valid UTF-8 — a byte container can hold arbitrary bytes —
 // is refused with ErrArgument (§6.3) and no bytes are written, enforcing the
-// producer-side MUST NOT of MESSAGE_SPEC §8. With it disabled
-// (WithStrictUTF8(false)) the bytes are written verbatim. utf8.ValidString
+// producer-side MUST NOT of MESSAGE_SPEC §8. With it disabled —
+// WithStrictUTF8(false), or a `sofab_no_strict_utf8` build, in which the
+// validator is not compiled in at all — the bytes are written verbatim. utf8.ValidString
 // correctly rejects overlong encodings, surrogate code points, and code points
 // above U+10FFFF, while accepting an embedded NUL.
 //
@@ -795,7 +796,7 @@ func (e *Encoder) WriteString(id ID, s string) error {
 	if overCeiling(len(s)) {
 		return e.rejectArgument()
 	}
-	if e.lim.strictUTF8 && !utf8.ValidString(s) {
+	if e.lim.strictUTF8On() && !utf8.ValidString(s) {
 		e.setErr(ErrArgument)
 		return e.err
 	}

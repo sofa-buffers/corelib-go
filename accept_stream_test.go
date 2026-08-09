@@ -183,10 +183,10 @@ func TestAcceptStreamUTF8AtDestination(t *testing.T) {
 	if err := newDec(in).AcceptStream(baseV{}); err != nil {
 		t.Fatalf("no destination = %v, want nil", err)
 	}
-	// A destination that validates: INVALID.
-	if err := newDec(in).AcceptStream(&bindStrV{id: 1}); !errors.Is(err, sofab.ErrInvalidMsg) {
-		t.Fatalf("destination invalid utf8 = %v, want ErrInvalidMsg", err)
-	}
+	// A destination that validates: INVALID (nil where §6.4 let the validator be
+	// compiled out — see utf8_build_on_test.go).
+	checkUTF8Decode(t, "destination invalid utf8",
+		newDec(in).AcceptStream(&bindStrV{id: 1}))
 }
 
 // TestAcceptStreamSignedArrayHeaderHook exercises the header hook on a signed
