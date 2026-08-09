@@ -379,6 +379,214 @@ func TestSkipFixlenArrayHeaderChecked(t *testing.T) {
 	}
 }
 
+// TestSkipFixlenHeaderChecked covers issue #76: skipping a plain fixlen field
+// must apply the same framing checks to its length-and-subtype word as reading
+// one does. §4.6 defines subtypes 0x0-0x3 only — 0x4-0x7 are reserved — and
+// fp32 carries exactly 4 payload bytes, fp64 exactly 8; §6.3 names both "a
+// reserved fixlen subtype" and "a wrong-width fp32/fp64 fixlen" as
+// InvalidMessage. These are framing checks, not schema checks, so they hold
+// whether or not the field is materialised: skipValue used to discard the
+// subtype and treat any word as a plain length jump, so `for { Next(); Skip() }`
+// reported COMPLETE on bytes both visitor paths reject.
+//
+// Both skip entry points are driven (Decoder.Skip and Next's auto-skip), and
+// every case is pinned against AcceptBytes and AcceptStream: the visitor paths
+// always validated this word, so all three must agree on every input (§5.2).
+func TestSkipFixlenHeaderChecked(t *testing.T) {
+	hdr := vhdr(0, sofab.TypeFixlen)
+
+	// fix builds a complete fixlen field from a length-and-subtype word plus
+	// payload bytes.
+	fix := func(length, sub uint64, payload ...byte) []byte {
+		out := append(append([]byte{}, hdr...), vbytes((length<<3)|sub)...)
+		return append(out, payload...)
+	}
+
+	// tail is a well-formed field after the one under test: on a rejected field
+	// it must never be handed out.
+	tail := append(vhdr(3, sofab.TypeVarintUnsigned), 0x7F)
+
+	cases := []struct {
+		name string
+		in   []byte
+		want error // nil = clean decode to end of stream
+	}{
+		{
+			// The isolate from §6.3's own example list: word (4<<3)|0x4.
+			name: "reserved subtype 0x4",
+			in:   fix(4, 0x4, 'A', 'B', 'C', 'D'),
+			want: sofab.ErrInvalidMsg,
+		},
+		{
+			name: "reserved subtype 0x5",
+			in:   fix(1, 0x5, 'A'),
+			want: sofab.ErrInvalidMsg,
+		},
+		{
+			name: "reserved subtype 0x6",
+			in:   fix(0, 0x6),
+			want: sofab.ErrInvalidMsg,
+		},
+		{
+			name: "reserved subtype 0x7",
+			in:   fix(2, 0x7, 'A', 'B'),
+			want: sofab.ErrInvalidMsg,
+		},
+		{
+			// The second §6.3 example: fp32 declared 8 bytes wide.
+			name: "fp32 with width 8",
+			in:   fix(8, subFP32, 'A', 'B', 'C', 'D', 'A', 'B', 'C', 'D'),
+			want: sofab.ErrInvalidMsg,
+		},
+		{
+			name: "fp32 with width 0",
+			in:   fix(0, subFP32),
+			want: sofab.ErrInvalidMsg,
+		},
+		{
+			name: "fp64 with width 4",
+			in:   fix(4, subFP64, 0, 0, 0, 0),
+			want: sofab.ErrInvalidMsg,
+		},
+		{
+			// Truncation is still truncation: a well-formed word whose payload runs
+			// out is INCOMPLETE, not INVALID.
+			name: "string payload truncated",
+			in:   fix(4, subStr, 'h', 'i'),
+			want: sofab.ErrIncomplete,
+		},
+		{
+			// Control: the exact-width floats skip by exactly their payload, so the
+			// field that follows is read at the right offset.
+			name: "fp32 skips its payload exactly",
+			in:   append(fix(4, subFP32, 0, 0, 0, 0), tail...),
+			want: nil,
+		},
+		{
+			name: "fp64 skips its payload exactly",
+			in:   append(fix(8, subFP64, 0, 0, 0, 0, 0, 0, 0, 0), tail...),
+			want: nil,
+		},
+		{
+			// Controls: strings and blobs take any length, including zero.
+			name: "string of arbitrary length",
+			in:   append(fix(3, subStr, 'a', 'b', 'c'), tail...),
+			want: nil,
+		},
+		{
+			name: "empty blob",
+			in:   append(fix(0, subBlob), tail...),
+			want: nil,
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			for _, mode := range []struct {
+				name     string
+				autoSkip bool
+			}{{"Skip", false}, {"NextAutoSkip", true}} {
+				t.Run(mode.name, func(t *testing.T) {
+					seen, err := drainPull(c.in, mode.autoSkip)
+					if c.want == nil {
+						if err != nil {
+							t.Fatalf("pull = %v, want clean decode", err)
+						}
+						if len(seen) != 2 || seen[1].ID != 3 || seen[1].Type != sofab.TypeVarintUnsigned {
+							t.Fatalf("pull saw %+v, want the fixlen field then the id-3 unsigned field", seen)
+						}
+						return
+					}
+					if !errors.Is(err, c.want) {
+						t.Fatalf("pull = %v, want %v", err, c.want)
+					}
+					// INVALID and INCOMPLETE are distinct outcomes (§5.2); guard the
+					// one this case is not, so a regression that swaps them is caught.
+					other := sofab.ErrIncomplete
+					if c.want == sofab.ErrIncomplete {
+						other = sofab.ErrInvalidMsg
+					}
+					if errors.Is(err, other) {
+						t.Fatalf("pull = %v, must not also match %v", err, other)
+					}
+					// A rejected field never yields the field past itself: resyncing on
+					// an unvalidated length was the visible half of the defect.
+					if len(seen) != 1 {
+						t.Fatalf("pull handed out %d fields on a rejected field: %+v", len(seen), seen)
+					}
+				})
+			}
+
+			// The visitor paths are the reference: both always validated this word.
+			verr := sofab.AcceptBytes(c.in, baseV{})
+			serr := sofab.NewDecoder(bytes.NewReader(c.in)).AcceptStream(baseV{})
+			if c.want == nil {
+				if verr != nil {
+					t.Fatalf("AcceptBytes = %v, want clean decode", verr)
+				}
+				if serr != nil {
+					t.Fatalf("AcceptStream = %v, want clean decode", serr)
+				}
+				return
+			}
+			if !errors.Is(verr, c.want) {
+				t.Fatalf("AcceptBytes = %v, want %v (pull and visitor must agree)", verr, c.want)
+			}
+			if !errors.Is(serr, c.want) {
+				t.Fatalf("AcceptStream = %v, want %v (pull and visitor must agree)", serr, c.want)
+			}
+		})
+	}
+}
+
+// TestFixlenReservedSubtypeTypedReaders pins the typed pull readers on the same
+// words: a reserved subtype or a wrong-width float is INVALID there too, and is
+// never confused with the ErrUsage a caller gets for asking for the wrong type.
+func TestFixlenReservedSubtypeTypedReaders(t *testing.T) {
+	cases := []struct {
+		name string
+		in   []byte
+		read func(*sofab.Decoder) error
+	}{
+		{
+			name: "String on a reserved subtype",
+			in:   append(vhdr(0, sofab.TypeFixlen), append(vbytes((4<<3)|0x4), 'A', 'B', 'C', 'D')...),
+			read: func(d *sofab.Decoder) error { _, err := d.String(); return err },
+		},
+		{
+			name: "Bytes on a reserved subtype",
+			in:   append(vhdr(0, sofab.TypeFixlen), append(vbytes((4<<3)|0x5), 'A', 'B', 'C', 'D')...),
+			read: func(d *sofab.Decoder) error { _, err := d.Bytes(); return err },
+		},
+		{
+			name: "Float32 on a width-8 fp32",
+			in:   append(vhdr(0, sofab.TypeFixlen), append(vbytes((8<<3)|subFP32), 0, 0, 0, 0, 0, 0, 0, 0)...),
+			read: func(d *sofab.Decoder) error { _, err := d.Float32(); return err },
+		},
+		{
+			name: "Float64 on a width-4 fp64",
+			in:   append(vhdr(0, sofab.TypeFixlen), append(vbytes((4<<3)|subFP64), 0, 0, 0, 0)...),
+			read: func(d *sofab.Decoder) error { _, err := d.Float64(); return err },
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			d := newDec(c.in)
+			if _, err := d.Next(); err != nil {
+				t.Fatalf("Next = %v", err)
+			}
+			err := c.read(d)
+			if !errors.Is(err, sofab.ErrInvalidMsg) {
+				t.Fatalf("read = %v, want ErrInvalidMsg", err)
+			}
+			if errors.Is(err, sofab.ErrUsage) || errors.Is(err, sofab.ErrIncomplete) {
+				t.Fatalf("read = %v, must not match ErrUsage/ErrIncomplete", err)
+			}
+		})
+	}
+}
+
 // TestSkipFixlenArrayHonoursArrayCountLimit pins the receiver-side half of the
 // same header (§6.2.1): the count word of a skipped fixlen array goes through the
 // configured WithMaxArrayCount cap, reported as ErrLimitExceeded and never
