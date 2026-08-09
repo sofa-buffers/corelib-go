@@ -278,7 +278,7 @@ features. The one configurable policy is **strict UTF-8 validation**:
 
 | Option | Default | Effect |
 |--------|---------|--------|
-| `WithStrictUTF8(bool)` (`SOFAB_STRICT_UTF8`) | on | Passed to `NewEncoder` or `NewDecoder`. On: an invalid-UTF-8 `string` is rejected — `ErrArgument` on encode, `ErrInvalidMsg` on `Decoder.String`. Off: bytes are stored/written verbatim (never lossy). |
+| `WithStrictUTF8(bool)` (`SOFAB_STRICT_UTF8`) | on | Passed to `NewEncoder`, `NewDecoder` or `AcceptBytes`. On: an invalid-UTF-8 `string` is rejected — `ErrArgument` on encode, `ErrInvalidMsg` where a string is read on decode. Off: bytes are stored/written verbatim (never lossy). It reaches every path a string is materialized on, the visitor destination included (below). |
 | `-tags sofab_no_strict_utf8` | off (check compiled in) | Folds `Utf8Valid` to a constant `true`, compiling the validator out for footprint builds. A documented non-strict build; CI conformance-tests the default. |
 
 **Where validation happens on decode.** A Go `string` is a byte-container type,
@@ -288,13 +288,48 @@ over bytes that are never inspected):
 
 * `Decoder.String` is a materializing read by construction, so it validates
   internally, under `WithStrictUTF8`. `Decoder.Skip` stays a pure discard.
-* `Accept` / `AcceptBytes` hand the wire bytes to `Visitor.String` verbatim. The
-  cursor cannot tell a field the visitor binds from one it ignores — an
-  undeclared id, or a field whose wire type contradicts the schema
-  (MESSAGE_SPEC §7.3), arrives at the same callback — so the consumer validates
-  at the destination with the exported `Utf8Valid(b []byte) bool` primitive and
-  returns `ErrInvalidMsg` on false. Generated code emits that call in each arm
-  that binds a `string`.
+* `Accept` / `AcceptBytes` / `AcceptStream` hand the wire bytes to
+  `Visitor.String` verbatim. The cursor cannot tell a field the visitor binds
+  from one it ignores — an undeclared id, or a field whose wire type contradicts
+  the schema (MESSAGE_SPEC §7.3), arrives at the same callback — so the consumer
+  validates at the destination and returns `ErrInvalidMsg` on false. Generated
+  code emits that check in each arm that binds a `string`.
+
+**Reaching the option from a visitor destination.** §6.4 requires both halves of
+the gate to sit inside the check, so flipping `WithStrictUTF8` never means
+regenerating or rebuilding. The destination therefore gets the *decode's* policy
+handed to it:
+
+```go
+type Msg struct {
+	sofab.StringCheck // gives Msg SetStringCheck + Utf8Valid
+	Name string
+}
+
+func (m *Msg) String(id sofab.ID, v string) error {
+	switch id {
+	case 1:
+		if !m.Utf8Valid([]byte(v)) { // this decode's policy, not the build's
+			return sofab.ErrInvalidMsg
+		}
+		m.Name = v
+	}
+	return nil
+}
+```
+
+A visitor implementing `StringPolicyVisitor` (embedding `sofab.StringCheck` is
+the one-line way) is handed the resolved `StringCheck` before its scope's first
+string — nested sequence visitors included. The zero value is **strict**, so a
+destination that is never handed a policy validates rather than silently
+accepting. Memory-wise it adds one `bool` to the visitor and no allocation: the
+value is a plain struct, the type assertion is made at most once per scope, and
+only at a scope that actually carries a string.
+
+The package-level `Utf8Valid(b []byte) bool` primitive stays exported and is the
+**always-strict** form — a package-level function has no decode to read the
+option from — so destinations written against it keep compiling and keep
+rejecting, whatever the option says.
 
 Framing is checked on every field regardless: the fixlen word, the reserved
 subtype rejection, `ARRAY_MAX`, `MAX_DEPTH`, varint overflow, and the exact

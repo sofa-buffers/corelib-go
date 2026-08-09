@@ -72,11 +72,15 @@ func WithMaxBlobLen(n int) Option {
 //     never a silent replacement (§6.4).
 //
 // Scope on decode: this option governs Decoder.String, the pull read that
-// materializes a string by construction. The visitor path (Accept, AcceptBytes)
-// never validates in either setting, because the cursor cannot tell a field the
-// visitor binds from one it skips and §6.4 forbids validating a skip; there the
-// check belongs to the destination and is performed by the caller via the
-// Utf8Valid primitive, whose own gate is compile-time (see utf8.go).
+// materializes a string by construction. The visitor path (Accept, AcceptBytes,
+// AcceptStream) never validates in the decoder itself, because the cursor cannot
+// tell a field the visitor binds from one it skips and §6.4 forbids validating a
+// skip; there the check belongs to the destination. The option still reaches it:
+// the decoder hands the resolved policy to a visitor that implements
+// StringPolicyVisitor — typically by embedding a StringCheck — before that
+// scope's first string, and the destination arm calls StringCheck.Utf8Valid
+// (utf8.go). A destination that instead calls the package-level Utf8Valid is
+// always strict, since a package-level function has no decode scope to read.
 //
 // The knob never changes how valid data is encoded, so two peers with different
 // settings interoperate on all valid data. It is a validation policy, never a
@@ -103,6 +107,15 @@ func newLimits(opts []Option) limits {
 		opt(&l)
 	}
 	return l
+}
+
+// stringCheck is the SOFAB_STRICT_UTF8 policy (§6.4) in the form a destination
+// can hold. The decoder hands it to a scope's StringPolicyVisitor so that
+// WithStrictUTF8 reaches the check generated code runs where it materializes a
+// string — the runtime half of the gate the package-level primitive cannot see
+// (utf8.go, issue #82).
+func (l limits) stringCheck() StringCheck {
+	return StringCheck{waived: !l.strictUTF8}
 }
 
 // checkArrayCount enforces maxArrayCount. The caller has already range-checked n
