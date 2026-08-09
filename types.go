@@ -67,6 +67,11 @@ const (
 )
 
 // Field is a decoded field header returned by Decoder.Next.
+//
+// On a TypeSequenceEnd marker ID is always 0, whatever id the header on the
+// wire spelled: the end marker's id carries no information, so the decoder
+// discards it (§4.9) instead of handing a sender-chosen number to a caller that
+// switches on ID.
 type Field struct {
 	ID   ID
 	Type WireType

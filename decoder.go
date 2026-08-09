@@ -103,6 +103,14 @@ func (d *Decoder) Next() (Field, error) {
 		}
 		d.depth--
 		d.needConsume = false
+		// The id is discarded (§4.9): the marker closes the innermost open
+		// sequence whatever the id says and re-encodes as 0x07, so a sender can
+		// express nothing by varying it. Zeroed here rather than left in d.cur,
+		// so a pull consumer that switches on f.ID can never observe the
+		// meaningless value. Discarded is not unvalidated — the ID_MAX check
+		// above stands on the raw header, on wire type 7 as anywhere else
+		// (§6.2), and it is deliberately not branched on the wire type.
+		d.cur.ID = 0
 	default:
 		return Field{}, ErrInvalidMsg
 	}

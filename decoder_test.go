@@ -350,3 +350,89 @@ func TestSkipNestedSequence(t *testing.T) {
 		t.Fatalf("want EOF, got %v", err)
 	}
 }
+
+// TestSequenceEndIDDiscarded pins CORELIB_PLAN §4.9: "a decoder MUST discard the
+// id" of a sequence-end marker. The id sub-field exists only to keep the header
+// format uniform; on wire type 7 it carries no information and never will, so a
+// sender can express nothing by varying it. Next must therefore hand the caller
+// a marker with ID 0 whatever spelling arrived — otherwise "the id is discarded"
+// is a convention a pull consumer has to know rather than a property the API
+// enforces, and a consumer that switches on f.ID sees a sender-chosen number
+// (issue #94).
+//
+// Discarded is not unvalidated: the ID_MAX ceiling still applies to the raw
+// header, so the over-ceiling case below stays ErrInvalidMsg (§6.2, PR #70).
+func TestSequenceEndIDDiscarded(t *testing.T) {
+	open := vhdr(0, sofab.TypeSequenceStart)
+
+	for _, c := range []struct {
+		name string
+		end  []byte
+	}{
+		{"canonical 0x07", vhdr(0, sofab.TypeSequenceEnd)},
+		{"id 3", vhdr(3, sofab.TypeSequenceEnd)},
+		{"id at ID_MAX", vhdr(sofab.IDMax, sofab.TypeSequenceEnd)},
+		// A non-minimal spelling of id 0 is an ordinary in-range id (§4.9): it
+		// is accepted, and discarded like every other.
+		{"non-minimal id 0", []byte{0x87, 0x00}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			d := newDec(append(append([]byte{}, open...), c.end...))
+			mustNext(t, d)
+			f := mustNext(t, d)
+			if f.Type != sofab.TypeSequenceEnd || f.ID != 0 {
+				t.Fatalf("Next = %+v, want {ID:0 Type:TypeSequenceEnd}", f)
+			}
+			// Field() replays the same header and must not leak the id either.
+			if g := d.Field(); g != f {
+				t.Fatalf("Field() = %+v, want %+v", g, f)
+			}
+			if _, err := d.Next(); err != io.EOF {
+				t.Fatalf("after end: %v, want EOF", err)
+			}
+		})
+	}
+
+	t.Run("id above ID_MAX", func(t *testing.T) {
+		d := newDec(append(append([]byte{}, open...), vhdr(sofab.IDMax+1, sofab.TypeSequenceEnd)...))
+		mustNext(t, d)
+		if _, err := d.Next(); !errors.Is(err, sofab.ErrInvalidMsg) {
+			t.Fatalf("Next = %v, want ErrInvalidMsg", err)
+		}
+	})
+}
+
+// TestSequenceEndIDDiscardedNested checks the discard on an inner marker too:
+// the id is dropped, and the marker still closes the innermost open scope, so
+// the field that follows belongs to the outer one.
+func TestSequenceEndIDDiscardedNested(t *testing.T) {
+	var in []byte
+	in = append(in, vhdr(1, sofab.TypeSequenceStart)...)
+	in = append(in, vhdr(2, sofab.TypeSequenceStart)...)
+	in = append(in, vhdr(9, sofab.TypeSequenceEnd)...) // closes id-2 scope
+	in = append(in, vhdr(4, sofab.TypeVarintUnsigned)...)
+	in = append(in, 0x2A)
+	in = append(in, vhdr(7, sofab.TypeSequenceEnd)...) // closes id-1 scope
+
+	d := newDec(in)
+	if f := mustNext(t, d); f.ID != 1 || f.Type != sofab.TypeSequenceStart {
+		t.Fatalf("outer start: %+v", f)
+	}
+	if f := mustNext(t, d); f.ID != 2 || f.Type != sofab.TypeSequenceStart {
+		t.Fatalf("inner start: %+v", f)
+	}
+	if f := mustNext(t, d); f.ID != 0 || f.Type != sofab.TypeSequenceEnd {
+		t.Fatalf("inner end: %+v, want ID 0", f)
+	}
+	f := mustNext(t, d)
+	v, err := d.Unsigned()
+	if f.ID != 4 || err != nil || v != 42 {
+		t.Fatalf("field after inner end: %+v %d %v", f, v, err)
+	}
+	if f := mustNext(t, d); f.ID != 0 || f.Type != sofab.TypeSequenceEnd {
+		t.Fatalf("outer end: %+v, want ID 0", f)
+	}
+	if _, err := d.Next(); err != io.EOF {
+		t.Fatalf("trailing: %v, want EOF", err)
+	}
+}

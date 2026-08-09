@@ -180,7 +180,12 @@ refuses a sequence-end marker that closes nothing — both `ErrInvalidMsg` (§6.
 The count belongs to the decoder, not to one call, so `Skip()` over a sub-tree is
 held to the same absolute ceiling, and a pull loop reaches the same verdict as
 `Accept` / `AcceptBytes` on the same bytes. A balanced end marker is still
-delivered as an ordinary `TypeSequenceEnd` header.
+delivered as an ordinary `TypeSequenceEnd` header — with `ID` always **0**,
+whatever id the header on the wire spelled: an end marker's id carries no
+information, so the decoder **discards** it (§4.9) rather than let a
+sender-chosen number reach a pull loop that switches on `f.ID`. Discarded is not
+unvalidated: an id above `IDMax` is `ErrInvalidMsg` on wire type 7 exactly as
+anywhere else (§6.2).
 
 #### An integer array's declared element width
 

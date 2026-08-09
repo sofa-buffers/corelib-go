@@ -330,8 +330,11 @@ func decodeField(t *testing.T, d *sofab.Decoder, f vecField) {
 		}
 		return
 	case "sequence_end":
-		if fd.Type != sofab.TypeSequenceEnd {
-			t.Fatalf("seq end: got %+v", fd)
+		// The end marker's id is discarded, so the decoder must report 0 for it
+		// however the vector spells it (§4.9, issue #94) — the vectors' own end
+		// markers carry no id at all, and f.ID is the zero value there.
+		if fd.Type != sofab.TypeSequenceEnd || fd.ID != 0 {
+			t.Fatalf("seq end: got %+v, want {ID:0 Type:TypeSequenceEnd}", fd)
 		}
 		return
 	}
