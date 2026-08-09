@@ -80,6 +80,24 @@ if err := e.Flush(); err != nil { /* ... */ }   // Flush pushes the tail
 msg := buf.Bytes()
 ```
 
+#### What the encoder refuses to write
+
+The encoder never hands back bytes no decoder could read: a write that cannot
+produce a valid field produces **nothing** and reports `ErrArgument`
+(`InvalidArgument`, CORELIB_PLAN §6.3). The error is sticky like any other, so
+generated `Marshal` code still checks once at `Flush`.
+
+| Refused | Why |
+|---|---|
+| an `id` past `IDMax` | `ID_MAX` binds every field header (CORELIB_PLAN §6.2). |
+| a `string`/blob longer than `FIXLEN_MAX`, or an array longer than `ARRAY_MAX` (both 2³¹−1) | a >2 GiB payload is representable in Go but not on the wire: the length or count word would go out looking well-formed and every decoder — this package's own included — would reject the message as `ErrInvalidMsg` (§6.2). |
+| opening a sequence past `MaxDepth` (255) | a message nesting deeper is `INVALID` (§4.9). |
+| closing a sequence when none is open | a bare `0x07` is an unbalanced sequence end, `INVALID` for every decoder (§4.9, §6.3) — the framing balance is the encoder's to keep in both directions. |
+| a non-UTF-8 `string` (unless the check is off) | see [Feature flags](#feature-flags) (§6.4). |
+
+None of these is a receiver-side limit: they are properties of the wire format,
+so they hold for every build and none of them is configurable.
+
 ### Serialize stream
 
 `NewEncoder` takes any `io.Writer` sink (socket, pipe, file, `gzip.Writer`, …) and
@@ -223,8 +241,9 @@ Framing is judged first and still wins: a reserved fixlen subtype, a wrong-width
 `ARRAY_MAX` — all `ErrInvalidMsg`, mismatch or not. And a mismatched field that
 runs off the end while being skipped is `ErrIncomplete`, the same verdict the
 matching read would give. What is left for **`ErrArgument`** is the genuine caller
-mistake: a typed reader called with no field waiting, or after the current value
-was already consumed.
+mistake: on this surface, a typed reader called with no field waiting, or after the
+current value was already consumed — and on the encode side, an argument no valid
+field can be built from ([above](#what-the-encoder-refuses-to-write)).
 
 Generated code decodes through `Accept` / `AcceptBytes` and applies §7.3 in its
 own field switch, so it never sees `ErrTypeMismatch`; both surfaces reach the same
