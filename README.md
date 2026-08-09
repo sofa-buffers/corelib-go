@@ -49,7 +49,7 @@ import sofab "github.com/sofa-buffers/corelib-go"
 
 | Goal | How |
 |------|-----|
-| Streaming **out** | [`Encoder`] writes to any `io.Writer`, buffering into a small internal slice flushed as it fills — a message can exceed RAM and stream straight to a socket or file. |
+| Streaming **out** | [`Encoder`] writes into an output buffer drained as it fills — a message can exceed RAM and stream straight to a socket or file. The buffer is the caller's (`NewEncoderBuffer` / `NewEncoderSink`, with a start offset for a framing header, CORELIB_PLAN §5.1); `NewEncoder` over any `io.Writer` is the convenience form that allocates one for you. |
 | Streaming **in** | [`Decoder`] is a pull parser over any `io.Reader`; `Next()` returns one field header at a time, never materializing the whole message. |
 | Two decode styles | Pull with `Decoder.Next`, or implement [`Visitor`] and call `Decoder.Accept`, which binds each field into a struct member — what generated `Unmarshal` uses. `AcceptBytes` is the zero-copy form for a message already in a `[]byte`. |
 | No dependencies | Standard library only, no `cgo`. |
@@ -111,6 +111,46 @@ for i := uint32(0); i < 1_000_000; i++ {
     e.WriteUnsigned(sofab.ID(i%128), uint64(i))
 }
 e.Flush()                              // push the tail (and surface a late error)
+```
+
+#### Serialize into a buffer you own
+
+`NewEncoder` allocates that window itself, which is convenient but is not the
+model the format is specified against: CORELIB_PLAN §5.1 has the **caller** own
+the output buffer, so the encoder can write straight into a packet — behind a
+framing header, without a second buffer and without a copy. Two constructors take
+one, and both accept a **start offset** that reserves room at the front:
+
+```go
+// (a) no sink: the buffer holds the message, or the encode reports ErrBufferFull.
+buf := make([]byte, 4+maxSize)
+e, _ := sofab.NewEncoderBuffer(buf, 4)           // 4 bytes reserved for a length header
+e.WriteUnsigned(1, 42)
+if err := e.Flush(); err != nil { /* ErrBufferFull if it did not fit */ }
+msg := e.Bytes()                                 // the bytes written, inside buf
+binary.BigEndian.PutUint32(buf[:4], uint32(len(msg)))
+packet := buf[:4+len(msg)]                       // one buffer, no copy
+
+// (b) with a flush sink: the buffer may be arbitrarily smaller than the message.
+scratch := make([]byte, 512)                     // >= sofab.MinOutputBuffer
+e, _ = sofab.NewEncoderSink(scratch, 0, func(_ *sofab.Encoder, b []byte) error {
+    _, err := conn.Write(b)                      // this sink copies, so it just returns
+    return err
+})
+```
+
+A sink may instead **take** the buffer it is handed — queue it for an
+asynchronous write, hand it to a transport — provided it installs a replacement
+with `SetBuffer` before returning. Returning without one means it copied, and the
+encoder writes on into the same buffer at offset 0. Passing the *same* buffer
+back to `SetBuffer` is a new installation like any other, which is how a sink
+re-arms its header room for every flushed unit:
+
+```go
+e, _ := sofab.NewEncoderSink(pool.Get(), 4, func(enc *sofab.Encoder, b []byte) error {
+    queue <- b                                   // the transport owns b now ...
+    return enc.SetBuffer(pool.Get(), 4)          // ... so hand the encoder another
+})
 ```
 
 ### Deserialize
@@ -313,16 +353,44 @@ got, _ := DecodePoint(wire)              // got.X == 3, got.Y == 4
 
 Buffer ownership is the part that most affects how callers wire the library in.
 
-**Encoder.** You hand `NewEncoder` an `io.Writer` sink, not a fixed output
-buffer. Bytes accumulate in a small internal window — 512 B, growing on demand to
-4 KiB — and flush to the writer as it fills (and on `Flush`), so the whole encoded
-message is never held. Each write copies its bytes into that window, so caller
-source strings/slices may be reused immediately. The one exception is a `string`
-or blob larger than the window: it is handed to the sink directly (after the
-buffered bytes, so ordering is unchanged) rather than growing the buffer to its
-size, which the sink sees as one extra `Write`. That write completes before the
-call returns, so the reuse guarantee still holds. You **must call `Flush`** to
-push the tail and surface a late write error.
+**Encoder — output buffer.** Who owns it depends on which constructor you use.
+Each write copies its bytes into the active buffer, so caller source
+strings/slices may be reused immediately on every form, and you **must call
+`Flush`** to push the tail and surface a late write error.
+
+| Constructor | Who owns the buffer | When it fills |
+|---|---|---|
+| `NewEncoder(w)` | this package: a 512 B window, growing on demand to 4 KiB | flushed to `w`, then reused |
+| `NewEncoderBuffer(buf, offset)` | you | nothing to flush to — the encode stops with `ErrBufferFull` |
+| `NewEncoderSink(buf, offset, sink)` | you | handed to `sink`, then reused (or replaced, see `SetBuffer`) |
+
+A caller-supplied buffer is **never grown, reallocated or replaced** behind your
+back, and the encoder writes only between `offset` and the end of it. `Bytes()`
+returns what has been written into the active buffer since it was installed — the
+whole message, for a sink-less encoder that had room for it.
+
+**`MIN_OUTPUT_BUFFER` = 20** (`sofab.MinOutputBuffer`). This is the smallest
+buffer accepted **for streaming**: `len(buf)-offset` must be at least 20 for a
+buffer installed *with a sink*, both at `NewEncoderSink` and at every mid-stream
+`SetBuffer`, and an undersized one is rejected there with `ErrArgument` rather
+than partway through a message. The value is what this encoder reserves as one
+contiguous piece — a field header varint plus a 64-bit value varint, 2 × 10 — and
+it never splits an atomic unit; a `string`/blob payload it does split freely, so
+a payload far larger than the buffer streams through it. A buffer installed
+**without** a sink is subject to **no minimum**: no flush can occur, so a message
+that encodes to two bytes encodes into a two-byte buffer.
+
+**Pass-through.** A `string`/blob payload larger than the buffer is normally
+copied through it. With the caller's permission it is instead handed to the sink
+**directly** (after the buffered bytes, so wire ordering is unchanged), saving a
+pass over the payload — the dominant cost of encoding a large blob. Such a call
+hands the sink memory that is **not** the output buffer: it is borrowed for the
+duration of the call and must not be retained, and it is never a buffer handover
+(`SetBuffer` is rejected while the permission is granted, since a sink cannot
+tell the two calls apart). It is **off by default** for `NewEncoderSink` — grant
+it with `WithPassThrough(true)` — and **on** for `NewEncoder`, whose sink is an
+`io.Writer` whose own contract already forbids retaining or modifying the slice
+it is given; pass `WithPassThrough(false)` to turn it off there.
 
 **Decoder.** The pull path (`Next`) is safe-by-default *and* streaming: `String()`
 and `Bytes()` both return fresh copies the caller owns. `Accept` / `AcceptBytes`
@@ -340,11 +408,13 @@ arrays are always freshly allocated on every path.
 ## Feature flags
 
 Go always ships the **full format** — there are no build-time toggles for wire
-features. The one configurable policy is **strict UTF-8 validation**:
+features. The configurable policies are **strict UTF-8 validation** and the
+encoder's **pass-through permission**; neither changes a byte on the wire:
 
 | Option | Default | Effect |
 |--------|---------|--------|
 | `WithStrictUTF8(bool)` (`SOFAB_STRICT_UTF8`) | on | Passed to `NewEncoder`, `NewDecoder` or `AcceptBytes`. On: an invalid-UTF-8 `string` is rejected — `ErrArgument` on encode, `ErrInvalidMsg` where a string is read on decode. Off: bytes are stored/written verbatim (never lossy). It reaches every path a string is materialized on, the visitor destination included (below). |
+| `WithPassThrough(bool)` | on for `NewEncoder`, off for `NewEncoderSink` | Whether a `string`/blob payload larger than the buffer may be handed to the sink directly instead of being copied through it (CORELIB_PLAN §5.1) — see [Memory handling](#memory-handling) for what a sink then owes. |
 | `-tags sofab_no_strict_utf8` | off (check compiled in) | Folds `Utf8Valid` to a constant `true`, compiling the validator out for footprint builds. A documented non-strict build; CI conformance-tests the default. |
 
 **Where validation happens on decode.** A Go `string` is a byte-container type,

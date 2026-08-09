@@ -265,6 +265,56 @@ func TestVectorEncode(t *testing.T) {
 	}
 }
 
+// TestVectorEncodeOverCallerBuffer replays every vector through a
+// caller-supplied output buffer (CORELIB_PLAN §7.2 item 1: "at the given
+// offset"), in the two shapes §5.1 requires — sink-less, sized to hold the
+// message, and streamed through a buffer of exactly MinOutputBuffer. Both must
+// reproduce the vector's bytes exactly, which is what makes "any buffer at or
+// above the minimum produces output byte-identical to the one-shot path" a
+// checked property across the whole corpus rather than one sample message.
+func TestVectorEncodeOverCallerBuffer(t *testing.T) {
+	vf := loadVectors(t)
+	for _, v := range vf.Vectors {
+		t.Run(v.Name, func(t *testing.T) {
+			// (a) no sink: the buffer holds the message and nothing is flushed.
+			buf := make([]byte, v.Offset+v.Serialized.Length)
+			e, err := sofab.NewEncoderBuffer(buf, v.Offset)
+			if err != nil {
+				t.Fatalf("NewEncoderBuffer(offset %d): %v", v.Offset, err)
+			}
+			for _, f := range v.Fields {
+				encodeField(t, e, f)
+			}
+			if err := e.Flush(); err != nil {
+				t.Fatalf("flush: %v", err)
+			}
+			if got := hex.EncodeToString(e.Bytes()); got != v.Serialized.Hex {
+				t.Fatalf("caller-buffer encode mismatch\n got: %s\nwant: %s", got, v.Serialized.Hex)
+			}
+
+			// (b) streamed through the declared minimum, driving the sink.
+			var out bytes.Buffer
+			small := make([]byte, v.Offset+sofab.MinOutputBuffer)
+			se, err := sofab.NewEncoderSink(small, v.Offset, func(_ *sofab.Encoder, b []byte) error {
+				out.Write(b)
+				return nil
+			})
+			if err != nil {
+				t.Fatalf("NewEncoderSink(offset %d): %v", v.Offset, err)
+			}
+			for _, f := range v.Fields {
+				encodeField(t, se, f)
+			}
+			if err := se.Flush(); err != nil {
+				t.Fatalf("flush: %v", err)
+			}
+			if got := hex.EncodeToString(out.Bytes()); got != v.Serialized.Hex {
+				t.Fatalf("min-buffer encode mismatch\n got: %s\nwant: %s", got, v.Serialized.Hex)
+			}
+		})
+	}
+}
+
 // --- decode side -------------------------------------------------------------
 
 func decodeField(t *testing.T, d *sofab.Decoder, f vecField) {

@@ -84,8 +84,18 @@ type Signed interface {
 }
 
 // Errors returned by the encoder and decoder. They mirror the C sofab_ret_t
-// codes (write-buffer-full is reported via the underlying io.Writer instead).
+// codes (§6.3).
 var (
+	// ErrBufferFull is the BufferFull code (§6.3): an output buffer the caller
+	// supplied (NewEncoderBuffer, or SetBuffer) ran out of room with no flush
+	// sink to drain it to. The encode stops there and the error is sticky, so a
+	// partial message is never reported as a complete one; nothing is grown or
+	// reallocated, because a caller-supplied buffer is what it is (§5.1).
+	//
+	// It cannot arise on an encoder with a sink — a full buffer is flushed and
+	// written on into — nor on the io.Writer form, whose window is this package's
+	// own to grow; there a failed write surfaces as the io.Writer's own error.
+	ErrBufferFull = errors.New("sofab: output buffer full")
 	// ErrArgument is an invalid caller argument (e.g. id > IDMax, opening a
 	// nested sequence past MaxDepth, calling a typed pull reader when no field's
 	// value is waiting to be read, or — with strict UTF-8 enabled, §6.4 — a
