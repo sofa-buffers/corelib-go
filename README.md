@@ -115,6 +115,15 @@ for {
 }
 ```
 
+`Next` also owns the stream's **nesting state**, so the pull loop above needs no
+depth bookkeeping of its own: it counts the sequences the stream opens, refuses
+the one that would nest past `MaxDepth` (255, CORELIB_PLAN §4.9/§6.2), and
+refuses a sequence-end marker that closes nothing — both `ErrInvalidMsg` (§6.3).
+The count belongs to the decoder, not to one call, so `Skip()` over a sub-tree is
+held to the same absolute ceiling, and a pull loop reaches the same verdict as
+`Accept` / `AcceptBytes` on the same bytes. A balanced end marker is still
+delivered as an ordinary `TypeSequenceEnd` header.
+
 ### Deserialize stream
 
 The very same loop reads a stream: hand `NewDecoder` any `io.Reader` and it refills

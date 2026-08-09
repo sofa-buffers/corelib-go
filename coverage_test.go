@@ -418,7 +418,10 @@ func TestSkipValueErrors(t *testing.T) {
 }
 
 func TestSkipSequenceEndIsNoop(t *testing.T) {
-	d := newDec(vhdr(0, sofab.TypeSequenceEnd))
+	// The end marker must close an open sequence: a lone one is a dangling end
+	// and is rejected by Next itself (§6.3, issue #78), so open a scope first.
+	d := newDec(append(vhdr(0, sofab.TypeSequenceStart), vhdr(0, sofab.TypeSequenceEnd)...))
+	mustNext(t, d)
 	f := mustNext(t, d)
 	if f.Type != sofab.TypeSequenceEnd {
 		t.Fatalf("type=%v", f.Type)
