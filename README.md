@@ -403,7 +403,12 @@ and `Bytes()` both return fresh copies the caller owns. `Accept` / `AcceptBytes`
 buffer the whole message and are faster, but only string values are copied — blob
 (`Bytes`) values **alias** the read buffer (`Accept`) or the caller's `[]byte`
 (`AcceptBytes`), so a visitor keeping a blob past the call must copy it. Numeric
-arrays are always freshly allocated on every path.
+arrays are always freshly allocated on every path — but *only* the output slice
+is: no reader path allocates **per element**. Varint elements are decoded in
+batches out of the reader's own buffer, and fp32/fp64 elements — like the scalar
+`Float32`/`Float64` fields — are read in place out of it, so a 1000-element array
+costs that slice's growth and nothing else, on `Next`, `ReadFloat32Array` and
+`AcceptStream` alike.
 
 | Path | `String` | `Bytes` (blob) |
 |------|----------|----------------|
