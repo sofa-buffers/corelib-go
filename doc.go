@@ -26,7 +26,7 @@
 // a start offset that leaves room at the front for a framing header
 // (CORELIB_PLAN §5.1; MinOutputBuffer says how small such a buffer may be).
 // NewEncoder is the io.Writer convenience form, and the only one that allocates
-// a window of its own. The decoder offers two styles:
+// a window of its own. The decoder offers three styles:
 //
 //   - Pull: call Decoder.Next to get the next field header, then a typed reader
 //     (or Skip) to consume its value. It streams one field at a time, never
@@ -34,12 +34,24 @@
 //   - Visitor: implement Visitor on the target type and call Decoder.Accept; the
 //     decoder drives, binding each field straight into a struct member. This is
 //     what a generated Decode<Name> uses. See the Decoding example below.
+//   - Visitor over a reader: the same Visitor, driven by Decoder.AcceptStream,
+//     which reads and dispatches each field as the io.Reader delivers it instead
+//     of buffering the message first. This is what a generated
+//     Decode<Name>From(io.Reader) uses.
 //
-// The visitor path reads the message into one contiguous buffer and parses it by
-// advancing a cursor over it (the protobuf-style decode kernel), so for an
-// in-memory source it is faster than the pull parser but does buffer the whole
-// message. AcceptBytes is the zero-copy form when the message is already a
-// []byte (e.g. a generated Decode<Name>).
+// Accept reads the message into one contiguous buffer and parses it by advancing
+// a cursor over it (the protobuf-style decode kernel), so for an in-memory source
+// it is faster than the pull parser but does buffer the whole message.
+// AcceptBytes is the zero-copy form when the message is already a []byte (e.g. a
+// generated Decode<Name>). AcceptStream buffers nothing: peak memory is the
+// largest single field, and — having no shared image to alias — it hands the
+// visitor freshly read storage for strings and blobs alike, where Accept and
+// AcceptBytes hand it blob values that are views into the buffer being parsed.
+//
+// A visitor may implement the optional extensions HeaderVisitor and
+// ElemBoundVisitor (and SchemaBoundVisitor, StringPolicyVisitor) to have a
+// schema bound reach the decoder; each is consulted on every visitor path, and a
+// visitor that implements none decodes exactly as before.
 //
 // # Sequence framing (omitting an all-default sequence)
 //
