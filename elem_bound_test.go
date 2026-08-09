@@ -183,16 +183,40 @@ func TestElemBoundBackwardCompat(t *testing.T) {
 	}
 }
 
-// TestElemBoundIsAskedOncePerArray pins the cost claim in ElemBoundVisitor's
-// doc: the bound is resolved once per array FIELD and then applied by the
-// decoder, so the element loop never calls back however long the array is.
-func TestElemBoundIsAskedOncePerArray(t *testing.T) {
-	v := &countingBoundVisitor{}
-	if err := sofab.AcceptBytes([]byte{sHdr, 4, 0x02, 0x04, 0x06, 0x08}, v); err != nil {
-		t.Fatalf("complete array: %v", err)
-	}
-	if v.asked != 1 {
-		t.Errorf("bound asked %d time(s) for one 4-element array; want 1", v.asked)
+// TestElemBoundIsAskedOnlyWhereItCanMatter pins the cost claim in
+// ElemBoundVisitor's doc: the bound is resolved at most once per array FIELD —
+// never per element, however long the array — and only where the array fails to
+// complete, which is the only place it can change an outcome. An array that
+// arrives whole reaches the visitor's own guard, and that guard sees every
+// element and reaches the same verdict, so nothing is asked for it.
+//
+// Both visitor surfaces are held to the same count on the same bytes: the
+// reader-driven one always resolved it this late, and the cursor now agrees.
+func TestElemBoundIsAskedOnlyWhereItCanMatter(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		in   []byte
+		want int
+	}{
+		{"complete array", []byte{sHdr, 4, 0x02, 0x04, 0x06, 0x08}, 0},
+		// count 5 with one element on the wire: the array never completes.
+		{"truncated array", []byte{sHdr, 5, 0x02}, 1},
+	} {
+		v := &countingBoundVisitor{}
+		if err := sofab.AcceptBytes(tc.in, v); (err != nil) != (tc.want != 0) {
+			t.Fatalf("AcceptBytes %s: %v", tc.name, err)
+		}
+		if v.asked != tc.want {
+			t.Errorf("AcceptBytes %s: bound asked %d time(s), want %d", tc.name, v.asked, tc.want)
+		}
+
+		s := &countingBoundVisitor{}
+		if err := sofab.NewDecoder(bytes.NewReader(tc.in)).AcceptStream(s); (err != nil) != (tc.want != 0) {
+			t.Fatalf("AcceptStream %s: %v", tc.name, err)
+		}
+		if s.asked != v.asked {
+			t.Errorf("AcceptStream %s: bound asked %d time(s), cursor asked %d", tc.name, s.asked, v.asked)
+		}
 	}
 }
 

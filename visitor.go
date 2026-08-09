@@ -99,13 +99,14 @@ type HeaderVisitor interface {
 // As its own interface it is purely additive: a visitor that does not implement
 // it decodes exactly as before.
 //
-// Asked once per array FIELD, never per element: the answer is resolved at the
-// count word and the decoder applies it afterwards, so a long array costs one
-// call, not one per value. A scope holding no array never even makes the type
-// assertion. And the bound only changes an outcome where the whole-slice
-// callback does not fire — where the array completes, the visitor's own guard
-// sees every element and reaches the same verdict — so it is applied on the
-// failure path and the element loops stay a pure decode.
+// Asked AT MOST ONCE per array FIELD, never per element, and only where the
+// array fails to complete. That is the whole of its cost: the bound can change
+// an outcome only where the whole-slice callback does not fire, since an array
+// that arrives whole reaches the visitor's own guard, which sees every element
+// and reaches the same verdict. So a long array costs no call at all when it
+// decodes, one when it is truncated — and the element loops stay a pure decode.
+// A scope holding no array never even makes the type assertion, and both visitor
+// surfaces ask the same number of times on the same bytes.
 type ElemBoundVisitor interface {
 	// ArrayElemBound reports the inclusive range an element of the integer array
 	// field id may take, and whether the schema narrows it at all (false for u64

@@ -405,8 +405,11 @@ func (d *Decoder) readFloat32Elements(n uint64) ([]float32, error) {
 		if left := n - uint64(len(out)); uint64(k) > left {
 			k = int(left)
 		}
-		for i := 0; i < k*4; i += 4 {
-			out = append(out, math.Float32frombits(binary.LittleEndian.Uint32(w[i:])))
+		// The batch is consumed as an advancing window with the width in the loop
+		// condition, so the four-byte load needs no bounds check — see
+		// cursor.acceptFixlenArray, which decodes the same elements the same way.
+		for b := w[:k*4]; len(b) >= 4; b = b[4:] {
+			out = append(out, math.Float32frombits(binary.LittleEndian.Uint32(b)))
 		}
 		d.r.Discard(k * 4)
 	}
@@ -424,8 +427,9 @@ func (d *Decoder) readFloat64Elements(n uint64) ([]float64, error) {
 		if left := n - uint64(len(out)); uint64(k) > left {
 			k = int(left)
 		}
-		for i := 0; i < k*8; i += 8 {
-			out = append(out, math.Float64frombits(binary.LittleEndian.Uint64(w[i:])))
+		// See readFloat32Elements on the advancing window.
+		for b := w[:k*8]; len(b) >= 8; b = b[8:] {
+			out = append(out, math.Float64frombits(binary.LittleEndian.Uint64(b)))
 		}
 		d.r.Discard(k * 8)
 	}

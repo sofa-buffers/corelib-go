@@ -141,7 +141,28 @@ func clampLimit(n int) uint64 {
 // newLimits folds the options into a limits value. SOFAB_STRICT_UTF8 (§6.4)
 // defaults to ON, so strictUTF8 starts true and only WithStrictUTF8(false)
 // turns it off; the cap fields start at their zero value (unlimited).
+//
+// The no-option case — every AcceptBytes, NewDecoder and NewEncoder that
+// configures nothing, which is the common one — is the whole body here, and the
+// option loop is out of line in applyOptions. That is not layout taste: an
+// Option is an opaque func(*limits), so `opt(&l)` makes l ESCAPE, and escape
+// analysis is per function, not per branch. With the loop in this body every
+// caller heap-allocated a limits value (one allocation and 32 bytes per
+// encode/decode entry point) whether or not it passed an option. Split, the
+// default path returns a value that stays in the caller's frame and allocates
+// nothing; only a call that really has options pays.
 func newLimits(opts []Option) limits {
+	if len(opts) == 0 {
+		return limits{strictUTF8: true}
+	}
+	return applyOptions(opts)
+}
+
+// applyOptions is the out-of-line half of newLimits: the branch in which the
+// options escape. See newLimits for why it is not inline.
+//
+//go:noinline
+func applyOptions(opts []Option) limits {
 	l := limits{strictUTF8: true}
 	for _, opt := range opts {
 		opt(&l)
