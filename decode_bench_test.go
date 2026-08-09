@@ -1,7 +1,7 @@
 package sofab_test
 
 // Benchmarks for the visitor-driven decode path (Decoder.Accept). These drive
-// the same two workloads as cmd/perfbench (a 1000-element u64 array and the
+// two of cmd/perfbench's shared workloads (a 1000-element u64 array and the
 // mixed "typical" message) but under the go test harness, so -count/benchstat
 // give stable, comparable numbers across optimization steps.
 

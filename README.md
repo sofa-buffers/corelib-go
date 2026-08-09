@@ -575,14 +575,62 @@ go run ./cmd/perfbench bench   # throughput table (MB/s, MB = 1e6) over a ~1s CP
 go run ./cmd/perfbench perf    # per-op cost (CPU time/op ns + MB/s) for the 12-field message
 ```
 
-Single-workload subcommands (`encode_u64_array`, `encode_typical`,
-`decode_u64_array`, `decode_typical`) run one `//go:noinline` `run_*` function once
-with setup excluded, so a Callgrind harness can toggle collection on
-`main.run_<workload>`. `bench/run_callgrind.sh` is that harness — the third tool
-of the shared set, reporting machine-independent instructions/op:
+### The workloads
+
+`bench` prints one row per shared dataset — the 1000-element `u64` array, the
+small `typical` message, the unbounded **1 MB blob** and the **composite**
+message — and each row is driven through the API a real caller uses:
+
+| Row | How it is driven |
+|---|---|
+| `encode: u64 array (1000)`, `encode: typical message`, `encode: composite` | a caller-supplied buffer (`NewEncoderBuffer`), no sink |
+| `encode: blob 1MB one-shot` | one caller buffer of exactly **1,000,005** bytes, no sink — the floor: one contiguous write, no flush logic |
+| `encode: blob 1MB streaming` | a **4096**-byte caller buffer with a flush sink (`NewEncoderSink`), pass-through **not** granted, so the megabyte is copied through it in ~245 flushes |
+| `encode: blob 1MB passthrough` | the same, with `WithPassThrough(true)`: the payload goes to the sink directly |
+| `decode: blob 1MB` | fed to `AcceptStream` in **4096**-byte chunks, so peak memory is one field |
+| `decode: composite` / `decode: composite skip-all` | the whole message read into a visitor, versus the pull loop that `Skip`s every field and sub-tree — the path a router or filter runs |
+
+The `blob 1MB` rows are **bandwidth-bound**: five bytes of that message are
+metadata and a million are payload, so its MB/s is this machine's `memcpy` and
+not a statement about the library. Read those three rows against **each other**
+(the gaps are the flush machinery and what the §5.1 pass-through permission
+buys), and read them as `Ir/op` rather than MB/s — instruction counts do not care
+about memory bandwidth or a busy neighbour. The `passthrough` row is the shared
+suite's one optional row, printed here because this port implements the
+permission.
+
+`decode: composite skip-all` is the pull loop rather than a visitor, because the
+pull surface is the only one here that really materializes nothing: `Skip` over a
+sequence start consumes the whole sub-tree and `Skip` over a `fixlen` is a length
+jump over bytes that are never inspected, while a visitor is handed each value
+whether or not its destination wants it. The two composite rows therefore differ
+in surface as well as in work — on this port the per-field cost of the pull
+parser outweighs what it saves by not materializing, and the skip row comes out
+*above* the visitor row.
+
+The `composite` message is the one that reaches what the flat datasets never do:
+a wrapper array of 64 string elements, 320 bytes of 1-/2-/3-/4-byte UTF-8 through
+the validator, nesting at depth 3, a field equal to its default that the encoder
+must **omit**, and a two-byte field header. Its encoded size is 956 bytes on
+every port, as the `perf` message's is 170 and the blob's 1,000,005 — those three
+numbers are the cross-language parity checks.
+
+### Instruction cost
+
+Every workload is also a single-shot subcommand (`perfbench encode_blob_oneshot`,
+…; `perfbench workloads` lists them) that runs the op **twice**: once warm,
+through a path the profiler is not collecting, and once through the
+`//go:noinline` `run_<workload>` symbol a Callgrind harness toggles collection
+on. Setup is excluded from both, and the warm call is what keeps the reported
+number a steady-state per-op cost rather than one that also pays the first-touch
+of every heap size class the op allocates from — the same startup cost the
+two-rep subtraction cancels for the JIT ports (it is 60 % of the small rows
+here). `bench/run_callgrind.sh` is that harness — the third tool of the shared
+set, reporting machine-independent instructions/op, and it takes its row list
+from `perfbench workloads` rather than a second copy of the suite:
 
 ```bash
-bash bench/run_callgrind.sh           # Ir/op table over the four workloads
+bash bench/run_callgrind.sh           # Ir/op table over every workload
 bash bench/profile.sh decode_typical  # per-function breakdown of one workload
 ```
 
@@ -592,7 +640,7 @@ it, so both tools run in the environment the central benchmark harness builds
 this repo in; `bench_env_test.go` keeps the two in step.
 
 Both directions also have `go test` benchmarks — `decode_bench_test.go` and
-`encode_bench_test.go` — driving the same two workloads through each API shape
+`encode_bench_test.go` — driving two of those workloads through each API shape
 (`Accept` / `AcceptBytes` / `AcceptStream`, and the `io.Writer` window against a
 caller-supplied buffer), with `-benchmem` so an allocation added to a hot path
 shows up as a number:
