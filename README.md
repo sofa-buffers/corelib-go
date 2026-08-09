@@ -387,10 +387,11 @@ pass over the payload — the dominant cost of encoding a large blob. Such a cal
 hands the sink memory that is **not** the output buffer: it is borrowed for the
 duration of the call and must not be retained, and it is never a buffer handover
 (`SetBuffer` is rejected while the permission is granted, since a sink cannot
-tell the two calls apart). It is **off by default** for `NewEncoderSink` — grant
-it with `WithPassThrough(true)` — and **on** for `NewEncoder`, whose sink is an
-`io.Writer` whose own contract already forbids retaining or modifying the slice
-it is given; pass `WithPassThrough(false)` to turn it off there.
+tell the two calls apart). It is **off by default everywhere** — for
+`NewEncoderSink` and for `NewEncoder` alike, whose `io.Writer` is a sink like any
+other — so a destination that was not told it may receive foreign memory never
+does. Grant it with `WithPassThrough(true)`; the bytes on the wire are identical
+either way, so it is purely a permission about what the destination is handed.
 
 **Decoder.** The pull path (`Next`) is safe-by-default *and* streaming: `String()`
 and `Bytes()` both return fresh copies the caller owns. `Accept` / `AcceptBytes`
@@ -414,7 +415,7 @@ encoder's **pass-through permission**; neither changes a byte on the wire:
 | Option | Default | Effect |
 |--------|---------|--------|
 | `WithStrictUTF8(bool)` (`SOFAB_STRICT_UTF8`) | on | Passed to `NewEncoder`, `NewDecoder` or `AcceptBytes`. On: an invalid-UTF-8 `string` is rejected — `ErrArgument` on encode, `ErrInvalidMsg` where a string is read on decode. Off: bytes are stored/written verbatim (never lossy). It reaches every path a string is materialized on, the visitor destination included (below). |
-| `WithPassThrough(bool)` | on for `NewEncoder`, off for `NewEncoderSink` | Whether a `string`/blob payload larger than the buffer may be handed to the sink directly instead of being copied through it (CORELIB_PLAN §5.1) — see [Memory handling](#memory-handling) for what a sink then owes. |
+| `WithPassThrough(bool)` | off | Whether a `string`/blob payload larger than the buffer may be handed to the sink directly instead of being copied through it (CORELIB_PLAN §5.1) — see [Memory handling](#memory-handling) for what a sink then owes. |
 | `-tags sofab_no_strict_utf8` | off (check compiled in) | Folds `Utf8Valid` to a constant `true`, compiling the validator out for footprint builds. A documented non-strict build; CI conformance-tests the default. |
 
 **Where validation happens on decode.** A Go `string` is a byte-container type,

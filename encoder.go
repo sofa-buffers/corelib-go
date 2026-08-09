@@ -53,9 +53,9 @@ type Encoder struct {
 	// buffer an Encoder may grow. A caller-supplied buffer never is.
 	owned bool
 	// passThrough is the caller's permission to hand a string/blob run to the
-	// sink directly instead of copying it through the output buffer (§5.1). Off
-	// by default for a caller-supplied buffer; see NewEncoder for why the
-	// io.Writer form defaults the other way.
+	// sink directly instead of copying it through the output buffer (§5.1). It is
+	// off for every encoder form unless WithPassThrough(true) granted it: a
+	// destination that was not told it may receive foreign memory never does.
 	passThrough bool
 	// installed records that the sink called SetBuffer during the flush it is
 	// currently in — i.e. that it took the buffer and replaced it, rather than
@@ -145,16 +145,18 @@ type Sink func(e *Encoder, b []byte) error
 // options (WithMaxArrayCount, WithMaxStringLen, WithMaxBlobLen) are decode-only
 // and are accepted but ignored here.
 //
-// Pass-through of a string/blob payload larger than the window (§5.1) is ON for
-// this form unless WithPassThrough(false) is passed: the sink here is an
-// io.Writer, whose own contract already forbids retaining or modifying the slice
-// it is given, which is exactly the borrow rule pass-through requires — so
-// handing it the caller's payload is a permission the caller grants by choosing
-// this constructor. The buffer is this package's, so no sink can take it and the
-// rule that pass-through excludes SetBuffer costs nothing here.
+// Pass-through of a string/blob payload larger than the window (§5.1) is OFF
+// here as it is everywhere: w is a sink like any other, and §5.1 makes the
+// permission the caller's to give rather than the constructor's to assume — an
+// io.Writer whose Write is handed the caller's own payload is still handed
+// memory it was never told to expect, even though io.Writer's contract forbids
+// retaining it. Pass WithPassThrough(true) to grant it; the bytes are identical
+// either way. This form is the one where granting it costs nothing extra, since
+// the window is this package's and no sink can take it, so the rule that
+// pass-through excludes SetBuffer takes nothing away here.
 func NewEncoder(w io.Writer, opts ...Option) *Encoder {
 	e := &Encoder{w: w, buf: make([]byte, encBufInit), owned: true, lim: newLimits(opts)}
-	e.passThrough = !e.lim.passThroughSet || e.lim.passThrough
+	e.passThrough = e.lim.passThrough
 	e.pending = e.pendingInline[:0]
 	return e
 }
@@ -199,7 +201,7 @@ func NewEncoderSink(buf []byte, offset int, sink Sink, opts ...Option) (*Encoder
 // constructors, once their arguments have been checked.
 func newBufferEncoder(buf []byte, offset int, sink Sink, opts []Option) *Encoder {
 	e := &Encoder{sink: sink, buf: buf, n: offset, start: offset, lim: newLimits(opts)}
-	e.passThrough = sink != nil && e.lim.passThroughSet && e.lim.passThrough
+	e.passThrough = sink != nil && e.lim.passThrough
 	e.pending = e.pendingInline[:0]
 	return e
 }
