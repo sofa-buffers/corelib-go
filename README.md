@@ -52,7 +52,7 @@ import sofab "github.com/sofa-buffers/corelib-go"
 |------|-----|
 | Streaming **out** | [`Encoder`] writes into an output buffer drained as it fills — a message can exceed RAM and stream straight to a socket or file. The buffer is the caller's (`NewEncoderBuffer` / `NewEncoderSink`, with a start offset for a framing header, CORELIB_PLAN §5.1); `NewEncoder` over any `io.Writer` is the convenience form that allocates one for you. |
 | Streaming **in** | [`Decoder`] is a pull parser over any `io.Reader`; `Next()` returns one field header at a time, never materializing the whole message. |
-| Two decode styles | Pull with `Decoder.Next`, or implement [`Visitor`] and call `Decoder.Accept`, which binds each field into a struct member — what generated `Decode<Name>` uses. `AcceptBytes` is the zero-copy form for a message already in a `[]byte`. |
+| Three decode styles | Pull with `Decoder.Next`; implement [`Visitor`] and call `Decoder.Accept`, which binds each field into a struct member — what generated `Decode<Name>` uses, with `AcceptBytes` as its zero-copy form for a message already in a `[]byte`; or `Decoder.AcceptStream`, the same visitor events driven straight off an `io.Reader` with no whole-message buffer, so peak memory is one field — what generated `Decode<Name>From` uses. |
 | No dependencies | Standard library only, no `cgo`. |
 | Sticky errors | The encoder records the first failure and turns later writes into no-ops, so a generated `Serialize` can issue a run of writes and its `Encode` check once at `Flush`. |
 | Generics for arrays | `WriteUnsignedArray[T]` / `ReadUnsignedArray[T]` (and signed variants) accept any `~uint8..~uint64` / `~int8..~int64` element type; float arrays have dedicated methods. On decode `T` doubles as the declared-width bound (MESSAGE_SPEC §7.1) — see [below](#an-integer-arrays-declared-element-width). |
@@ -314,6 +314,33 @@ for {
 }
 ```
 
+#### A visitor over a reader
+
+The visitor path streams too. `Accept` reads the whole message into one buffer
+before parsing it; `AcceptStream` reads and dispatches each field as the reader
+delivers it, so peak memory is the largest single field rather than the whole
+wire image — the same visitor events, the same verdict, no slurp. It is what a
+generated `Decode<Name>From(io.Reader)` runs:
+
+```go
+d := sofab.NewDecoder(conn)            // any io.Reader
+m := &Point{}
+if err := d.AcceptStream(m); err != nil {
+    /* ErrInvalidMsg / ErrIncomplete / a reader error, verbatim */
+}
+```
+
+Every `string` and blob it hands the visitor is freshly read storage, not a view
+into a buffer the decoder reuses, so the visitor may keep one without copying —
+see [Memory handling](#memory-handling).
+
+A visitor may also implement `HeaderVisitor` (`FixlenHeader`, `ArrayBegin`) or
+`ElemBoundVisitor` (`ArrayElemBound`) — optional extensions, honoured on every
+visitor path, that carry a schema's `maxlen` / `count` / element width into the
+decoder so it can be judged at the length or count word instead of after the
+payload (MESSAGE_SPEC §7.1). Generated code implements them; a visitor that does
+not decodes exactly as before.
+
 ### Code generator
 
 The common real use is driving the runtime through **generated object code**.
@@ -408,7 +435,12 @@ either way, so it is purely a permission about what the destination is handed.
 and `Bytes()` both return fresh copies the caller owns. `Accept` / `AcceptBytes`
 buffer the whole message and are faster, but only string values are copied — blob
 (`Bytes`) values **alias** the read buffer (`Accept`) or the caller's `[]byte`
-(`AcceptBytes`), so a visitor keeping a blob past the call must copy it. Numeric
+(`AcceptBytes`), so a visitor keeping a blob past the call must copy it.
+`AcceptStream` buffers no message at all — it reads each field out of the reader
+as it reaches it — so there is no shared image to alias: both its strings and its
+blobs are fresh storage the visitor may keep. That copy per payload is the price
+of a peak memory of one field, and it is why the decoder that never sees the
+whole message is the one whose values outlive it. Numeric
 arrays are always freshly allocated on every path — but *only* the output slice
 is: no reader path allocates **per element**. Varint elements are decoded in
 batches out of the reader's own buffer, and fp32/fp64 elements — like the scalar
@@ -421,6 +453,7 @@ costs that slice's growth and nothing else, on `Next`, `ReadFloat32Array` and
 | `Next` (pull, streaming) | fresh copy | fresh copy |
 | `Accept` | fresh copy | aliases read buffer — copy to keep |
 | `AcceptBytes` | fresh copy | aliases caller's `[]byte` — keep it alive |
+| `AcceptStream` (visitor, streaming) | fresh copy | fresh copy |
 
 ## Feature flags
 
