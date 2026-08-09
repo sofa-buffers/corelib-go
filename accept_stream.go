@@ -42,9 +42,11 @@ func (d *Decoder) acceptStream(v Visitor, depth int) error {
 	// Header hooks resolved lazily, as on the cursor path (see hvCache): at most
 	// one type assertion per scope, and none in a scope holding no array/fixlen.
 	// The element-bound extension likewise, asked only where an integer array
-	// fails to complete (see ebCache).
+	// fails to complete (see ebCache). The SOFAB_STRICT_UTF8 policy is handed to
+	// the visitor just as lazily, at this scope's first string (see spCache).
 	var hooks hvCache
 	var bounds ebCache
+	var policy spCache
 	for {
 		h, err := d.readVarint(true)
 		if err != nil {
@@ -83,7 +85,7 @@ func (d *Decoder) acceptStream(v Visitor, depth int) error {
 				return err
 			}
 		case TypeFixlen:
-			if err := d.acceptStreamFixlen(v, hooks.of(v), id); err != nil {
+			if err := d.acceptStreamFixlen(v, hooks.of(v), &policy, id); err != nil {
 				return err
 			}
 		case TypeVarintArrayUnsigned:
@@ -123,7 +125,7 @@ func (d *Decoder) acceptStream(v Visitor, depth int) error {
 	}
 }
 
-func (d *Decoder) acceptStreamFixlen(v Visitor, hv HeaderVisitor, id ID) error {
+func (d *Decoder) acceptStreamFixlen(v Visitor, hv HeaderVisitor, sp *spCache, id ID) error {
 	n, sub, err := d.readFixlenHeader()
 	if err != nil {
 		return err
@@ -163,7 +165,10 @@ func (d *Decoder) acceptStreamFixlen(v Visitor, hv HeaderVisitor, id ID) error {
 		// No UTF-8 validation here, exactly as on the cursor path (§6.4 "Skipped
 		// fields are never validated"): the decoder cannot know whether v has a
 		// destination for this id, so validation belongs at the destination —
-		// generated code calls Utf8Valid inside the arm that binds the value.
+		// generated code calls Utf8Valid inside the arm that binds the value. The
+		// POLICY it validates under is this decode's, handed to the scope here
+		// exactly as on the cursor path (issue #82).
+		sp.deliver(v, d.lim)
 		return v.String(id, string(b))
 	case fixBlob:
 		b, err := d.readRaw(n)

@@ -303,8 +303,11 @@ func (c *cursor) accept(v Visitor, depth int) error {
 	// assertion per scope, and none at all in a scope that holds no array or
 	// fixlen field. The element-bound extension is resolved the same way and
 	// asked even later: only where an integer array is truncated (see ebCache).
+	// The SOFAB_STRICT_UTF8 policy is handed over just as lazily — only at this
+	// scope's first string field (see spCache, utf8.go).
 	var hooks hvCache
 	var bounds ebCache
+	var policy spCache
 	for {
 		h, err := c.uvarint(true)
 		if err != nil {
@@ -343,7 +346,7 @@ func (c *cursor) accept(v Visitor, depth int) error {
 				return err
 			}
 		case TypeFixlen:
-			if err := c.acceptFixlen(v, hooks.of(v), id); err != nil {
+			if err := c.acceptFixlen(v, hooks.of(v), &policy, id); err != nil {
 				return err
 			}
 		case TypeVarintArrayUnsigned:
@@ -433,7 +436,7 @@ func (c *cursor) accept(v Visitor, depth int) error {
 	}
 }
 
-func (c *cursor) acceptFixlen(v Visitor, hv HeaderVisitor, id ID) error {
+func (c *cursor) acceptFixlen(v Visitor, hv HeaderVisitor, sp *spCache, id ID) error {
 	n, sub, err := c.fixlenHeader()
 	if err != nil {
 		return err
@@ -481,6 +484,12 @@ func (c *cursor) acceptFixlen(v Visitor, hv HeaderVisitor, id ID) error {
 		// the fixlen word, the reserved-subtype rejection, arrayMax, and the
 		// exact length advance in c.take — is fully checked either way, which is
 		// what keeps a skip a length jump and not a peek.
+		//
+		// What the decoder does owe the destination is the POLICY: WithStrictUTF8
+		// belongs to this decode, not to the build, so the scope's visitor is
+		// handed its StringCheck here — once per scope, at the first string, and
+		// only if it accepts one (issue #82).
+		sp.deliver(v, c.lim)
 		return v.String(id, string(b))
 	case fixBlob:
 		b, err := c.take(n)
