@@ -37,9 +37,9 @@ type Encoder struct {
 	//
 	// A caller-supplied buffer is never grown or reallocated (§5.1): it drains to
 	// the sink, or reports ErrBufferFull when there is none. The window of the
-	// io.Writer form (owned) grows by doubling up to flushThreshold and then
-	// stops: past that it is drained to w instead, which is what keeps memory
-	// bounded and preserves mid-stream flushing.
+	// io.Writer form (owned) grows once, from encBufInit straight to
+	// flushThreshold, and then stops: past that it is drained to w instead, which
+	// is what keeps memory bounded and preserves mid-stream flushing.
 	buf []byte
 	n   int
 	// start is where the bytes accumulated since the current installation begin:
@@ -61,12 +61,13 @@ type Encoder struct {
 	// currently in — i.e. that it took the buffer and replaced it, rather than
 	// copying and returning (§5.1). drain clears it before every sink call.
 	installed bool
-	// dst, dstN, dstStart and tail are the exact-fit tail path of a sink-less
-	// caller-supplied buffer; see stage. dst is nil unless the encoder is in it.
-	dst      []byte
-	dstN     int
-	dstStart int
-	tail     [MinOutputBuffer]byte
+	// staged is the exact-fit tail path of a sink-less caller-supplied buffer (see
+	// stage), nil unless the encoder has entered it. It hangs off a pointer rather
+	// than sitting in the struct because it is dead weight for every other form:
+	// the io.Writer window and the sink can never enter it, yet its ~60 bytes made
+	// every Encoder that much larger to allocate, zero and GC-scan. Entering it
+	// costs one allocation, on a path that has already run out of caller buffer.
+	staged *stagedTail
 	// pending holds the ids of the innermost open sequences whose header has not
 	// been written yet (WriteSequenceBeginLazy, MESSAGE_SPEC §2). It is always a
 	// contiguous suffix of the open sequences — writing any field commits the
@@ -84,12 +85,24 @@ type Encoder struct {
 	lim           limits
 }
 
+// stagedTail is the sink-less caller-supplied buffer's exact-fit tail: dst is
+// the caller's buffer with the cursor it had when staging began, and scratch is
+// the small window the encoder produces the last stretch into. See stage.
+type stagedTail struct {
+	dst     []byte
+	n       int
+	start   int
+	scratch [MinOutputBuffer]byte
+}
+
 // lazySeqInline is how many held-back sequence ids fit in the Encoder itself
 // before the pending run has to spill to the heap. Not a wire-format or API
 // limit — nesting deeper still works and still produces canonical bytes, it just
-// allocates once. Sized for real schemas rather than MaxDepth so the Encoder
-// stays small.
-const lazySeqInline = 32
+// allocates once. Sized for the depth real schemas nest to, not for MaxDepth:
+// every Encoder pays this array's bytes on every allocation, so a value that
+// covers the realistic case and lets append() handle the rest is the cheaper
+// trade.
+const lazySeqInline = 8
 
 // MinOutputBuffer is the smallest output buffer this package accepts for
 // streaming (CORELIB_PLAN §5.1): buflen-offset must be at least this many bytes
@@ -231,7 +244,7 @@ func (e *Encoder) SetBuffer(buf []byte, offset int) error {
 		return e.err
 	}
 	e.buf, e.n, e.start = buf, offset, offset
-	e.dst, e.dstN, e.dstStart = nil, 0, 0 // a fresh buffer ends any staged tail
+	e.staged = nil // a fresh buffer ends any staged tail
 	e.installed = true
 	return nil
 }
@@ -245,9 +258,9 @@ func (e *Encoder) SetBuffer(buf []byte, offset int) error {
 // stage), so a message whose tail did not fit sets ErrBufferFull here rather
 // than returning a short result silently. Check Err (or Flush) before using it.
 func (e *Encoder) Bytes() []byte {
-	if e.dst != nil {
+	if s := e.staged; s != nil {
 		e.spill()
-		return e.dst[e.dstStart:e.dstN]
+		return s.dst[s.start:s.n]
 	}
 	return e.buf[e.start:e.n]
 }
@@ -265,7 +278,7 @@ func (e *Encoder) Flush() error {
 		return e.err
 	}
 	if e.w == nil && e.sink == nil {
-		if e.dst != nil {
+		if e.staged != nil {
 			e.spill()
 		}
 		return e.err
@@ -337,15 +350,17 @@ func (e *Encoder) makeRoom(k int) bool {
 	}
 	// Grow first while the window is still below the threshold: a small message
 	// then accumulates entirely and leaves in a single Write on Flush, exactly
-	// as the append-based buffer did. Doubling from encBufInit lands on
-	// flushThreshold exactly (both are powers of two), so the window converges
-	// there and stops growing.
+	// as the append-based buffer did.
+	//
+	// The growth is ONE STEP to the cap, not a doubling ladder. A message that
+	// outgrows the initial window has already shown it is not a small message, and
+	// each rung of the ladder cost an allocation plus a copy of everything written
+	// so far — encoding a 1000-element u64 array climbed 512→1024→2048→4096 and
+	// paid four of each. The cap is untouched, so the ceiling on memory is
+	// untouched: the window still never exceeds flushThreshold for a message that
+	// fits it, and past that it drains to w rather than growing.
 	if len(e.buf) < flushThreshold && len(e.buf)-e.n < k {
-		size := len(e.buf)
-		for size < flushThreshold && size-e.n < k {
-			size *= 2
-		}
-		grown := make([]byte, size)
+		grown := make([]byte, flushThreshold)
 		copy(grown, e.buf[:e.n])
 		e.buf = grown
 		if len(e.buf)-e.n >= k {
@@ -431,10 +446,11 @@ func (e *Encoder) drain() bool {
 //
 //go:noinline
 func (e *Encoder) stage(k int) bool {
-	if e.dst == nil {
-		e.dst, e.dstN, e.dstStart = e.buf, e.n, e.start
-		e.buf, e.n, e.start = e.tail[:], 0, 0
-		return true // k <= MinOutputBuffer == len(tail), see writeHeaderRoom
+	if e.staged == nil {
+		s := &stagedTail{dst: e.buf, n: e.n, start: e.start}
+		e.staged = s
+		e.buf, e.n, e.start = s.scratch[:], 0, 0
+		return true // k <= MinOutputBuffer == len(scratch), see writeHeaderRoom
 	}
 	return e.spill()
 }
@@ -443,11 +459,12 @@ func (e *Encoder) stage(k int) bool {
 // do not fit. This is where a sink-less encode runs out of room, and it does so
 // on the bytes actually produced rather than on a reservation.
 func (e *Encoder) spill() bool {
-	if e.n > len(e.dst)-e.dstN {
+	s := e.staged
+	if e.n > len(s.dst)-s.n {
 		e.err = ErrBufferFull
 		return false
 	}
-	e.dstN += copy(e.dst[e.dstN:], e.buf[:e.n])
+	s.n += copy(s.dst[s.n:], e.buf[:e.n])
 	e.n = 0
 	return true
 }

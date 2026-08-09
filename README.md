@@ -469,7 +469,7 @@ strings/slices may be reused immediately on every form, and you **must call
 
 | Constructor | Who owns the buffer | When it fills |
 |---|---|---|
-| `NewEncoder(w)` | this package: a 512 B window, growing on demand to 4 KiB | flushed to `w`, then reused |
+| `NewEncoder(w)` | this package: a 512 B window, grown once to 4 KiB by the first message that outgrows it | flushed to `w`, then reused |
 | `NewEncoderBuffer(buf, offset)` | you | nothing to flush to — the encode stops with `ErrBufferFull` |
 | `NewEncoderSink(buf, offset, sink)` | you | handed to `sink`, then reused (or replaced, see `SetBuffer`) |
 
@@ -591,8 +591,15 @@ which ships in the same package). The dev container in `.devcontainer/` installs
 it, so both tools run in the environment the central benchmark harness builds
 this repo in; `bench_env_test.go` keeps the two in step.
 
-The decode path also has `go test` benchmarks in `decode_bench_test.go`:
+Both directions also have `go test` benchmarks — `decode_bench_test.go` and
+`encode_bench_test.go` — driving the same two workloads through each API shape
+(`Accept` / `AcceptBytes` / `AcceptStream`, and the `io.Writer` window against a
+caller-supplied buffer), with `-benchmem` so an allocation added to a hot path
+shows up as a number:
 
 ```bash
-go test -run '^$' -bench BenchmarkDecode -benchmem -count=8 -cpu=1 -benchtime=300ms
+go test -run '^$' -bench . -benchmem -count=8 -cpu=1 -benchtime=300ms
 ```
+
+`-count=8` and `benchstat` are worth the extra minute: on a shared machine a
+single run's wall-clock varies by more than most codec changes are worth.

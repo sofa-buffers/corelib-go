@@ -19,22 +19,38 @@ type cursor struct {
 	lim limits
 }
 
+// uvarint1 is the single-byte varint — every field header for id < 16, and every
+// small scalar, count and length word — and it is the reason this pair is split
+// in two. Returning (value, hit) instead of (value, error) keeps it under the
+// inline budget, so the common read costs one bounds-checked load, one compare
+// and an increment AT THE CALL SITE, with no call at all. Rolled into uvarint the
+// same body cost 104 against a budget of 80 — the uvarintSlow call node alone is
+// 57 — so every varint in a message paid a call/return pair to reach it.
+//
+// A miss means either the cursor is empty or the byte carries a continuation bit;
+// both are uvarintSlow's business, and it re-reads the byte itself, so a caller
+// hands the miss straight on without unwinding anything.
+func (c *cursor) uvarint1() (uint64, bool) {
+	if p := c.pos; p < len(c.buf) {
+		if b := c.buf[p]; b < 0x80 {
+			c.pos = p + 1
+			return uint64(b), true
+		}
+	}
+	return 0, false
+}
+
 // uvarint reads a base-128 varint at pos. If eofOK, a field boundary with no
 // bytes left is reported as io.EOF (clean end of stream); a varint truncated by
 // the end of the buffer is ErrIncomplete (INCOMPLETE, §7) — it ran out of bytes
 // mid-field. A varint that exceeds 64 bits is ErrInvalidMsg (malformed).
 //
-// The single-byte case (payload < 0x80 — every field header for id<16, and every
-// small scalar/count) is peeled into a lean fast path: one bounds-checked load and
-// a return, with none of the multi-byte loop's shift/overflow bookkeeping. That is
-// the common read, so it is worth the peel even though the two-value return keeps
-// uvarint just over the inline budget.
+// This is the (value, error) form for the readers off the innermost loop. The
+// loop in accept — where a message's headers and scalar values are read — spells
+// the uvarint1/uvarintSlow pair out instead, so the fast path lands inline there.
 func (c *cursor) uvarint(eofOK bool) (uint64, error) {
-	if p := c.pos; p < len(c.buf) {
-		if b := c.buf[p]; b < 0x80 {
-			c.pos = p + 1
-			return uint64(b), nil
-		}
+	if v, ok := c.uvarint1(); ok {
+		return v, nil
 	}
 	return c.uvarintSlow(eofOK)
 }
@@ -80,25 +96,28 @@ func (c *cursor) uvarintSlow(eofOK bool) (uint64, error) {
 	return 0, ErrIncomplete // ran off the end mid-varint: truncated, not malformed
 }
 
-// fillUnsigned decodes len(out) varint elements into out.
+// fillUnsigned decodes len(out) varint elements into out and reports how many it
+// decoded before stopping (len(out) on success).
 //
 // Decoding goes through decodeUvarintRun, the shared bulk decoder (varint.go).
 // Calling c.uvarint per element instead would pay three layers — the inlined
 // single-byte probe, the out-of-line uvarintSlow dispatch, and uvarintFast
 // itself — plus a reload of c.buf/c.pos from memory each time.
-// `bound` is the schema's declared element width, applied ONLY when the fill
-// fails: the elements already decoded are on the wire, and §5.2 makes one
-// outside its width outrank the truncation that stopped the read
-// (generator#267). Checking there rather than per element keeps the bulk decoder
-// a pure decode — where the array completes, the visitor's own guard sees every
-// element and reaches the same verdict.
-func (c *cursor) fillUnsigned(out []uint64, bound elemBound) error {
+//
+// It is a PURE DECODE: the schema's declared element width is not its business.
+// That bound only ever changes an outcome where the array fails to complete —
+// where it completes, the whole-slice callback fires and the visitor's own guard
+// sees every element — so the caller applies it to the prefix returned here, on
+// the error path and nowhere else (unsignedBoundErr, generator#267). Keeping it
+// out means the element loop below carries no bound to test and the caller need
+// not resolve one for an array that decodes cleanly.
+func (c *cursor) fillUnsigned(out []uint64) (int, error) {
 	buf, p := c.buf, c.pos
 	// Unsigned elements are the bulk decoder's own output type, so it fills the
 	// destination in place — no staging, no copy.
 	got, np, st := decodeUvarintRun(buf, p, out)
 	if st != varintOK {
-		return unsignedBoundErr(out[:got], bound, tailErr(st))
+		return got, tailErr(st)
 	}
 	p = np
 	// decodeUvarintRun stops on reaching the last maxVarintLen bytes of the
@@ -107,16 +126,17 @@ func (c *cursor) fillUnsigned(out []uint64, bound elemBound) error {
 	for i := got; i < len(out); i++ {
 		v, np, st := uvarintTail(buf, p)
 		if st != varintOK {
-			return unsignedBoundErr(out[:i], bound, tailErr(st))
+			return i, tailErr(st)
 		}
 		out[i], p = v, np
 	}
 	c.pos = p
-	return nil
+	return len(out), nil
 }
 
-// fillSigned is fillUnsigned for a zigzag-encoded signed array.
-func (c *cursor) fillSigned(out []int64, bound elemBound) error {
+// fillSigned is fillUnsigned for a zigzag-encoded signed array, with the same
+// decoded-prefix return and the same division of labour over the element bound.
+func (c *cursor) fillSigned(out []int64) (int, error) {
 	buf, p := c.buf, c.pos
 	// Signed elements are not the bulk decoder's output type, so a chunk is
 	// staged on the stack and zigzag-mapped out. varintChunk is sized so that
@@ -127,14 +147,11 @@ func (c *cursor) fillSigned(out []int64, bound elemBound) error {
 	for i < len(out) {
 		want := min(len(out)-i, varintChunk)
 		got, np, st := decodeUvarintRun(buf, p, stage[:want])
-		if st != varintOK {
-			for k, v := range stage[:got] {
-				out[i+k] = zigzagDecode(v)
-			}
-			return signedBoundErr(out[:i+got], bound, tailErr(st))
-		}
 		for k, v := range stage[:got] {
 			out[i+k] = zigzagDecode(v)
+		}
+		if st != varintOK {
+			return i + got, tailErr(st)
 		}
 		i, p = i+got, np
 		if got < want {
@@ -144,12 +161,12 @@ func (c *cursor) fillSigned(out []int64, bound elemBound) error {
 	for ; i < len(out); i++ {
 		v, np, st := uvarintTail(buf, p)
 		if st != varintOK {
-			return signedBoundErr(out[:i], bound, tailErr(st))
+			return i, tailErr(st)
 		}
 		out[i], p = zigzagDecode(v), np
 	}
 	c.pos = p
-	return nil
+	return len(out), nil
 }
 
 // unsignedBoundErr upgrades a failed fill to INVALID when an element already
@@ -238,9 +255,14 @@ func (c *cursor) take(n uint64) ([]byte, error) {
 // schema-bound source: a maxlen the schema declares for this id keeps the
 // receiver's string/blob cap off the field (§6.2.1, see SchemaBoundVisitor).
 func (c *cursor) fixlenHeader(id ID, sb schemaBound) (length, sub uint64, err error) {
-	h, err := c.uvarint(false)
-	if err != nil {
-		return 0, 0, err
+	// The uvarint1/uvarintSlow pair rather than uvarint: a fixlen word is a single
+	// byte for every payload under 32 bytes, and this function is itself too large
+	// to inline, so its varint read would otherwise be a second call.
+	h, ok := c.uvarint1()
+	if !ok {
+		if h, err = c.uvarintSlow(false); err != nil {
+			return 0, 0, err
+		}
 	}
 	length = h >> 3
 	sub = h & 0x07
@@ -257,10 +279,13 @@ func (c *cursor) fixlenHeader(id ID, sb schemaBound) (length, sub uint64, err er
 // array (§4.7/§4.8); only a count past arrayMax is rejected as ErrInvalidMsg.
 // The receiver's count cap is skipped for a field the schema bounds (§6.2.1),
 // which is what sb answers.
-func (c *cursor) arrayCount(id ID, sb schemaBound) (uint64, error) {
-	n, err := c.uvarint(false)
-	if err != nil {
-		return 0, err
+func (c *cursor) arrayCount(id ID, sb schemaBound) (n uint64, err error) {
+	// See fixlenHeader: the inline pair, since a count below 128 is one byte.
+	n, ok := c.uvarint1()
+	if !ok {
+		if n, err = c.uvarintSlow(false); err != nil {
+			return 0, err
+		}
 	}
 	if n > arrayMax {
 		return 0, ErrInvalidMsg
@@ -317,15 +342,20 @@ func (c *cursor) accept(v Visitor, depth int) error {
 	var policy spCache
 	sb := schemaBound{v: v}
 	for {
-		h, err := c.uvarint(true)
-		if err != nil {
-			if err == io.EOF {
-				if nested {
-					return ErrIncomplete // ended inside an open sequence (§7)
+		// The uvarint1/uvarintSlow pair, spelled out rather than called through
+		// uvarint, so the single-byte header — every id below 16 — decodes inline.
+		h, ok := c.uvarint1()
+		if !ok {
+			var err error
+			if h, err = c.uvarintSlow(true); err != nil {
+				if err == io.EOF {
+					if nested {
+						return ErrIncomplete // ended inside an open sequence (§7)
+					}
+					return nil
 				}
-				return nil
+				return err
 			}
-			return err
 		}
 		t := WireType(h & 0x07)
 		id := ID(h >> 3)
@@ -338,17 +368,23 @@ func (c *cursor) accept(v Visitor, depth int) error {
 		}
 		switch t {
 		case TypeVarintUnsigned:
-			x, err := c.uvarint(false)
-			if err != nil {
-				return err
+			x, ok := c.uvarint1()
+			if !ok {
+				var err error
+				if x, err = c.uvarintSlow(false); err != nil {
+					return err
+				}
 			}
 			if err := v.Unsigned(id, x); err != nil {
 				return err
 			}
 		case TypeVarintSigned:
-			x, err := c.uvarint(false)
-			if err != nil {
-				return err
+			x, ok := c.uvarint1()
+			if !ok {
+				var err error
+				if x, err = c.uvarintSlow(false); err != nil {
+					return err
+				}
 			}
 			if err := v.Signed(id, zigzagDecode(x)); err != nil {
 				return err
@@ -379,13 +415,20 @@ func (c *cursor) accept(v Visitor, depth int) error {
 			// element varint already provably overlong is INVALID, not truncation
 			// (issue #66) — and likewise one already outside its declared width
 			// (generator#267).
-			ub := elemBoundOf(bounds.of(v), id, ArrayUnsigned)
+			//
+			// The declared width is resolved in the two failure arms and nowhere
+			// else. An array that decodes whole reaches the visitor's own guard, so
+			// it needs no bound from here — and asking for one costs a
+			// v.(ElemBoundVisitor) assertion, which for a visitor without the
+			// extension is a failed itab lookup. Asked here, an ordinary array field
+			// paid it on every decode; asked in the arms, only a message that is
+			// already being rejected does.
 			if n > uint64(len(c.buf)-c.pos) {
-				return c.scanTruncatedArray(ub)
+				return c.scanTruncatedArray(elemBoundOf(bounds.of(v), id, ArrayUnsigned))
 			}
 			out := make([]uint64, n)
-			if err := c.fillUnsigned(out, ub); err != nil {
-				return err
+			if got, err := c.fillUnsigned(out); err != nil {
+				return unsignedBoundErr(out[:got], elemBoundOf(bounds.of(v), id, ArrayUnsigned), err)
 			}
 			if err := v.UnsignedArray(id, out); err != nil {
 				return err
@@ -400,17 +443,15 @@ func (c *cursor) accept(v Visitor, depth int) error {
 					return err
 				}
 			}
-			// See TypeVarintArrayUnsigned: a count larger than the bytes remaining
-			// is truncated, but scan the elements in hand first so a provably
-			// overlong varint — or one outside its declared width — stays INVALID
-			// (§5.2, issues #40 and #66, generator#267).
-			sb := elemBoundOf(bounds.of(v), id, ArraySigned)
+			// See TypeVarintArrayUnsigned, including why the declared element width
+			// is resolved inside the two failure arms and not before them (§5.2,
+			// issues #40 and #66, generator#267).
 			if n > uint64(len(c.buf)-c.pos) {
-				return c.scanTruncatedArray(sb)
+				return c.scanTruncatedArray(elemBoundOf(bounds.of(v), id, ArraySigned))
 			}
 			out := make([]int64, n)
-			if err := c.fillSigned(out, sb); err != nil {
-				return err
+			if got, err := c.fillSigned(out); err != nil {
+				return signedBoundErr(out[:got], elemBoundOf(bounds.of(v), id, ArraySigned), err)
 			}
 			if err := v.SignedArray(id, out); err != nil {
 				return err
@@ -555,14 +596,22 @@ func (c *cursor) acceptFixlenArray(v Visitor, hv HeaderVisitor, sb schemaBound, 
 			return err
 		}
 	}
+	// Both element loops advance a WINDOW over the payload and carry the element
+	// width in the loop condition, the same shape WriteFloat32Array uses on the
+	// encode side and for the same reason: `len(w) >= 4` proves the four-byte load
+	// in range and `i < len(out)` proves the store, so neither is bounds-checked.
+	// Indexing payload[i*4:] instead cost a slice bounds check per element, since
+	// the prove pass cannot relate i*4+4 to len(payload). take() already sized the
+	// payload at exactly width*n, so the window empties as the last element lands.
 	if kind == ArrayFp32 {
 		payload, err := c.take(n * 4)
 		if err != nil {
 			return err
 		}
 		out := make([]float32, n)
-		for i := range out {
-			out[i] = math.Float32frombits(binary.LittleEndian.Uint32(payload[i*4:]))
+		for i := 0; i < len(out) && len(payload) >= 4; i++ {
+			out[i] = math.Float32frombits(binary.LittleEndian.Uint32(payload))
+			payload = payload[4:]
 		}
 		return v.Float32Array(id, out)
 	}
@@ -571,8 +620,9 @@ func (c *cursor) acceptFixlenArray(v Visitor, hv HeaderVisitor, sb schemaBound, 
 		return err
 	}
 	out := make([]float64, n)
-	for i := range out {
-		out[i] = math.Float64frombits(binary.LittleEndian.Uint64(payload[i*8:]))
+	for i := 0; i < len(out) && len(payload) >= 8; i++ {
+		out[i] = math.Float64frombits(binary.LittleEndian.Uint64(payload))
+		payload = payload[8:]
 	}
 	return v.Float64Array(id, out)
 }
