@@ -330,6 +330,108 @@ func (d *Decoder) readRaw(n uint64) ([]byte, error) {
 // buffer grows incrementally as bytes arrive.
 const readRawChunk = 1 << 16
 
+// fixedWindow returns a window into the reader's OWN buffer holding at least
+// width bytes — usually more, everything currently buffered — without consuming
+// anything. The caller decodes as many fixed-width elements out of it as it
+// wants and then Discards exactly the bytes it used, so a run of fp32/fp64
+// values costs one Peek/Discard pair per buffer-full instead of one heap
+// allocation per element (issue #85). It is the fixed-width twin of what
+// readVarint/readVarintBatch already do for varints, and it allocates nothing:
+// this is a maxspeed corelib, so a value the reader already holds is decoded in
+// place rather than copied into a fresh slice first.
+//
+// A stream that ends with fewer than width bytes left is a payload truncated
+// mid-element: ErrIncomplete (§5.2/§7), never malformed. A genuine reader
+// failure is returned verbatim. Nothing is consumed on either.
+//
+// width is at most 8, well under bufio's minimum buffer size, so Peek can always
+// satisfy it when the stream can.
+func (d *Decoder) fixedWindow(width int) ([]byte, error) {
+	if avail := d.r.Buffered(); avail >= width {
+		// Already buffered: Peek reads nothing and cannot fail.
+		return d.r.Peek(avail)
+	}
+	w, err := d.r.Peek(width)
+	if len(w) >= width {
+		return w, nil
+	}
+	if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
+		return nil, err // a real reader failure, not a stream boundary
+	}
+	return nil, ErrIncomplete
+}
+
+// readFixed32 consumes one little-endian 4-byte value; readFixed64 the 8-byte
+// form. Both decode straight out of the reader's buffer (fixedWindow), so a
+// scalar fp32/fp64 field allocates nothing (issue #85).
+func (d *Decoder) readFixed32() (uint32, error) {
+	w, err := d.fixedWindow(4)
+	if err != nil {
+		return 0, err
+	}
+	v := binary.LittleEndian.Uint32(w)
+	d.r.Discard(4)
+	return v, nil
+}
+
+func (d *Decoder) readFixed64() (uint64, error) {
+	w, err := d.fixedWindow(8)
+	if err != nil {
+		return 0, err
+	}
+	v := binary.LittleEndian.Uint64(w)
+	d.r.Discard(8)
+	return v, nil
+}
+
+// readFloat32Elements reads n fp32 array elements, readFloat64Elements the fp64
+// form. Elements are decoded in batches straight out of the reader's buffer — as
+// many as it currently holds, never past the declared count — so the only
+// allocation left is the output slice's own growth (issue #85). This mirrors the
+// batch/tail split readUnsignedElements uses for varint arrays.
+//
+// Neither pre-allocates from the untrusted count (initialArrayCap, issue #40),
+// and neither consumes a partial element: a stream ending mid-array surfaces
+// ErrIncomplete from fixedWindow, with the elements decoded so far returned
+// alongside it exactly as the per-element reads did.
+func (d *Decoder) readFloat32Elements(n uint64) ([]float32, error) {
+	out := make([]float32, 0, initialArrayCap(n))
+	for uint64(len(out)) < n {
+		w, err := d.fixedWindow(4)
+		if err != nil {
+			return out, err
+		}
+		k := len(w) / 4
+		if left := n - uint64(len(out)); uint64(k) > left {
+			k = int(left)
+		}
+		for i := 0; i < k*4; i += 4 {
+			out = append(out, math.Float32frombits(binary.LittleEndian.Uint32(w[i:])))
+		}
+		d.r.Discard(k * 4)
+	}
+	return out, nil
+}
+
+func (d *Decoder) readFloat64Elements(n uint64) ([]float64, error) {
+	out := make([]float64, 0, initialArrayCap(n))
+	for uint64(len(out)) < n {
+		w, err := d.fixedWindow(8)
+		if err != nil {
+			return out, err
+		}
+		k := len(w) / 8
+		if left := n - uint64(len(out)); uint64(k) > left {
+			k = int(left)
+		}
+		for i := 0; i < k*8; i += 8 {
+			out = append(out, math.Float64frombits(binary.LittleEndian.Uint64(w[i:])))
+		}
+		d.r.Discard(k * 8)
+	}
+	return out, nil
+}
+
 // initialArrayCap chooses a starting capacity for a decoded array that never
 // pre-allocates from the untrusted wire count: the slice grows via append as
 // elements actually decode, so a hostile count costs memory only in proportion
@@ -441,12 +543,12 @@ func (d *Decoder) Float32() (float32, error) {
 		// declared type disagreeing with a well-formed word: skip the payload.
 		return 0, d.skipMismatchedPayload(n)
 	}
-	buf, err := d.readRaw(4)
+	bits, err := d.readFixed32()
 	if err != nil {
 		return 0, err
 	}
 	d.needConsume = false
-	return math.Float32frombits(binary.LittleEndian.Uint32(buf)), nil
+	return math.Float32frombits(bits), nil
 }
 
 // Float64 consumes the current field as a 64-bit float. A field of another wire
@@ -464,12 +566,12 @@ func (d *Decoder) Float64() (float64, error) {
 	if sub != fixFp64 {
 		return 0, d.skipMismatchedPayload(n)
 	}
-	buf, err := d.readRaw(8)
+	bits, err := d.readFixed64()
 	if err != nil {
 		return 0, err
 	}
 	d.needConsume = false
-	return math.Float64frombits(binary.LittleEndian.Uint64(buf)), nil
+	return math.Float64frombits(bits), nil
 }
 
 // String consumes the current field as a string. When strict UTF-8 is enabled
@@ -806,13 +908,9 @@ func (d *Decoder) ReadFloat32Array() ([]float32, error) {
 		d.needConsume = false
 		return []float32{}, nil
 	}
-	out := make([]float32, 0, initialArrayCap(n))
-	for i := uint64(0); i < n; i++ {
-		buf, err := d.readRaw(4)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, math.Float32frombits(binary.LittleEndian.Uint32(buf)))
+	out, err := d.readFloat32Elements(n)
+	if err != nil {
+		return nil, err
 	}
 	d.needConsume = false
 	return out, nil
@@ -842,13 +940,9 @@ func (d *Decoder) ReadFloat64Array() ([]float64, error) {
 		d.needConsume = false
 		return []float64{}, nil
 	}
-	out := make([]float64, 0, initialArrayCap(n))
-	for i := uint64(0); i < n; i++ {
-		buf, err := d.readRaw(8)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, math.Float64frombits(binary.LittleEndian.Uint64(buf)))
+	out, err := d.readFloat64Elements(n)
+	if err != nil {
+		return nil, err
 	}
 	d.needConsume = false
 	return out, nil

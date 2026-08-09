@@ -1,7 +1,6 @@
 package sofab
 
 import (
-	"encoding/binary"
 	"io"
 	"math"
 )
@@ -146,20 +145,20 @@ func (d *Decoder) acceptStreamFixlen(v Visitor, hv HeaderVisitor, sp *spCache, s
 		if n != 4 {
 			return ErrInvalidMsg
 		}
-		b, err := d.readRaw(4)
+		bits, err := d.readFixed32()
 		if err != nil {
 			return err
 		}
-		return v.Float32(id, math.Float32frombits(binary.LittleEndian.Uint32(b)))
+		return v.Float32(id, math.Float32frombits(bits))
 	case fixFp64:
 		if n != 8 {
 			return ErrInvalidMsg
 		}
-		b, err := d.readRaw(8)
+		bits, err := d.readFixed64()
 		if err != nil {
 			return err
 		}
-		return v.Float64(id, math.Float64frombits(binary.LittleEndian.Uint64(b)))
+		return v.Float64(id, math.Float64frombits(bits))
 	case fixStr:
 		b, err := d.readRaw(n)
 		if err != nil {
@@ -277,24 +276,22 @@ func (d *Decoder) acceptStreamFixlenArray(v Visitor, hv HeaderVisitor, sb schema
 			return err
 		}
 	}
+	// Elements are staged in batches out of the reader's own buffer
+	// (readFloat32Elements / readFloat64Elements), the way the integer arrays
+	// above go through readVarintBatch: one element per heap allocation is not a
+	// streaming cost, it is allocator traffic, and this is a maxspeed corelib
+	// (issue #85). The outcomes are unchanged — a payload ending mid-element is
+	// still ErrIncomplete, at whatever byte boundary the reader delivers.
 	if kind == ArrayFp32 {
-		out := make([]float32, 0, initialArrayCap(n))
-		for i := uint64(0); i < n; i++ {
-			b, err := d.readRaw(4)
-			if err != nil {
-				return err
-			}
-			out = append(out, math.Float32frombits(binary.LittleEndian.Uint32(b)))
-		}
-		return v.Float32Array(id, out)
-	}
-	out := make([]float64, 0, initialArrayCap(n))
-	for i := uint64(0); i < n; i++ {
-		b, err := d.readRaw(8)
+		out, err := d.readFloat32Elements(n)
 		if err != nil {
 			return err
 		}
-		out = append(out, math.Float64frombits(binary.LittleEndian.Uint64(b)))
+		return v.Float32Array(id, out)
+	}
+	out, err := d.readFloat64Elements(n)
+	if err != nil {
+		return err
 	}
 	return v.Float64Array(id, out)
 }
