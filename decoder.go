@@ -299,10 +299,58 @@ func initialArrayCap(n uint64) int {
 	return cap0
 }
 
-// Unsigned consumes the current field as an unsigned integer.
+// bind admits a typed read of wire type want on the current field.
+//
+// It returns nil when the field is that type and its value is still unconsumed.
+// When the wire type contradicts want it is the MESSAGE_SPEC §7.3 case — the
+// field must be skipped exactly like an unknown id and the decode stays COMPLETE
+// — so the value is consumed here and ErrTypeMismatch is returned, leaving the
+// decoder on the next field boundary. Reporting that as ErrInvalidMsg would call
+// a well-formed message malformed (the same bytes decode fine for a peer whose
+// schema declares the other type), and reporting it as a caller mistake is the
+// "invalid usage" code §6.3 deleted: nothing at the call distinguishes a
+// mis-typed read from a peer that sent another type for the id (issue #79).
+//
+// A sequence start/end carries no value, so nothing can be consumed on its
+// behalf: it is still ErrTypeMismatch, and the caller skips the sub-tree with
+// Skip as it does for an unknown id. What is left — no current field, or a value
+// already consumed — is the genuine caller mistake and is ErrArgument.
+func (d *Decoder) bind(want WireType) error {
+	if d.cur.Type == want {
+		if d.needConsume {
+			return nil
+		}
+		return ErrArgument // nothing to read: no field, or already consumed
+	}
+	if d.needConsume {
+		if err := d.skipValue(); err != nil {
+			return err // truncated or malformed: that verdict wins
+		}
+		return ErrTypeMismatch
+	}
+	if d.cur.Type == TypeSequenceStart || d.cur.Type == TypeSequenceEnd {
+		return ErrTypeMismatch // no value to consume; Skip walks the sub-tree
+	}
+	return ErrArgument
+}
+
+// skipMismatchedPayload discards n already-framed payload bytes of a fixlen (or
+// fixlen-array) field whose subtype contradicts the requested type, and reports
+// the §7.3 skip. Truncation while discarding is INCOMPLETE, exactly as it would
+// be for the matching read.
+func (d *Decoder) skipMismatchedPayload(n uint64) error {
+	d.needConsume = false
+	if _, err := d.r.Discard(int(n)); err != nil {
+		return eofToIncomplete(err)
+	}
+	return ErrTypeMismatch
+}
+
+// Unsigned consumes the current field as an unsigned integer. A field of another
+// wire type is skipped and reported as ErrTypeMismatch (§7.3).
 func (d *Decoder) Unsigned() (uint64, error) {
-	if !d.needConsume || d.cur.Type != TypeVarintUnsigned {
-		return 0, ErrUsage
+	if err := d.bind(TypeVarintUnsigned); err != nil {
+		return 0, err
 	}
 	v, err := d.readVarint(false)
 	if err != nil {
@@ -312,10 +360,11 @@ func (d *Decoder) Unsigned() (uint64, error) {
 	return v, nil
 }
 
-// Signed consumes the current field as a signed integer.
+// Signed consumes the current field as a signed integer. A field of another wire
+// type is skipped and reported as ErrTypeMismatch (§7.3).
 func (d *Decoder) Signed() (int64, error) {
-	if !d.needConsume || d.cur.Type != TypeVarintSigned {
-		return 0, ErrUsage
+	if err := d.bind(TypeVarintSigned); err != nil {
+		return 0, err
 	}
 	v, err := d.readVarint(false)
 	if err != nil {
@@ -331,17 +380,22 @@ func (d *Decoder) Bool() (bool, error) {
 	return v != 0, err
 }
 
-// Float32 consumes the current field as a 32-bit float.
+// Float32 consumes the current field as a 32-bit float. A field of another wire
+// type — or a fixlen carrying another subtype (fp64, string, blob) — is skipped
+// and reported as ErrTypeMismatch (§7.3); a malformed fixlen word (reserved
+// subtype, wrong width) stays ErrInvalidMsg.
 func (d *Decoder) Float32() (float32, error) {
-	if !d.needConsume || d.cur.Type != TypeFixlen {
-		return 0, ErrUsage
+	if err := d.bind(TypeFixlen); err != nil {
+		return 0, err
 	}
 	n, sub, err := d.readFixlenHeader()
 	if err != nil {
 		return 0, err
 	}
-	if sub != fixFp32 || n != 4 {
-		return 0, ErrInvalidMsg
+	if sub != fixFp32 {
+		// readFixlenHeader already ruled on the framing, so this is purely the
+		// declared type disagreeing with a well-formed word: skip the payload.
+		return 0, d.skipMismatchedPayload(n)
 	}
 	buf, err := d.readRaw(4)
 	if err != nil {
@@ -351,17 +405,20 @@ func (d *Decoder) Float32() (float32, error) {
 	return math.Float32frombits(binary.LittleEndian.Uint32(buf)), nil
 }
 
-// Float64 consumes the current field as a 64-bit float.
+// Float64 consumes the current field as a 64-bit float. A field of another wire
+// type — or a fixlen carrying another subtype (fp32, string, blob) — is skipped
+// and reported as ErrTypeMismatch (§7.3); a malformed fixlen word (reserved
+// subtype, wrong width) stays ErrInvalidMsg.
 func (d *Decoder) Float64() (float64, error) {
-	if !d.needConsume || d.cur.Type != TypeFixlen {
-		return 0, ErrUsage
+	if err := d.bind(TypeFixlen); err != nil {
+		return 0, err
 	}
 	n, sub, err := d.readFixlenHeader()
 	if err != nil {
 		return 0, err
 	}
-	if sub != fixFp64 || n != 8 {
-		return 0, ErrInvalidMsg
+	if sub != fixFp64 {
+		return 0, d.skipMismatchedPayload(n)
 	}
 	buf, err := d.readRaw(8)
 	if err != nil {
@@ -391,24 +448,27 @@ func (d *Decoder) String() (string, error) {
 	return string(b), nil
 }
 
-// Bytes consumes the current field as a binary blob.
+// Bytes consumes the current field as a binary blob. A field of another wire
+// type, or a fixlen carrying another subtype, is skipped and reported as
+// ErrTypeMismatch (§7.3).
 func (d *Decoder) Bytes() ([]byte, error) {
 	return d.fixlenBytes(fixBlob)
 }
 
 // fixlenBytes consumes the current fixlen field, requiring its subtype to equal
 // want (fixStr or fixBlob), and returns the raw payload. It backs String and
-// Bytes. A wrong field type is ErrUsage; a mismatched subtype is ErrInvalidMsg.
+// Bytes. A contradicting wire type or subtype is the §7.3 skip
+// (ErrTypeMismatch); only a malformed fixlen word is ErrInvalidMsg.
 func (d *Decoder) fixlenBytes(want uint64) ([]byte, error) {
-	if !d.needConsume || d.cur.Type != TypeFixlen {
-		return nil, ErrUsage
+	if err := d.bind(TypeFixlen); err != nil {
+		return nil, err
 	}
 	n, sub, err := d.readFixlenHeader()
 	if err != nil {
 		return nil, err
 	}
 	if sub != want {
-		return nil, ErrInvalidMsg
+		return nil, d.skipMismatchedPayload(n)
 	}
 	buf, err := d.readRaw(n)
 	if err != nil {
@@ -517,20 +577,12 @@ func (d *Decoder) skipValue() error {
 			return err
 		}
 		// A fixlen array always carries its fixlen_word, even when empty (§4.8);
-		// only the payload is elided for a zero count.
-		h, err := d.readVarint(false)
+		// only the payload is elided for a zero count. The word is validated
+		// (fixlenArrayElem) just as cursor.acceptFixlenArray and
+		// acceptStreamFixlenArray do, so a skip is a jump over a checked stride.
+		_, size, err := d.fixlenArrayElem()
 		if err != nil {
 			return err
-		}
-		sub := h & 0x07
-		size := h >> 3
-		// §4.8 admits only fp32/4 and fp64/8 as fixlen-array elements. Anything
-		// else — a string/blob subtype, a width that contradicts its subtype — is
-		// malformed regardless of the schema, so a skip rejects it just as
-		// cursor.acceptFixlenArray and acceptStreamFixlenArray do; the size would
-		// otherwise be an attacker-chosen stride the parser resynchronises on.
-		if !((sub == fixFp32 && size == 4) || (sub == fixFp64 && size == 8)) {
-			return ErrInvalidMsg
 		}
 		_, err = d.r.Discard(int(n) * int(size))
 		return eofToIncomplete(err)
@@ -555,9 +607,10 @@ func (d *Decoder) arrayCount() (uint64, error) {
 }
 
 // ReadUnsignedArray consumes the current field as an array of unsigned integers.
+// A field of another wire type is skipped and reported as ErrTypeMismatch (§7.3).
 func ReadUnsignedArray[T Unsigned](d *Decoder) ([]T, error) {
-	if !d.needConsume || d.cur.Type != TypeVarintArrayUnsigned {
-		return nil, ErrUsage
+	if err := d.bind(TypeVarintArrayUnsigned); err != nil {
+		return nil, err
 	}
 	n, err := d.arrayCount()
 	if err != nil {
@@ -589,10 +642,11 @@ func ReadUnsignedArray[T Unsigned](d *Decoder) ([]T, error) {
 	return out, nil
 }
 
-// ReadSignedArray consumes the current field as an array of signed integers.
+// ReadSignedArray consumes the current field as an array of signed integers. A
+// field of another wire type is skipped and reported as ErrTypeMismatch (§7.3).
 func ReadSignedArray[T Signed](d *Decoder) ([]T, error) {
-	if !d.needConsume || d.cur.Type != TypeVarintArraySigned {
-		return nil, ErrUsage
+	if err := d.bind(TypeVarintArraySigned); err != nil {
+		return nil, err
 	}
 	n, err := d.arrayCount()
 	if err != nil {
@@ -622,10 +676,30 @@ func ReadSignedArray[T Signed](d *Decoder) ([]T, error) {
 	return out, nil
 }
 
-// ReadFloat32Array consumes the current field as an array of 32-bit floats.
+// fixlenArrayElem reads a fixlen array's element header (§4.8) and returns the
+// element subtype and width. §4.8 admits only fp32/4 and fp64/8; anything else —
+// a string/blob subtype, a width contradicting its subtype — is malformed
+// regardless of the schema and is ErrInvalidMsg, never a §7.3 skip, since the
+// width would otherwise be an attacker-chosen stride the parser resynchronises
+// on.
+func (d *Decoder) fixlenArrayElem() (sub, size uint64, err error) {
+	h, err := d.readVarint(false)
+	if err != nil {
+		return 0, 0, err
+	}
+	sub, size = h&0x07, h>>3
+	if !((sub == fixFp32 && size == 4) || (sub == fixFp64 && size == 8)) {
+		return 0, 0, ErrInvalidMsg
+	}
+	return sub, size, nil
+}
+
+// ReadFloat32Array consumes the current field as an array of 32-bit floats. A
+// field of another wire type, or a fixlen array whose elements are fp64, is
+// skipped and reported as ErrTypeMismatch (§7.3).
 func (d *Decoder) ReadFloat32Array() ([]float32, error) {
-	if !d.needConsume || d.cur.Type != TypeFixlenArray {
-		return nil, ErrUsage
+	if err := d.bind(TypeFixlenArray); err != nil {
+		return nil, err
 	}
 	n, err := d.arrayCount()
 	if err != nil {
@@ -633,12 +707,15 @@ func (d *Decoder) ReadFloat32Array() ([]float32, error) {
 	}
 	// The fixlen_word is always present, even for an empty array (§4.8), so read
 	// and validate it before the (possibly zero) payload.
-	h, err := d.readVarint(false)
+	sub, size, err := d.fixlenArrayElem()
 	if err != nil {
 		return nil, err
 	}
-	if (h&0x07) != fixFp32 || (h>>3) != 4 {
-		return nil, ErrInvalidMsg
+	if sub != fixFp32 {
+		// A well-formed fp64 element word: the declared type does not match this
+		// field, so its payload is skipped (§7.3). n ≤ arrayMax and size ≤ 8, so
+		// the product is at most 2^34 and the int conversion cannot wrap.
+		return nil, d.skipMismatchedPayload(n * size)
 	}
 	if n == 0 {
 		d.needConsume = false
@@ -656,10 +733,12 @@ func (d *Decoder) ReadFloat32Array() ([]float32, error) {
 	return out, nil
 }
 
-// ReadFloat64Array consumes the current field as an array of 64-bit floats.
+// ReadFloat64Array consumes the current field as an array of 64-bit floats. A
+// field of another wire type, or a fixlen array whose elements are fp32, is
+// skipped and reported as ErrTypeMismatch (§7.3).
 func (d *Decoder) ReadFloat64Array() ([]float64, error) {
-	if !d.needConsume || d.cur.Type != TypeFixlenArray {
-		return nil, ErrUsage
+	if err := d.bind(TypeFixlenArray); err != nil {
+		return nil, err
 	}
 	n, err := d.arrayCount()
 	if err != nil {
@@ -667,12 +746,12 @@ func (d *Decoder) ReadFloat64Array() ([]float64, error) {
 	}
 	// The fixlen_word is always present, even for an empty array (§4.8), so read
 	// and validate it before the (possibly zero) payload.
-	h, err := d.readVarint(false)
+	sub, size, err := d.fixlenArrayElem()
 	if err != nil {
 		return nil, err
 	}
-	if (h&0x07) != fixFp64 || (h>>3) != 8 {
-		return nil, ErrInvalidMsg
+	if sub != fixFp64 {
+		return nil, d.skipMismatchedPayload(n * size)
 	}
 	if n == 0 {
 		d.needConsume = false
