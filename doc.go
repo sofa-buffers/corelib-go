@@ -15,9 +15,15 @@
 //
 // # Streaming
 //
-// Encoding targets an io.Writer, so the encoder never holds the whole message in
-// memory — messages larger than RAM can be streamed straight to a socket or
-// file. The decoder offers two styles:
+// Encoding writes into an output buffer that is drained as it fills, so the
+// encoder never holds the whole message in memory — messages larger than RAM can
+// be streamed straight to a socket or file. That buffer is the caller's:
+// NewEncoderBuffer takes one with no sink (it holds the message, or reports
+// ErrBufferFull), NewEncoderSink takes one plus a flush callback, and both take
+// a start offset that leaves room at the front for a framing header
+// (CORELIB_PLAN §5.1; MinOutputBuffer says how small such a buffer may be).
+// NewEncoder is the io.Writer convenience form, and the only one that allocates
+// a window of its own. The decoder offers two styles:
 //
 //   - Pull: call Decoder.Next to get the next field header, then a typed reader
 //     (or Skip) to consume its value. It streams one field at a time, never
