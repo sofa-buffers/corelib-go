@@ -772,3 +772,97 @@ func TestSkipFixlenArrayHonoursArrayCountLimit(t *testing.T) {
 		t.Fatalf("AcceptBytes at the cap = %v, want clean decode", err)
 	}
 }
+
+// TestPullNextEnforcesMaxDepth covers issue #78: MAX_DEPTH = 255 (§4.9/§6.2) is a
+// property of the wire format, so it binds the pull surface exactly as it binds
+// the two visitor kernels. Decoder carried no depth state at all: Next handed
+// back sequence-start headers for as long as the stream offered them, so a plain
+// pull loop walked an arbitrarily deep message to COMPLETE while AcceptBytes on
+// the same bytes returned ErrInvalidMsg — the two surfaces disagreed on whether
+// the message was well-formed. A generated decoder driving Next therefore had no
+// ceiling on the nesting an attacker could impose on its own scope stack.
+func TestPullNextEnforcesMaxDepth(t *testing.T) {
+	// 0x06 = sequence start id 0, 0x07 = sequence end id 0.
+	deep := append(bytes.Repeat([]byte{0x06}, 1000), bytes.Repeat([]byte{0x07}, 1000)...)
+
+	// The visitor path is the reference outcome for these bytes.
+	if err := sofab.AcceptBytes(deep, baseV{}); !errors.Is(err, sofab.ErrInvalidMsg) {
+		t.Fatalf("AcceptBytes deep = %v, want ErrInvalidMsg", err)
+	}
+
+	// A pull loop that only calls Next must reach the same verdict, and must do
+	// so exactly at the 256th open: MaxDepth nested sequences are legal.
+	d := newDec(deep)
+	for i := 0; i < sofab.MaxDepth; i++ {
+		f, err := d.Next()
+		if err != nil {
+			t.Fatalf("Next at depth %d = %v, want a sequence start", i+1, err)
+		}
+		if f.Type != sofab.TypeSequenceStart {
+			t.Fatalf("Next at depth %d = type %v, want TypeSequenceStart", i+1, f.Type)
+		}
+	}
+	if _, err := d.Next(); !errors.Is(err, sofab.ErrInvalidMsg) {
+		t.Fatalf("Next opening depth %d = %v, want ErrInvalidMsg", sofab.MaxDepth+1, err)
+	}
+
+	// And the whole-stream drain agrees, on both the Skip and the auto-skip leg.
+	for _, autoSkip := range []bool{false, true} {
+		if _, err := drainPull(deep, autoSkip); !errors.Is(err, sofab.ErrInvalidMsg) {
+			t.Fatalf("drainPull(autoSkip=%v) = %v, want ErrInvalidMsg", autoSkip, err)
+		}
+	}
+}
+
+// TestPullSkipDepthIsAbsolute pins the second half of issue #78: Skip's own
+// counter was relative to the scope the skip started in, so nesting already
+// established by earlier Next calls was invisible to it. Descending 200 scopes by
+// hand and then skipping a 200-deep sub-tree reached a total wire depth of 400
+// and still returned nil. The depth ceiling belongs to the decoder, not to one
+// call, so Skip now inherits it from Next.
+func TestPullSkipDepthIsAbsolute(t *testing.T) {
+	const half = 200
+	in := append(bytes.Repeat([]byte{0x06}, 2*half), bytes.Repeat([]byte{0x07}, 2*half)...)
+
+	d := newDec(in)
+	for i := 0; i < half; i++ {
+		if _, err := d.Next(); err != nil {
+			t.Fatalf("Next at depth %d = %v", i+1, err)
+		}
+	}
+	// The scope opened here sits at wire depth half+1; skipping it walks another
+	// half-1 opens, i.e. past MaxDepth in absolute terms.
+	if _, err := d.Next(); err != nil {
+		t.Fatalf("Next at depth %d = %v", half+1, err)
+	}
+	if err := d.Skip(); !errors.Is(err, sofab.ErrInvalidMsg) {
+		t.Fatalf("Skip of a sub-tree crossing MaxDepth = %v, want ErrInvalidMsg", err)
+	}
+}
+
+// TestPullDanglingSequenceEnd covers the other §6.3 InvalidMessage case issue #78
+// found open on the pull surface: "a sequence-end marker with no open sequence".
+// Both visitor kernels reject it; Next used to return it as an ordinary header,
+// so a pull loop reported COMPLETE on bytes the same library called malformed.
+func TestPullDanglingSequenceEnd(t *testing.T) {
+	cases := []struct {
+		name string
+		in   []byte
+	}{
+		{"lone end", []byte{0x07}},
+		{"end after a balanced sequence", []byte{0x06, 0x07, 0x07}},
+		{"end after a scalar", []byte{0x00, 0x7F, 0x07}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := sofab.AcceptBytes(tc.in, baseV{}); !errors.Is(err, sofab.ErrInvalidMsg) {
+				t.Fatalf("AcceptBytes = %v, want ErrInvalidMsg", err)
+			}
+			for _, autoSkip := range []bool{false, true} {
+				if _, err := drainPull(tc.in, autoSkip); !errors.Is(err, sofab.ErrInvalidMsg) {
+					t.Fatalf("drainPull(autoSkip=%v) = %v, want ErrInvalidMsg", autoSkip, err)
+				}
+			}
+		})
+	}
+}

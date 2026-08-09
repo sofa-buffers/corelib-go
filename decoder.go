@@ -20,6 +20,7 @@ type Decoder struct {
 	r           *bufio.Reader // pull-parser buffer, created lazily on first Next
 	cur         Field
 	needConsume bool // a value-bearing field header is read but not yet consumed
+	depth       int  // sequences open on this stream (0 at the top level), §4.9
 	lim         limits
 }
 
@@ -47,6 +48,14 @@ func asBufio(r io.Reader) *bufio.Reader {
 // caller must consume the value (typed reader or Skip) before the following
 // Next; an unconsumed scalar/array/fixlen value is auto-skipped. Sequence
 // start/end markers carry no value. Returns io.EOF at the end of the stream.
+//
+// Next owns the stream's nesting state (§4.9): it counts the sequences the
+// stream has opened, rejects the one that would nest past MaxDepth, and rejects
+// a sequence-end marker that closes nothing — both ErrInvalidMsg (§6.3). The
+// count is a property of the stream, not of any one call, so every pull consumer
+// inherits the same ceiling the visitor kernels apply (cursor.accept,
+// Decoder.acceptStream) and the three surfaces agree on which messages are
+// well-formed (issue #78).
 func (d *Decoder) Next() (Field, error) {
 	if d.r == nil {
 		d.r = asBufio(d.src)
@@ -70,7 +79,23 @@ func (d *Decoder) Next() (Field, error) {
 	case TypeVarintUnsigned, TypeVarintSigned, TypeFixlen,
 		TypeVarintArrayUnsigned, TypeVarintArraySigned, TypeFixlenArray:
 		d.needConsume = true
-	case TypeSequenceStart, TypeSequenceEnd:
+	case TypeSequenceStart:
+		// MaxDepth nested sequences are legal; the one past it is malformed
+		// regardless of what follows (§4.9/§6.2), so it is refused here rather
+		// than handed to the caller as an ordinary header for its own scope
+		// stack to absorb.
+		if d.depth >= MaxDepth {
+			return Field{}, ErrInvalidMsg
+		}
+		d.depth++
+		d.needConsume = false
+	case TypeSequenceEnd:
+		// An end marker with no open sequence is InvalidMessage (§6.3): the
+		// stream is unbalanced, not merely surprising.
+		if d.depth == 0 {
+			return Field{}, ErrInvalidMsg
+		}
+		d.depth--
 		d.needConsume = false
 	default:
 		return Field{}, ErrInvalidMsg
@@ -398,8 +423,15 @@ func (d *Decoder) fixlenBytes(want uint64) ([]byte, error) {
 func (d *Decoder) Skip() error {
 	switch d.cur.Type {
 	case TypeSequenceStart:
-		depth := 1
-		for depth > 0 {
+		// A plain walk to the matching end. The counter is only how far this
+		// call has descended below its starting scope — the MaxDepth ceiling is
+		// the decoder's, applied by Next against the stream's absolute depth
+		// (§4.9). Checking a relative counter here was the bug: nesting already
+		// established by earlier Next calls was invisible to it, so a skip that
+		// started 200 scopes deep could walk 200 more and still return nil
+		// (issue #78).
+		open := 1
+		for open > 0 {
 			f, err := d.Next()
 			if err == io.EOF {
 				return ErrIncomplete // sequence never closed: truncated (§7)
@@ -409,12 +441,9 @@ func (d *Decoder) Skip() error {
 			}
 			switch f.Type {
 			case TypeSequenceStart:
-				depth++
-				if depth > MaxDepth {
-					return ErrInvalidMsg
-				}
+				open++
 			case TypeSequenceEnd:
-				depth--
+				open--
 			default:
 				if err := d.skipValue(); err != nil {
 					return err

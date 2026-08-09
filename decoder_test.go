@@ -250,13 +250,14 @@ func TestOverlongVarintInvalid(t *testing.T) {
 }
 
 func TestDanglingSequenceEndInvalid(t *testing.T) {
-	// header 0x07 = id 0, type SequenceEnd. The pull decoder surfaces it as a
-	// token; a generated decoder treats an unmatched end as end-of-message. Here
-	// we just confirm it decodes to the right token type.
+	// header 0x07 = id 0, type SequenceEnd with nothing open. §6.3 names an
+	// unbalanced sequence end as InvalidMessage, so the pull surface rejects it
+	// rather than surfacing it as a token the caller has to judge (issue #78);
+	// the visitor kernels already did. Balanced end markers are covered by the
+	// nesting round-trips (TestMaxDepthRoundTrip, TestSkipSequenceEndIsNoop).
 	d := newDec([]byte{0x07})
-	f, err := d.Next()
-	if err != nil || f.Type != sofab.TypeSequenceEnd {
-		t.Fatalf("got %+v %v", f, err)
+	if _, err := d.Next(); !errors.Is(err, sofab.ErrInvalidMsg) {
+		t.Fatalf("Next on a dangling end = %v, want ErrInvalidMsg", err)
 	}
 }
 
