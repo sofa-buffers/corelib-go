@@ -54,7 +54,7 @@ import sofab "github.com/sofa-buffers/corelib-go"
 | Two decode styles | Pull with `Decoder.Next`, or implement [`Visitor`] and call `Decoder.Accept`, which binds each field into a struct member — what generated `Unmarshal` uses. `AcceptBytes` is the zero-copy form for a message already in a `[]byte`. |
 | No dependencies | Standard library only, no `cgo`. |
 | Sticky errors | The encoder records the first failure and turns later writes into no-ops, so generated `Marshal` can issue a run of writes and check once at `Flush`. |
-| Generics for arrays | `WriteUnsignedArray[T]` / `ReadUnsignedArray[T]` (and signed variants) accept any `~uint8..~uint64` / `~int8..~int64` element type; float arrays have dedicated methods. |
+| Generics for arrays | `WriteUnsignedArray[T]` / `ReadUnsignedArray[T]` (and signed variants) accept any `~uint8..~uint64` / `~int8..~int64` element type; float arrays have dedicated methods. On decode `T` doubles as the declared-width bound (MESSAGE_SPEC §7.1) — see [below](#an-integer-arrays-declared-element-width). |
 | Forward/backward compatible | Unknown fields are consumed with `Skip()` — old readers tolerate new fields, new readers tolerate missing ones. |
 | Canonical sequence framing | `WriteSequenceBeginLazy` holds a sequence header back until the sequence gets content, so an all-default sequence **field** is omitted rather than framed empty (MESSAGE_SPEC §2) — in one forward pass, without buffering the sub-message. A wrapper-array **element** keeps its frame even when all-default, since element presence is what carries a dynamic array's length (§5.1); it closes with `WriteSequenceEndKeep`, which forces the frame out. The hold-back has no depth bound of its own: the pending run grows with the nesting, so every sequence up to `MaxDepth` is canonical (CORELIB_PLAN §6). |
 
@@ -123,6 +123,28 @@ The count belongs to the decoder, not to one call, so `Skip()` over a sub-tree i
 held to the same absolute ceiling, and a pull loop reaches the same verdict as
 `Accept` / `AcceptBytes` on the same bytes. A balanced end marker is still
 delivered as an ordinary `TypeSequenceEnd` header.
+
+#### An integer array's declared element width
+
+`ReadUnsignedArray[T]` / `ReadSignedArray[T]` take the schema's element type as
+`T`, and that type is a **validity bound**, not a cast: an element the declared
+width cannot hold is `ErrInvalidMsg` (MESSAGE_SPEC §7.1), never quietly masked
+down. An `array<u8>` carrying `300` is a rejected message, not `44`:
+
+```go
+v, err := sofab.ReadUnsignedArray[uint8](d)
+// 300 on the wire => err = ErrInvalidMsg, v = nil
+```
+
+Each element is judged as it decodes, so an over-width element that is fully on
+the wire outranks a truncation behind it (§5.2: INVALID beats INCOMPLETE), and
+`uint64` / `int64` — which span the value domain — cost nothing, since no wire
+value can breach them. The visitor surface hands over a whole `[]uint64` at once
+and so cannot see the width itself; there the bound travels in through the
+optional `ElemBoundVisitor` (`ArrayElemBound(id, kind)`), which generated code
+implements, and both surfaces then reach the same verdict on the same bytes.
+`NarrowUnsigned` / `NarrowSigned` are plain conversions for that visitor path and
+assume the bound has already been applied.
 
 #### When the reader's type disagrees with the wire
 

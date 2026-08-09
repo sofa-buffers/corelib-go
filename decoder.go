@@ -608,6 +608,13 @@ func (d *Decoder) arrayCount() (uint64, error) {
 
 // ReadUnsignedArray consumes the current field as an array of unsigned integers.
 // A field of another wire type is skipped and reported as ErrTypeMismatch (§7.3).
+//
+// T is the element width the SCHEMA declares, so this reader carries the
+// MESSAGE_SPEC §7.1 bound itself and needs no ElemBoundVisitor: an element the
+// declared type cannot hold is ErrInvalidMsg, never the silent narrowing §7.1
+// forbids (issue #83). It is judged as each element decodes, so an over-width
+// element already on the wire outranks a truncation behind it (§5.2, INVALID
+// over INCOMPLETE) — the pull twin of the visitor path's ElemBoundVisitor.
 func ReadUnsignedArray[T Unsigned](d *Decoder) ([]T, error) {
 	if err := d.bind(TypeVarintArrayUnsigned); err != nil {
 		return nil, err
@@ -631,11 +638,19 @@ func ReadUnsignedArray[T Unsigned](d *Decoder) ([]T, error) {
 			if err != nil {
 				return nil, err
 			}
-			out = append(out, T(v))
+			e := T(v)
+			if uint64(e) != v {
+				return nil, ErrInvalidMsg
+			}
+			out = append(out, e)
 			continue
 		}
 		for _, v := range stage[:got] {
-			out = append(out, T(v))
+			e := T(v)
+			if uint64(e) != v {
+				return nil, ErrInvalidMsg
+			}
+			out = append(out, e)
 		}
 	}
 	d.needConsume = false
@@ -644,6 +659,11 @@ func ReadUnsignedArray[T Unsigned](d *Decoder) ([]T, error) {
 
 // ReadSignedArray consumes the current field as an array of signed integers. A
 // field of another wire type is skipped and reported as ErrTypeMismatch (§7.3).
+//
+// The declared element width bounds the value exactly as in ReadUnsignedArray,
+// on the zigzag-DECODED element: zigzag maps a negative value to a small wire
+// value, so an element below the declared minimum breaches just as an element
+// above the maximum does, and only the decoded form sees both (§7.1).
 func ReadSignedArray[T Signed](d *Decoder) ([]T, error) {
 	if err := d.bind(TypeVarintArraySigned); err != nil {
 		return nil, err
@@ -665,11 +685,21 @@ func ReadSignedArray[T Signed](d *Decoder) ([]T, error) {
 			if err != nil {
 				return nil, err
 			}
-			out = append(out, T(zigzagDecode(v)))
+			s := zigzagDecode(v)
+			e := T(s)
+			if int64(e) != s {
+				return nil, ErrInvalidMsg
+			}
+			out = append(out, e)
 			continue
 		}
 		for _, v := range stage[:got] {
-			out = append(out, T(zigzagDecode(v)))
+			s := zigzagDecode(v)
+			e := T(s)
+			if int64(e) != s {
+				return nil, ErrInvalidMsg
+			}
+			out = append(out, e)
 		}
 	}
 	d.needConsume = false
