@@ -3,13 +3,15 @@ package main
 // Tests for the §10 perf/bench harness.
 //
 // The point of testing a benchmark is not the numbers — those are the machine's
-// — but the WORKLOAD: BENCH_SPEC pins the two shared messages (the "typical"
-// message and the 12-field perf message) down to their ids, wire types and
-// values so the Go row can be compared with the C/C++/Rust/… rows. A harness
-// that quietly encodes something else, or whose visitor silently drops half the
-// fields, still prints a perfectly plausible MB/s figure. So every workload here
-// is decoded back and checked field by field, and the reported table is checked
-// for the shared shape rather than for its values.
+// — but the WORKLOAD and the OUTPUT GRAMMAR: BENCH_SPEC pins every shared
+// dataset down to its ids, wire types and values, and pins the table the central
+// harness parses down to its row labels, so the Go rows can be compared with the
+// C/C++/Rust/… rows. A harness that quietly encodes something else, or whose
+// visitor silently drops half the fields, still prints a perfectly plausible
+// MB/s figure; one whose row label drifted prints a number nothing will read.
+// So every workload here is decoded back and checked field by field, the two
+// cross-port size parity checks (170 for `perf`, 1,000,005 for `blob 1MB`) are
+// asserted, and each printed row is matched against the harness's own regex.
 //
 // The measured loops (`bench`, `perf`) are driven through main() once each, so
 // the ~1s CPU-time loops are paid once for both the subcommand dispatch and the
@@ -23,6 +25,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -31,18 +34,19 @@ import (
 
 // ---- helpers ---------------------------------------------------------------
 
-// encodeToBytes runs fn against a fresh encoder over a fresh sliceWriter and
-// returns the bytes it produced, restoring nothing: the globals are the
-// harness's own and every test that reads them sets them first.
+// encodeToBytes runs fn against a fresh encoder over a caller-supplied buffer
+// and returns the bytes it produced.
 func encodeToBytes(t *testing.T, fn func(*sofab.Encoder)) []byte {
 	t.Helper()
-	w := &sliceWriter{buf: make([]byte, 0, 1024)}
-	e := sofab.NewEncoder(w)
+	e, err := sofab.NewEncoderBuffer(make([]byte, 1<<16), 0)
+	if err != nil {
+		t.Fatalf("NewEncoderBuffer: %v", err)
+	}
 	fn(e)
 	if err := e.Flush(); err != nil {
 		t.Fatalf("Flush: %v", err)
 	}
-	return w.buf
+	return append([]byte(nil), e.Bytes()...)
 }
 
 // captureStdout runs fn with os.Stdout redirected and returns what it printed.
@@ -78,7 +82,8 @@ type field struct {
 // pullAll walks buf with the pull parser and records every field, descending
 // into sequences with a "seq:" prefix on the ids inside them. It is deliberately
 // an independent reader — not the harness's own visitors — so a visitor that
-// ignores a field cannot hide it.
+// ignores a field cannot hide it. It handles one level of nesting, which is what
+// the flat workloads reach; the composite message has its own walker below.
 func pullAll(t *testing.T, buf []byte, fixKind map[sofab.ID]string) []field {
 	t.Helper()
 	d := sofab.NewDecoder(bytes.NewReader(buf))
@@ -207,6 +212,22 @@ func TestMakeSrcIsTheSharedSequence(t *testing.T) {
 	}
 }
 
+// The blob payload is derived from the same constant as the u64 array — one
+// magic number in the suite, not two — and must be exactly 1,000,000 bytes so
+// MB/s reads directly against the MB = 1e6 convention.
+func TestMakeBlobIsTheSharedPayload(t *testing.T) {
+	blobSrc = nil
+	makeBlob()
+	if len(blobSrc) != blobLen {
+		t.Fatalf("len(blobSrc) = %d, want %d", len(blobSrc), blobLen)
+	}
+	for _, i := range []int{0, 1, 2, 4095, 500_000, blobLen - 1} {
+		if want := byte(uint64(i) * 0x9E3779B97F4A7C15); blobSrc[i] != want {
+			t.Errorf("blobSrc[%d] = %d, want %d", i, blobSrc[i], want)
+		}
+	}
+}
+
 func TestEncodeTypicalRoundTrips(t *testing.T) {
 	buf := encodeToBytes(t, encodeTypical)
 	wantFields(t, pullAll(t, buf, typicalFix), []field{
@@ -244,13 +265,22 @@ func TestPerfEncodeRoundTrips(t *testing.T) {
 	})
 }
 
+// BENCH_SPEC: "The encoded size of the perf message (170 bytes on every
+// implementation) is a quick parity check: if your perf prints a different
+// message size, your encoding diverges."
+func TestPerfMessageSizeIsThe170ByteParityCheck(t *testing.T) {
+	if got := len(encodeToBytes(t, perfEncode)); got != 170 {
+		t.Errorf("perf message encodes to %d bytes, want the cross-port 170", got)
+	}
+}
+
 // The u64-array workload must really carry all n elements: a harness that
 // encoded a shorter array would report a throughput for a message that is not
 // the shared one.
 func TestEncodeU64ArrayCarriesAllElements(t *testing.T) {
 	setupEncodeU64()
 	run_encode_u64_array()
-	d := sofab.NewDecoder(bytes.NewReader(sw.buf))
+	d := sofab.NewDecoder(bytes.NewReader(encOut[:used]))
 	f, err := d.Next()
 	if err != nil {
 		t.Fatalf("Next: %v", err)
@@ -275,12 +305,314 @@ func TestEncodeU64ArrayCarriesAllElements(t *testing.T) {
 	}
 }
 
+// ---- the composite message -------------------------------------------------
+
+// walkComposite renders a message as one line per event, with the nesting depth
+// in front, so the composite's structure — a wrapper array, depth-3 nesting, an
+// omitted field — can be asserted whole. Every fixlen in this message is a
+// string, so no per-id kind table is needed.
+func walkComposite(t *testing.T, buf []byte) []string {
+	t.Helper()
+	d := sofab.NewDecoder(bytes.NewReader(buf))
+	var out []string
+	depth := 0
+	for {
+		f, err := d.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("Next: %v", err)
+		}
+		switch f.Type {
+		case sofab.TypeSequenceStart:
+			out = append(out, fmt.Sprintf("%d seq{ %d", depth, f.ID))
+			depth++
+		case sofab.TypeSequenceEnd:
+			depth--
+			out = append(out, fmt.Sprintf("%d }", depth))
+		case sofab.TypeFixlen:
+			s, err := d.String()
+			if err != nil {
+				t.Fatalf("String at id %d: %v", f.ID, err)
+			}
+			out = append(out, fmt.Sprintf("%d str %d %q", depth, f.ID, s))
+		case sofab.TypeVarintUnsigned:
+			v, err := d.Unsigned()
+			if err != nil {
+				t.Fatalf("Unsigned at id %d: %v", f.ID, err)
+			}
+			out = append(out, fmt.Sprintf("%d u %d %d", depth, f.ID, v))
+		case sofab.TypeVarintSigned:
+			v, err := d.Signed()
+			if err != nil {
+				t.Fatalf("Signed at id %d: %v", f.ID, err)
+			}
+			out = append(out, fmt.Sprintf("%d s %d %d", depth, f.ID, v))
+		default:
+			t.Fatalf("unexpected wire type %d at id %d", f.Type, f.ID)
+		}
+	}
+	return out
+}
+
+// The composite message is the only workload exercising the wrapper-array form,
+// multi-byte UTF-8, depth-3 nesting, an omitted all-default field and a two-byte
+// field header — so each of those is asserted, not just the total size.
+func TestEncodeCompositeHasEveryPathItIsThereFor(t *testing.T) {
+	makeCompositeElements()
+	got := walkComposite(t, encodeToBytes(t, encodeComposite))
+
+	var want []string
+	// id 1: the wrapper array — one header per element, element id = index.
+	want = append(want, "0 seq{ 1")
+	for i := 0; i < compositeElems; i++ {
+		want = append(want, fmt.Sprintf("1 str %d %q", i, fmt.Sprintf("item-%d", i)))
+	}
+	want = append(want, "0 }")
+	// id 2: 320 UTF-8 bytes over 1-, 2-, 3- and 4-byte sequences.
+	want = append(want, fmt.Sprintf("0 str 2 %q", strings.Repeat(compositeText, 32)))
+	// id 3: { 1: { 1: { 1: unsigned 7 } }, 2: signed -1 } — depth 3.
+	want = append(want,
+		"0 seq{ 3",
+		"1 seq{ 1",
+		"2 seq{ 1",
+		"3 u 1 7",
+		"2 }",
+		"1 }",
+		"1 s 2 -1",
+		"0 }",
+	)
+	// id 4 is equal to its default and must NOT appear at all.
+	// id 130: the suite's only two-byte field header.
+	want = append(want, "0 u 130 3735928559")
+
+	if len(got) != len(want) {
+		t.Fatalf("composite has %d events, want %d\ngot:\n%s", len(got), len(want), strings.Join(got, "\n"))
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("event %d = %q, want %q", i, got[i], want[i])
+		}
+	}
+	for _, line := range got {
+		if strings.HasPrefix(line, "0 seq{ 4") {
+			t.Error("field 4 equals its default and must be omitted (§2), but it is on the wire")
+		}
+	}
+}
+
+// The composite string field must really be the four-width UTF-8 cycle: 320
+// bytes carrying a 1-, a 2-, a 3- and a 4-byte sequence, the last a surrogate
+// pair in every UTF-16 port. A port that silently used ASCII would not be
+// running the §6.4 validator on anything interesting.
+func TestCompositeStringCoversAllFourUTF8Widths(t *testing.T) {
+	if len(compositeStr) != 320 {
+		t.Errorf("composite string is %d bytes, want 320", len(compositeStr))
+	}
+	widths := map[int]bool{}
+	for _, r := range compositeText {
+		widths[len(string(r))] = true
+	}
+	for _, w := range []int{1, 2, 3, 4} {
+		if !widths[w] {
+			t.Errorf("composite string has no %d-byte UTF-8 sequence", w)
+		}
+	}
+}
+
+// The composite's encoded size is its cross-port parity check, as 170 is the
+// perf message's: every port must land on the same number for the same message.
+func TestCompositeEncodedSizeIsTheParityCheck(t *testing.T) {
+	makeCompositeElements()
+	if got := len(encodeToBytes(t, encodeComposite)); got != 956 {
+		t.Errorf("composite encodes to %d bytes, want the cross-port 956", got)
+	}
+}
+
+// ---- the blob workloads ----------------------------------------------------
+
+// 1,000,005 = a 1-byte header, a 4-byte fixlen word and a megabyte of payload.
+// BENCH_SPEC makes it a parity check, and the one-shot row's caller buffer is
+// sized by hand to exactly that.
+func TestBlobEncodedSizeIsTheParityCheck(t *testing.T) {
+	setupEncodeBlobOneShot()
+	run_encode_blob_oneshot()
+	if used != blobEncoded {
+		t.Fatalf("blob 1MB encodes to %d bytes, want %d", used, blobEncoded)
+	}
+	if len(encOut) != blobEncoded {
+		t.Errorf("one-shot caller buffer is %d bytes, want exactly %d", len(encOut), blobEncoded)
+	}
+	d := sofab.NewDecoder(bytes.NewReader(encOut[:used]))
+	f, err := d.Next()
+	if err != nil {
+		t.Fatalf("Next: %v", err)
+	}
+	if f.ID != 1 || f.Type != sofab.TypeFixlen {
+		t.Fatalf("header = id %d type %d, want id 1 blob", f.ID, f.Type)
+	}
+	b, err := d.Bytes()
+	if err != nil {
+		t.Fatalf("Bytes: %v", err)
+	}
+	if !bytes.Equal(b, blobSrc) {
+		t.Error("the decoded blob payload is not the one that was encoded")
+	}
+}
+
+// capturingSink is the test's stand-in for discardSink: it keeps what it is
+// handed so the streaming rows can be checked to produce the same wire bytes as
+// the one-shot row, and records the largest single hand-over (which is how
+// pass-through shows itself).
+type capturingSink struct {
+	got     []byte
+	calls   int
+	largest int
+}
+
+func (c *capturingSink) fn(_ *sofab.Encoder, b []byte) error {
+	c.got = append(c.got, b...)
+	c.calls++
+	if len(b) > c.largest {
+		c.largest = len(b)
+	}
+	return nil
+}
+
+// The three encode: blob rows must all put the SAME message on the wire — the
+// rows differ in how the bytes get there, not in what they are.
+func TestBlobStreamingRowsProduceTheOneShotBytes(t *testing.T) {
+	makeBlob()
+	// The one-shot reference: a caller buffer of exactly 1,000,005 bytes, sized
+	// by hand as BENCH_SPEC requires, and no sink.
+	one, err := sofab.NewEncoderBuffer(make([]byte, blobEncoded), 0)
+	if err != nil {
+		t.Fatalf("NewEncoderBuffer: %v", err)
+	}
+	if err := one.WriteBytes(1, blobSrc); err != nil {
+		t.Fatalf("WriteBytes: %v", err)
+	}
+	if err := one.Flush(); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	oneShot := one.Bytes()
+	if len(oneShot) != blobEncoded {
+		t.Fatalf("one-shot encode is %d bytes, want %d", len(oneShot), blobEncoded)
+	}
+
+	for _, tc := range []struct {
+		name        string
+		opts        []sofab.Option
+		wantHandOff int // the largest single sink hand-over
+	}{
+		// Pass-through NOT granted: every byte is copied through the 4096-byte
+		// buffer, so no hand-over can exceed it. This is the required row.
+		{"streaming", nil, blobChunk},
+		// Granted: the payload reaches the sink directly (§5.1), so one call
+		// carries far more than the buffer holds. This is the optional row, and
+		// this assertion is what stops it from silently measuring the copy path.
+		{"passthrough", []sofab.Option{sofab.WithPassThrough(true)}, blobChunk + 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cap := &capturingSink{}
+			e, err := sofab.NewEncoderSink(make([]byte, blobChunk), 0, cap.fn, tc.opts...)
+			if err != nil {
+				t.Fatalf("NewEncoderSink: %v", err)
+			}
+			if err := e.WriteBytes(1, blobSrc); err != nil {
+				t.Fatalf("WriteBytes: %v", err)
+			}
+			if err := e.Flush(); err != nil {
+				t.Fatalf("Flush: %v", err)
+			}
+			if !bytes.Equal(cap.got, oneShot) {
+				t.Errorf("%s wire bytes differ from the one-shot row (%d vs %d bytes)",
+					tc.name, len(cap.got), len(oneShot))
+			}
+			if tc.name == "streaming" {
+				if cap.largest > tc.wantHandOff {
+					t.Errorf("a hand-over of %d bytes exceeds the %d-byte buffer: "+
+						"the required streaming row must not pass through", cap.largest, tc.wantHandOff)
+				}
+				if cap.calls < 200 {
+					t.Errorf("only %d flushes for a megabyte through a %d-byte buffer", cap.calls, blobChunk)
+				}
+			} else if cap.largest < tc.wantHandOff {
+				t.Errorf("largest hand-over %d bytes: the pass-through row never left the buffer", cap.largest)
+			}
+		})
+	}
+}
+
+// discardSink is what the measured rows use, and BENCH_SPEC forbids it to
+// accumulate: it must consume and discard, doing only the minimum that keeps the
+// call from being optimized away.
+func TestDiscardSinkFoldsAndKeepsNothing(t *testing.T) {
+	discardAcc = 0
+	if err := discardSink(nil, []byte{0xA5, 0xFF}); err != nil {
+		t.Fatalf("discardSink: %v", err)
+	}
+	if discardAcc != 0xA5 {
+		t.Errorf("discardAcc = %#x, want the first byte folded in", discardAcc)
+	}
+	if err := discardSink(nil, nil); err != nil {
+		t.Errorf("discardSink on an empty hand-over: %v", err)
+	}
+}
+
+// The blob decode is "fed in 4096-byte chunks", which is chunkReader's whole
+// job: never hand out more than one chunk per Read, and still decode correctly
+// whatever boundary a field straddles.
+func TestChunkReaderFeedsInChunks(t *testing.T) {
+	r := &chunkReader{buf: make([]byte, 10_000), chunk: blobChunk}
+	p := make([]byte, 8192)
+	total, calls := 0, 0
+	for {
+		k, err := r.Read(p)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("Read: %v", err)
+		}
+		if k > blobChunk {
+			t.Fatalf("Read returned %d bytes, more than the %d-byte chunk", k, blobChunk)
+		}
+		total += k
+		calls++
+	}
+	if total != 10_000 || calls != 3 {
+		t.Errorf("read %d bytes in %d calls, want 10000 in 3", total, calls)
+	}
+	r.reset()
+	if k, err := r.Read(p); k == 0 || err != nil {
+		t.Errorf("after reset: Read = %d, %v, want the stream again", k, err)
+	}
+}
+
+// The chunk-fed decode must reach the same values as a one-shot decode, at any
+// boundary: a byte-at-a-time feed is the extreme case of the 4096-byte one.
+func TestDecodeOverAChunkedReaderResumesAtAnyBoundary(t *testing.T) {
+	buf := encodeToBytes(t, encodeTypical)
+	for _, chunk := range []int{1, 3, 7, len(buf)} {
+		r := &chunkReader{buf: buf, chunk: chunk}
+		before := sink
+		if err := sofab.NewDecoder(r).AcceptStream(foldVisitor{}); err != nil {
+			t.Fatalf("chunk %d: AcceptStream: %v", chunk, err)
+		}
+		if sink == before {
+			t.Errorf("chunk %d: the decode folded nothing", chunk)
+		}
+	}
+}
+
 // ---- setup + measured entry points -----------------------------------------
 
 func TestSetupDecodeU64PreparesADecodableBuffer(t *testing.T) {
 	setupDecodeU64()
-	if len(decBuf) == 0 || dec == nil {
-		t.Fatalf("setup left decBuf=%d dec=%v", len(decBuf), dec)
+	if len(decBuf) == 0 || used != len(decBuf) {
+		t.Fatalf("setup left decBuf=%d used=%d", len(decBuf), used)
 	}
 	before := sink
 	run_decode_u64_array()
@@ -293,8 +625,8 @@ func TestSetupDecodeU64PreparesADecodableBuffer(t *testing.T) {
 
 func TestSetupDecodeTypicalPreparesADecodableBuffer(t *testing.T) {
 	setupDecodeTypical()
-	if len(decBuf) == 0 || dec == nil {
-		t.Fatalf("setup left decBuf=%d dec=%v", len(decBuf), dec)
+	if len(decBuf) == 0 || used != len(decBuf) {
+		t.Fatalf("setup left decBuf=%d used=%d", len(decBuf), used)
 	}
 	before := sink
 	run_decode_typical()
@@ -307,23 +639,56 @@ func TestSetupDecodeTypicalPreparesADecodableBuffer(t *testing.T) {
 	}
 }
 
+// The blob decode row folds one length per payload, so a decode that never
+// reached the blob (or that stopped at a chunk boundary) shows up as a delta
+// that is not the payload length.
+func TestRunDecodeBlobReadsTheWholePayload(t *testing.T) {
+	setupDecodeBlob()
+	before := sink
+	run_decode_blob()
+	if got := sink - before; got != blobLen {
+		t.Errorf("blob decode folded %d, want the %d-byte payload", got, blobLen)
+	}
+}
+
+// decode: composite and decode: composite skip-all must walk the same bytes to
+// the same end — one materializing every value, the other materializing none.
+func TestCompositeDecodeRowsWalkTheWholeMessage(t *testing.T) {
+	setupDecodeComposite()
+	if used != len(decBuf) || used != 956 {
+		t.Fatalf("setup left used=%d decBuf=%d, want 956", used, len(decBuf))
+	}
+	before := sink
+	run_decode_composite()
+	if sink == before {
+		t.Error("decode: composite folded nothing")
+	}
+	// skip-all must consume the message cleanly; a Skip that stopped early
+	// would surface as an error inside run_decode_composite_skip (it panics).
+	before = sink
+	run_decode_composite_skip()
+	if sink != before+1 {
+		t.Error("decode: composite skip-all did not complete its walk")
+	}
+}
+
 // setupEncodeTypical + run_encode_typical are the Callgrind single-shot pair;
-// they must leave exactly one encoded message in the writer.
+// they must leave exactly one encoded message in the buffer.
 func TestRunEncodeTypicalProducesOneMessage(t *testing.T) {
 	setupEncodeTypical()
 	run_encode_typical()
-	one := len(sw.buf)
-	if one == 0 {
+	if used == 0 {
 		t.Fatal("no bytes produced")
 	}
-	wantFields(t, pullAll(t, sw.buf, typicalFix), pullAll(t, encodeToBytes(t, encodeTypical), typicalFix))
+	wantFields(t, pullAll(t, encOut[:used], typicalFix), pullAll(t, encodeToBytes(t, encodeTypical), typicalFix))
 }
 
-// The perf visitor must observe every one of the 12 fields, nested scope
-// included: it is what stops the decode loop from being optimized into a skip.
-func TestPerfVisitorFoldsEveryField(t *testing.T) {
+// foldVisitor is the destination for the perf, composite and blob decodes, whose
+// point is that every value is materialized: it must observe all 12 fields of
+// the perf message, nested scope included.
+func TestFoldVisitorFoldsEveryField(t *testing.T) {
 	buf := encodeToBytes(t, perfEncode)
-	counts := &countingPerfVisitor{}
+	counts := &countingVisitor{}
 	if err := sofab.AcceptBytes(buf, counts); err != nil {
 		t.Fatalf("AcceptBytes: %v", err)
 	}
@@ -333,28 +698,28 @@ func TestPerfVisitorFoldsEveryField(t *testing.T) {
 		t.Errorf("visitor saw %d values, want 13", counts.n)
 	}
 	before := sink
-	if err := sofab.AcceptBytes(buf, perfVisitor{}); err != nil {
-		t.Fatalf("AcceptBytes(perfVisitor): %v", err)
+	if err := sofab.AcceptBytes(buf, foldVisitor{}); err != nil {
+		t.Fatalf("AcceptBytes(foldVisitor): %v", err)
 	}
 	if sink == before {
-		t.Error("perfVisitor folded nothing into sink")
+		t.Error("foldVisitor folded nothing into sink")
 	}
 }
 
-type countingPerfVisitor struct {
+type countingVisitor struct {
 	baseVisitor
 	n int
 }
 
-func (c *countingPerfVisitor) Unsigned(sofab.ID, uint64) error        { c.n++; return nil }
-func (c *countingPerfVisitor) Signed(sofab.ID, int64) error           { c.n++; return nil }
-func (c *countingPerfVisitor) Float32(sofab.ID, float32) error        { c.n++; return nil }
-func (c *countingPerfVisitor) Float64(sofab.ID, float64) error        { c.n++; return nil }
-func (c *countingPerfVisitor) String(sofab.ID, string) error          { c.n++; return nil }
-func (c *countingPerfVisitor) UnsignedArray(sofab.ID, []uint64) error { c.n++; return nil }
-func (c *countingPerfVisitor) SignedArray(sofab.ID, []int64) error    { c.n++; return nil }
-func (c *countingPerfVisitor) Float64Array(sofab.ID, []float64) error { c.n++; return nil }
-func (c *countingPerfVisitor) BeginSequence(sofab.ID) (sofab.Visitor, error) {
+func (c *countingVisitor) Unsigned(sofab.ID, uint64) error        { c.n++; return nil }
+func (c *countingVisitor) Signed(sofab.ID, int64) error           { c.n++; return nil }
+func (c *countingVisitor) Float32(sofab.ID, float32) error        { c.n++; return nil }
+func (c *countingVisitor) Float64(sofab.ID, float64) error        { c.n++; return nil }
+func (c *countingVisitor) String(sofab.ID, string) error          { c.n++; return nil }
+func (c *countingVisitor) UnsignedArray(sofab.ID, []uint64) error { c.n++; return nil }
+func (c *countingVisitor) SignedArray(sofab.ID, []int64) error    { c.n++; return nil }
+func (c *countingVisitor) Float64Array(sofab.ID, []float64) error { c.n++; return nil }
+func (c *countingVisitor) BeginSequence(sofab.ID) (sofab.Visitor, error) {
 	return c, nil
 }
 
@@ -381,6 +746,112 @@ func TestBaseVisitorAcceptsEveryFieldKind(t *testing.T) {
 	})
 	if err := sofab.AcceptBytes(buf, baseVisitor{}); err != nil {
 		t.Fatalf("baseVisitor rejected a field kind: %v", err)
+	}
+}
+
+// ---- the workload table ----------------------------------------------------
+
+// benchRowLabel is BENCH_SPEC's own row grammar, minus the value: the harness
+// will not parse a row whose label is not one of these, so the table is a
+// contract rather than an editorial choice.
+var benchRowLabel = regexp.MustCompile(
+	`^(encode|decode): (u64 array \(1000\)|typical message|blob 1MB one-shot|` +
+		`blob 1MB streaming|blob 1MB passthrough|blob 1MB|composite skip-all|composite)$`)
+
+// benchRow is the full grammar the central harness matches each printed row
+// with, value included.
+var benchRow = regexp.MustCompile(
+	`^(encode|decode):\s+(u64 array \(1000\)|typical message|blob 1MB one-shot|` +
+		`blob 1MB streaming|blob 1MB passthrough|blob 1MB|composite skip-all|composite)\s+([\d.]+)$`)
+
+func TestWorkloadTableCoversTheSpecifiedDatasets(t *testing.T) {
+	want := []string{
+		"encode: u64 array (1000)",
+		"encode: typical message",
+		"encode: blob 1MB one-shot",
+		"encode: blob 1MB streaming",
+		"encode: blob 1MB passthrough",
+		"encode: composite",
+		"decode: u64 array (1000)",
+		"decode: typical message",
+		"decode: blob 1MB",
+		"decode: composite",
+		"decode: composite skip-all",
+	}
+	if len(workloads) != len(want) {
+		t.Fatalf("%d workloads, want %d", len(workloads), len(want))
+	}
+	seen := map[string]bool{}
+	for i, w := range workloads {
+		if w.label != want[i] {
+			t.Errorf("workload %d label = %q, want %q", i, w.label, want[i])
+		}
+		if !benchRowLabel.MatchString(w.label) {
+			t.Errorf("workload %q has a label the central harness will not parse", w.label)
+		}
+		if w.setup == nil || w.warm == nil || w.run == nil {
+			t.Errorf("workload %q is missing a setup, warm or run function", w.verb)
+		}
+		if seen[w.verb] {
+			t.Errorf("duplicate workload verb %q", w.verb)
+		}
+		seen[w.verb] = true
+		if findWorkload(w.verb) == nil {
+			t.Errorf("findWorkload(%q) found nothing", w.verb)
+		}
+	}
+	if findWorkload("nonsense") != nil {
+		t.Error("findWorkload matched a verb that does not exist")
+	}
+}
+
+// The warm and the toggled path must be the SAME op: the Callgrind number is
+// one call of run_<verb> after one call of warm, and a wrapper wired to the
+// wrong body — or a body that only works the first time — would report an Ir/op
+// for something other than the row it is printed against.
+func TestWarmAndToggledPathsAreTheSameOp(t *testing.T) {
+	for _, w := range workloads {
+		w.setup()
+
+		before := sink
+		w.warm()
+		warmUsed, warmDelta := used, sink-before
+
+		before = sink
+		w.run()
+		runUsed, runDelta := used, sink-before
+
+		if warmUsed == 0 {
+			t.Errorf("%s: the warm op reported no message size", w.verb)
+		}
+		if runUsed != warmUsed {
+			t.Errorf("%s: warm op produced %d bytes, toggled op %d", w.verb, warmUsed, runUsed)
+		}
+		// Both calls walk the same message, so they fold the same amount into
+		// the sink — including zero, for the encode rows.
+		if runDelta != warmDelta {
+			t.Errorf("%s: warm op folded %d, toggled op %d", w.verb, warmDelta, runDelta)
+		}
+	}
+}
+
+// bench/run_callgrind.sh and bench/profile.sh take their workload list from this
+// verb, so a row added to the table reaches the Callgrind table without editing
+// a shell script. The list must therefore stay machine-readable.
+func TestWorkloadsVerbListsEveryRow(t *testing.T) {
+	out := captureStdout(t, func() { runMain(t, "workloads") })
+	lines := strings.Split(strings.TrimSpace(out), "\n")
+	if len(lines) != len(workloads) {
+		t.Fatalf("`workloads` printed %d lines, want %d\n%s", len(lines), len(workloads), out)
+	}
+	for i, line := range lines {
+		verb, label, ok := strings.Cut(line, "\t")
+		if !ok {
+			t.Fatalf("line %q is not <verb>TAB<label>", line)
+		}
+		if verb != workloads[i].verb || label != workloads[i].label {
+			t.Errorf("line %d = %q/%q, want %q/%q", i, verb, label, workloads[i].verb, workloads[i].label)
+		}
 	}
 }
 
@@ -452,38 +923,59 @@ func TestPerfReportPrintsTheSharedFields(t *testing.T) {
 	}
 }
 
+func TestPerfMeasureCountsTheOpsItRan(t *testing.T) {
+	calls := 0
+	var x uint64
+	r := perfMeasure(func() {
+		calls++
+		for i := 0; i < 20_000; i++ {
+			x += uint64(i)
+		}
+	}, 256)
+	sink += x
+	if r.iters == 0 || r.nsOp <= 0 || r.mbS <= 0 {
+		t.Errorf("perfMeasure = %+v, want positive iterations, ns/op and MB/s", r)
+	}
+	if uint64(calls) < r.iters {
+		t.Errorf("reported %d iterations but called the op %d times", r.iters, calls)
+	}
+}
+
 // ---- the two subcommands that measure --------------------------------------
 
 // Driven through main() so the dispatch and the ~1s loops behind it are paid
 // once, not twice.
 func TestMainBenchPrintsTheSharedTable(t *testing.T) {
 	out := captureStdout(t, func() { runMain(t, "bench") })
-	for _, want := range []string{
-		"=== SofaBuffers Go throughput (CPU time, MB/s) ===",
-		"Workload",
-		"encode: u64 array (1000)",
-		"encode: typical message",
-		"decode: u64 array (1000)",
-		"decode: typical message",
-		"MB = 1e6 bytes",
-	} {
-		if !strings.Contains(out, want) {
-			t.Errorf("bench output missing %q\n%s", want, out)
-		}
+	if !strings.Contains(out, "=== SofaBuffers Go throughput (CPU time, MB/s) ===") {
+		t.Errorf("bench output missing the harness's header line\n%s", out)
 	}
-	// Every row must carry a real number, not a 0.00 placeholder from a
-	// workload that never ran.
+	if !strings.Contains(out, "MB = 1e6 bytes") {
+		t.Errorf("bench output missing the MB convention line\n%s", out)
+	}
+
+	// Every workload must appear as a row the harness's regex parses, carrying a
+	// real number rather than a 0.00 placeholder from a workload that never ran.
+	rows := map[string]bool{}
 	for _, line := range strings.Split(out, "\n") {
 		if !strings.HasPrefix(line, "encode:") && !strings.HasPrefix(line, "decode:") {
 			continue
 		}
-		var mbs float64
-		if _, err := fmt.Sscanf(strings.TrimSpace(line[26:]), "%g", &mbs); err != nil {
-			t.Errorf("row %q has no parseable MB/s: %v", line, err)
+		m := benchRow.FindStringSubmatch(strings.TrimRight(line, " "))
+		if m == nil {
+			t.Errorf("row %q does not match the central harness's row grammar", line)
 			continue
 		}
-		if !(mbs > 0) {
-			t.Errorf("row %q reports non-positive throughput %v", line, mbs)
+		label := m[1] + ": " + m[2]
+		rows[label] = true
+		var mbs float64
+		if _, err := fmt.Sscanf(m[3], "%g", &mbs); err != nil || !(mbs > 0) {
+			t.Errorf("row %q reports no positive throughput", line)
+		}
+	}
+	for _, w := range workloads {
+		if !rows[w.label] {
+			t.Errorf("bench printed no row for %q", w.label)
 		}
 	}
 }
@@ -497,6 +989,7 @@ func TestMainPerfPrintsBothHalves(t *testing.T) {
 		"iterations    :",
 		"CPU time/op   :",
 		"throughput    :",
+		"message size  : 170 bytes", // the cross-port parity check
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("perf output missing %q\n%s", want, out)
@@ -516,21 +1009,22 @@ func runMain(t *testing.T, args ...string) {
 	main()
 }
 
+// Every workload must be reachable as a single-shot verb — that is what the
+// Callgrind harness runs — and must leave a byte count behind for the table's
+// `bytes` column.
 func TestMainSingleWorkloadVerbs(t *testing.T) {
-	// main() reports "sink=… used=…" on stderr for the Callgrind harness; the
-	// assertion here is that each verb runs its workload and leaves bytes
-	// behind, which `used` is derived from.
-	for _, verb := range []string{
-		"encode_u64_array", "encode_typical", "decode_u64_array", "decode_typical",
-	} {
-		sw = nil
+	for _, w := range workloads {
+		used = 0
 		before := sink
-		runMain(t, verb)
-		if sw == nil || len(sw.buf) == 0 {
-			t.Errorf("%s: produced no bytes", verb)
+		runMain(t, w.verb)
+		if used == 0 {
+			t.Errorf("%s: reported no message size", w.verb)
 		}
-		if strings.HasPrefix(verb, "decode_") && sink == before {
-			t.Errorf("%s: decoded nothing into sink", verb)
+		if strings.HasPrefix(w.verb, "decode_") && sink == before {
+			t.Errorf("%s: decoded nothing into sink", w.verb)
+		}
+		if strings.Contains(w.verb, "blob") && used != blobEncoded {
+			t.Errorf("%s: used=%d, want the %d-byte parity size", w.verb, used, blobEncoded)
 		}
 	}
 }
@@ -555,6 +1049,7 @@ func TestCLIExitCodes(t *testing.T) {
 		{[]string{"nonsense"}, false},      // unknown verb
 		{[]string{"encode_typical"}, true}, // a known single-shot verb
 		{[]string{"decode_typical"}, true}, //
+		{[]string{"workloads"}, true},      // the verb list the shell tools read
 	} {
 		err := exec.Command(bin, tc.args...).Run()
 		if tc.wantOK && err != nil {
@@ -563,21 +1058,5 @@ func TestCLIExitCodes(t *testing.T) {
 		if !tc.wantOK && err == nil {
 			t.Errorf("%v: exited 0, want a non-zero status", tc.args)
 		}
-	}
-}
-
-// ---- the fixed-capacity writer ---------------------------------------------
-
-func TestSliceWriterAppendsEverything(t *testing.T) {
-	w := &sliceWriter{buf: make([]byte, 0, 4)}
-	n, err := w.Write([]byte("abc"))
-	if n != 3 || err != nil {
-		t.Fatalf("Write = %d, %v", n, err)
-	}
-	if n, err = w.Write([]byte("defgh")); n != 5 || err != nil {
-		t.Fatalf("Write = %d, %v", n, err)
-	}
-	if string(w.buf) != "abcdefgh" {
-		t.Errorf("buf = %q, want %q", w.buf, "abcdefgh")
 	}
 }

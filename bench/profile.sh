@@ -13,7 +13,8 @@
 #
 # Prereqs: valgrind, go.
 # Usage:   bash bench/profile.sh <workload> [topN]
-#          workloads: encode_u64_array encode_typical decode_u64_array decode_typical
+#          run without arguments to list the workloads (they come from
+#          `perfbench workloads`, so this script carries no copy of the suite).
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
@@ -23,12 +24,20 @@ if ! command -v valgrind >/dev/null 2>&1; then
     exit 1
 fi
 
-W="${1:-decode_typical}"
-TOP="${2:-25}"
 OUT="$(mktemp -d)"
 trap 'rm -rf "$OUT"' EXIT
 
 go build -o "$OUT/perfbench" ./cmd/perfbench
+
+W="${1:-}"
+TOP="${2:-25}"
+
+if [ -z "$W" ] || ! "$OUT/perfbench" workloads | cut -f1 | grep -qx -- "$W"; then
+    [ -n "$W" ] && echo "error: unknown workload '$W'." >&2
+    echo "workloads:" >&2
+    "$OUT/perfbench" workloads | sed 's/^/  /; s/\t/  --  /' >&2
+    exit 1
+fi
 
 # Same runtime taming as run_callgrind.sh: one OS thread, no async preemption,
 # no GC during the measured op, so a single op is deterministic under Valgrind.

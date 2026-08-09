@@ -14,6 +14,16 @@
 # Ir is one op's instruction count directly — no rep-count subtraction (native
 # symbols, unlike the JIT/interpreted ports).
 #
+# The workload list and its row labels come from `perfbench workloads`, so this
+# script never carries a second copy of the suite: a row added to the table in
+# cmd/perfbench/main.go appears here on the next run.
+#
+# The `blob 1MB` rows are where the instruction count earns its keep: the delta
+# between one-shot and streaming is the divisible-run cost (CORELIB_PLAN §5.1)
+# with the host's memory subsystem taken out of it, and the gap from streaming to
+# pass-through is what the §5.1 permission buys. Under MB/s those differences
+# drown in memory bandwidth; here they do not.
+#
 # The Go runtime is tamed so the single op is deterministic under Valgrind:
 # GOMAXPROCS=1 (one OS thread), GODEBUG=asyncpreemptoff=1 (no preemption signal
 # storms, which Valgrind serializes oddly), GOGC=off (no GC during the op).
@@ -37,8 +47,6 @@ BIN="$OUT/perfbench"
 echo ">> building perfbench ..." >&2
 go build -o "$BIN" ./cmd/perfbench
 
-WORKLOADS=(encode_u64_array encode_typical decode_u64_array decode_typical)
-
 run_cg() { # $1 workload
     GOMAXPROCS=1 GODEBUG=asyncpreemptoff=1 GOGC=off \
         valgrind --quiet --tool=callgrind --collect-atstart=no \
@@ -50,29 +58,23 @@ run_cg() { # $1 workload
 ir_of()    { grep -m1 '^summary:' "$OUT/$1.out" 2>/dev/null | awk '{print $2}'; }
 bytes_of() { grep -ohE 'used=[0-9]+' "$OUT/$1.log" 2>/dev/null | head -1 | cut -d= -f2; }
 
-label() {
-    case "$1" in
-        encode_u64_array) echo "encode: u64 array (1000)";;
-        encode_typical)   echo "encode: typical message";;
-        decode_u64_array) echo "decode: u64 array (1000)";;
-        decode_typical)   echo "decode: typical message";;
-    esac
-}
-
 echo ">> Measuring instructions/op under Callgrind (this is slow) ..." >&2
 echo
 echo "==============================================================================="
 echo " SofaBuffers Go instruction cost   (Callgrind, Ir/op)"
 echo " instructions/op: lower is better. Deterministic & machine-independent."
 echo "==============================================================================="
-printf "%-26s %16s %9s\n" "Workload" "instr/op" "bytes"
-printf "%-26s %16s %9s\n" "--------" "--------" "-----"
+printf "%-28s %16s %9s\n" "Workload" "instr/op" "bytes"
+printf "%-28s %16s %9s\n" "--------" "--------" "-----"
 
-for w in "${WORKLOADS[@]}"; do
-    run_cg "$w"
-    ir="$(ir_of "$w")"; b="$(bytes_of "$w")"
-    printf "%-26s %16s %9s\n" "$(label "$w")" "${ir:--}" "${b:--}"
-done
+while IFS=$'\t' read -r verb label; do
+    [ -n "$verb" ] || continue
+    run_cg "$verb"
+    ir="$(ir_of "$verb")"; b="$(bytes_of "$verb")"
+    printf "%-28s %16s %9s\n" "$label" "${ir:--}" "${b:--}"
+done < <("$BIN" workloads)
+
 echo
 echo "Ir = instructions retired (Callgrind). Independent of CPU clock and OS"
 echo "scheduling; depends only on the executed code, so it compares across machines."
+echo "blob 1MB: read one-shot vs streaming vs pass-through against each other."
