@@ -234,7 +234,10 @@ func (c *cursor) take(n uint64) ([]byte, error) {
 	return b, nil
 }
 
-func (c *cursor) fixlenHeader() (length, sub uint64, err error) {
+// fixlenHeader reads a fixlen field's length-and-subtype word. sb is the scope's
+// schema-bound source: a maxlen the schema declares for this id keeps the
+// receiver's string/blob cap off the field (§6.2.1, see SchemaBoundVisitor).
+func (c *cursor) fixlenHeader(id ID, sb schemaBound) (length, sub uint64, err error) {
 	h, err := c.uvarint(false)
 	if err != nil {
 		return 0, 0, err
@@ -244,7 +247,7 @@ func (c *cursor) fixlenHeader() (length, sub uint64, err error) {
 	if length > arrayMax {
 		return 0, 0, ErrInvalidMsg
 	}
-	if err := c.lim.checkFixlen(sub, length); err != nil {
+	if err := c.lim.checkFixlen(sub, length, id, sb); err != nil {
 		return 0, 0, err
 	}
 	return length, sub, nil
@@ -252,7 +255,9 @@ func (c *cursor) fixlenHeader() (length, sub uint64, err error) {
 
 // arrayCount reads an array's leading element count. Zero is valid — an empty
 // array (§4.7/§4.8); only a count past arrayMax is rejected as ErrInvalidMsg.
-func (c *cursor) arrayCount() (uint64, error) {
+// The receiver's count cap is skipped for a field the schema bounds (§6.2.1),
+// which is what sb answers.
+func (c *cursor) arrayCount(id ID, sb schemaBound) (uint64, error) {
 	n, err := c.uvarint(false)
 	if err != nil {
 		return 0, err
@@ -260,7 +265,7 @@ func (c *cursor) arrayCount() (uint64, error) {
 	if n > arrayMax {
 		return 0, ErrInvalidMsg
 	}
-	if err := c.lim.checkArrayCount(n); err != nil {
+	if err := c.lim.checkArrayCount(n, id, sb); err != nil {
 		return 0, err
 	}
 	return n, nil
@@ -304,10 +309,13 @@ func (c *cursor) accept(v Visitor, depth int) error {
 	// fixlen field. The element-bound extension is resolved the same way and
 	// asked even later: only where an integer array is truncated (see ebCache).
 	// The SOFAB_STRICT_UTF8 policy is handed over just as lazily — only at this
-	// scope's first string field (see spCache, utf8.go).
+	// scope's first string field (see spCache, utf8.go). The schema-bound
+	// extension is later still and needs no cache at all: it is asked only where a
+	// configured receiver cap has already been exceeded (see schema_bound.go).
 	var hooks hvCache
 	var bounds ebCache
 	var policy spCache
+	sb := schemaBound{v: v}
 	for {
 		h, err := c.uvarint(true)
 		if err != nil {
@@ -346,11 +354,11 @@ func (c *cursor) accept(v Visitor, depth int) error {
 				return err
 			}
 		case TypeFixlen:
-			if err := c.acceptFixlen(v, hooks.of(v), &policy, id); err != nil {
+			if err := c.acceptFixlen(v, hooks.of(v), &policy, sb, id); err != nil {
 				return err
 			}
 		case TypeVarintArrayUnsigned:
-			n, err := c.arrayCount()
+			n, err := c.arrayCount(id, sb)
 			if err != nil {
 				return err
 			}
@@ -383,7 +391,7 @@ func (c *cursor) accept(v Visitor, depth int) error {
 				return err
 			}
 		case TypeVarintArraySigned:
-			n, err := c.arrayCount()
+			n, err := c.arrayCount(id, sb)
 			if err != nil {
 				return err
 			}
@@ -408,7 +416,7 @@ func (c *cursor) accept(v Visitor, depth int) error {
 				return err
 			}
 		case TypeFixlenArray:
-			if err := c.acceptFixlenArray(v, hooks.of(v), id); err != nil {
+			if err := c.acceptFixlenArray(v, hooks.of(v), sb, id); err != nil {
 				return err
 			}
 		case TypeSequenceStart:
@@ -436,8 +444,8 @@ func (c *cursor) accept(v Visitor, depth int) error {
 	}
 }
 
-func (c *cursor) acceptFixlen(v Visitor, hv HeaderVisitor, sp *spCache, id ID) error {
-	n, sub, err := c.fixlenHeader()
+func (c *cursor) acceptFixlen(v Visitor, hv HeaderVisitor, sp *spCache, sb schemaBound, id ID) error {
+	n, sub, err := c.fixlenHeader(id, sb)
 	if err != nil {
 		return err
 	}
@@ -502,8 +510,8 @@ func (c *cursor) acceptFixlen(v Visitor, hv HeaderVisitor, sp *spCache, id ID) e
 	}
 }
 
-func (c *cursor) acceptFixlenArray(v Visitor, hv HeaderVisitor, id ID) error {
-	n, err := c.arrayCount()
+func (c *cursor) acceptFixlenArray(v Visitor, hv HeaderVisitor, sb schemaBound, id ID) error {
+	n, err := c.arrayCount(id, sb)
 	if err != nil {
 		return err
 	}

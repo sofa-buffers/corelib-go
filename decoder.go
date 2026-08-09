@@ -20,6 +20,7 @@ type Decoder struct {
 	r           *bufio.Reader // pull-parser buffer, created lazily on first Next
 	cur         Field
 	needConsume bool // a value-bearing field header is read but not yet consumed
+	bounded     bool // the caller declared cur schema-bounded (SchemaBounded, §6.2.1)
 	depth       int  // sequences open on this stream (0 at the top level), §4.9
 	lim         limits
 }
@@ -75,6 +76,11 @@ func (d *Decoder) Next() (Field, error) {
 		return Field{}, ErrInvalidMsg
 	}
 	d.cur = Field{ID: ID(id), Type: t}
+	// A schema-bound declaration belongs to the field it was made for; the next
+	// header starts unbounded again. Cleared after the auto-skip above, so a value
+	// the caller declared and then left unconsumed is skipped under its own
+	// declaration (§6.2.1).
+	d.bounded = false
 	switch t {
 	case TypeVarintUnsigned, TypeVarintSigned, TypeFixlen,
 		TypeVarintArrayUnsigned, TypeVarintArraySigned, TypeFixlenArray:
@@ -105,6 +111,24 @@ func (d *Decoder) Next() (Field, error) {
 
 // Field returns the field header most recently returned by Next.
 func (d *Decoder) Field() Field { return d.cur }
+
+// SchemaBounded declares that the schema bounds the size of the field Next most
+// recently returned — a `count:` on an array, a `maxlen:` on a string or blob —
+// so the receiver-side caps (WithMaxArrayCount / WithMaxStringLen /
+// WithMaxBlobLen) are not applied to it. CORELIB_PLAN §6.2.1 requires exactly
+// that: a cap protects the receiver where the SENDER picks the size, and where
+// the schema states one it governs instead, with an over-bound header being
+// INVALID rather than ErrLimitExceeded (§6.3, MESSAGE_SPEC §7.1).
+//
+// It is the pull surface's counterpart to SchemaBoundVisitor, which the visitor
+// surfaces (Accept, AcceptBytes, AcceptStream) ask instead — there the scope's
+// destination knows the schema, while here the caller does. Declaring a bound is
+// a promise to enforce it: the reader that follows must reject a count/length
+// past the declared bound as ErrInvalidMsg, since the cap no longer stands
+// between an untrusted header and the allocation it implies.
+//
+// The declaration covers the current field only; the next Next clears it.
+func (d *Decoder) SchemaBounded() { d.bounded = true }
 
 // readVarint reads a base-128 varint. If firstEOFok is true, an EOF before any
 // byte is reported as io.EOF (a clean stream boundary); a mid-varint EOF is
@@ -201,7 +225,19 @@ func (d *Decoder) readVarintBatch(dst []uint64) (int, error) {
 // splitting it into the byte length (h>>3) and the 3-bit subtype (h&0x07). A
 // length past arrayMax, a reserved subtype, or a width that contradicts an
 // fp32/fp64 subtype is rejected as a malformed message.
+//
+// This is the pull surface's form: the field is the one Next most recently
+// returned, and it is schema-bounded only if the caller said so with
+// SchemaBounded (§6.2.1).
 func (d *Decoder) readFixlenHeader() (length uint64, sub uint64, err error) {
+	return d.readFixlenHeaderFor(d.cur.ID, schemaBound{decl: d.bounded})
+}
+
+// readFixlenHeaderFor is readFixlenHeader with the field id and the schema-bound
+// source supplied by the caller, as the visitor stream surface must: there the
+// scope's visitor answers whether the schema bounds this maxlen, not a per-field
+// flag.
+func (d *Decoder) readFixlenHeaderFor(id ID, sb schemaBound) (length uint64, sub uint64, err error) {
 	h, err := d.readVarint(false)
 	if err != nil {
 		return 0, 0, err
@@ -225,7 +261,7 @@ func (d *Decoder) readFixlenHeader() (length uint64, sub uint64, err error) {
 	if err := checkFixlenSubtype(sub, length); err != nil {
 		return 0, 0, err
 	}
-	if err := d.lim.checkFixlen(sub, length); err != nil {
+	if err := d.lim.checkFixlen(sub, length, id, sb); err != nil {
 		return 0, 0, err
 	}
 	return length, sub, nil
@@ -592,7 +628,17 @@ func (d *Decoder) skipValue() error {
 
 // arrayCount reads an array's leading element count. Zero is valid — an empty
 // array (§4.7/§4.8); only a count past arrayMax is rejected as ErrInvalidMsg.
+//
+// This is the pull surface's form: the field is the one Next most recently
+// returned, schema-bounded only if the caller declared it (SchemaBounded).
 func (d *Decoder) arrayCount() (uint64, error) {
+	return d.arrayCountFor(d.cur.ID, schemaBound{decl: d.bounded})
+}
+
+// arrayCountFor is arrayCount with the field id and the schema-bound source
+// supplied by the caller — the form the visitor stream surface needs, where the
+// scope's visitor answers whether the schema bounds this count (§6.2.1).
+func (d *Decoder) arrayCountFor(id ID, sb schemaBound) (uint64, error) {
 	n, err := d.readVarint(false)
 	if err != nil {
 		return 0, err
@@ -600,7 +646,7 @@ func (d *Decoder) arrayCount() (uint64, error) {
 	if n > arrayMax {
 		return 0, ErrInvalidMsg
 	}
-	if err := d.lim.checkArrayCount(n); err != nil {
+	if err := d.lim.checkArrayCount(n, id, sb); err != nil {
 		return 0, err
 	}
 	return n, nil

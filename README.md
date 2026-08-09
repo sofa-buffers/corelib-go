@@ -146,6 +146,53 @@ implements, and both surfaces then reach the same verdict on the same bytes.
 `NarrowUnsigned` / `NarrowSigned` are plain conversions for that visitor path and
 assume the bound has already been applied.
 
+#### Receiver-side limits stop at a schema bound
+
+`WithMaxArrayCount` / `WithMaxStringLen` / `WithMaxBlobLen` cap what a decode will
+materialize from a size the *sender* chose. They are deployment configuration,
+not schema: exceeding one is `ErrLimitExceeded` — a policy rejection, never
+`ErrInvalidMsg`, since the same bytes decode under a looser cap — and they are
+enforced at the count/length word, before any element slice or payload buffer.
+
+They apply to **schema-unbounded fields only**. Where the schema states a
+`count:`/`maxlen:`, CORELIB_PLAN §6.2.1 has that bound govern and its violation is
+`ErrInvalidMsg` (MESSAGE_SPEC §7.1); §6.3 adds that `ErrLimitExceeded` is *never*
+raised for such a field. Only the schema knows which fields those are, so the
+destination says so:
+
+```go
+// Generated code declares the bound...
+func (m *Msg) SchemaBound(id sofab.ID, what sofab.BoundKind) bool {
+    return id == 4 && what == sofab.BoundArrayCount   // schema: count: 10000
+}
+
+// ...and enforces it at the header, which is what replaces the cap.
+func (m *Msg) ArrayBegin(id sofab.ID, kind sofab.ArrayKind, count int) error {
+    if id == 4 && count > 10000 { return sofab.ErrInvalidMsg }
+    return nil
+}
+```
+
+With that, a 5000-element array on field 4 decodes even under
+`WithMaxArrayCount(1000)`, while every field the schema leaves unbounded stays
+capped. `BoundKind` names the size being asked about — `BoundArrayCount`,
+`BoundStringLen`, `BoundBlobLen` — so the exemption is per `(id, kind)`, and a
+field arriving under a shape the schema does not declare for that id (the §7.3
+skip) keeps the cap. Answering `true` is a promise to enforce: the cap no longer
+stands between an untrusted header and the allocation it implies.
+
+`SchemaBoundVisitor` is a separate optional interface, like `HeaderVisitor` and
+`ElemBoundVisitor`, so a visitor that does not implement it decodes exactly as
+before. It is consulted only *after* a configured cap has been exceeded — a decode
+with no limits set never pays for it, not even the type assertion. On the pull
+surface the caller knows the schema instead, and says so per field:
+
+```go
+f, _ := d.Next()
+if f.ID == 4 { d.SchemaBounded() }          // covers this field only
+v, err := sofab.ReadUnsignedArray[uint32](d)
+```
+
 #### When the reader's type disagrees with the wire
 
 A typed reader bound to a field of another type — a different wire type, or for a
