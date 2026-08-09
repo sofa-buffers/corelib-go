@@ -474,8 +474,9 @@ func (d *Decoder) Float64() (float64, error) {
 
 // String consumes the current field as a string. When strict UTF-8 is enabled
 // (SOFAB_STRICT_UTF8, the default; §6.4), a payload that is not valid UTF-8 is
-// rejected as ErrInvalidMsg (the INVALID outcome, §5.2). With it disabled
-// (WithStrictUTF8(false)) the wire bytes are kept verbatim. Validation runs only
+// rejected as ErrInvalidMsg (the INVALID outcome, §5.2). With it disabled —
+// WithStrictUTF8(false), or a `sofab_no_strict_utf8` build, in which the
+// validator is not compiled in at all — the wire bytes are kept verbatim. Validation runs only
 // here, where the string is materialized — a skipped field (Skip) is a length
 // jump that is never validated (§6.4). The full payload is assembled (via
 // fixlenBytes → readRaw) before this check, so a payload split across a chunk
@@ -486,7 +487,7 @@ func (d *Decoder) String() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if d.lim.strictUTF8 && !utf8.Valid(b) {
+	if d.lim.strictUTF8On() && !utf8.Valid(b) {
 		return "", ErrInvalidMsg
 	}
 	return string(b), nil

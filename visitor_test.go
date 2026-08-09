@@ -498,17 +498,17 @@ func TestInvalidUTF8Rejected(t *testing.T) {
 	in := append(vhdr(1, sofab.TypeFixlen), append(vbytes((1<<3)|subStr), 0xFF)...)
 	d := newDec(in)
 	mustNext(t, d)
-	if _, err := d.String(); !errors.Is(err, sofab.ErrInvalidMsg) {
-		t.Fatalf("pull String invalid utf8 = %v, want ErrInvalidMsg", err)
-	}
+	_, err := d.String()
+	checkUTF8Decode(t, "pull String invalid utf8", err)
 	// A visitor with no destination for the id ignores the payload: accepted.
 	if err := sofab.AcceptBytes(in, baseV{}); err != nil {
 		t.Fatalf("visitor with no destination = %v, want nil (skips are never validated)", err)
 	}
-	// A visitor that binds id 1 validates at the destination: INVALID.
-	if err := sofab.AcceptBytes(in, &bindStrV{id: 1}); !errors.Is(err, sofab.ErrInvalidMsg) {
-		t.Fatalf("visitor destination invalid utf8 = %v, want ErrInvalidMsg", err)
-	}
+	// A visitor that binds id 1 validates at the destination: INVALID — in the
+	// default build. Where §6.4 let the validator be compiled out there is
+	// nothing to validate with, so the payload is bound verbatim instead.
+	checkUTF8Decode(t, "visitor destination invalid utf8",
+		sofab.AcceptBytes(in, &bindStrV{id: 1}))
 	// A blob with the same payload is fine (blobs are opaque).
 	blob := append(vhdr(1, sofab.TypeFixlen), append(vbytes((1<<3)|subBlob), 0xFF)...)
 	if err := sofab.AcceptBytes(blob, baseV{}); err != nil {

@@ -3,6 +3,7 @@ package sofab_test
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"testing"
 	"testing/iotest"
 
@@ -41,6 +42,58 @@ func strField(id sofab.ID, payload []byte) []byte {
 	return append(out, payload...)
 }
 
+// --- the build-configuration-aware assertions (issue #88) -------------------
+//
+// §6.4 has TWO gates, and the suite has to state the contract for both. The
+// runtime one (WithStrictUTF8) is exercised by passing options, below. The
+// compile-time one is a build tag, so it cannot be varied inside a run: the
+// tests instead branch on utf8CheckCompiled, declared per build in
+// utf8_build_on_test.go / utf8_build_off_test.go. Before this, every UTF-8
+// assertion hard-coded the ON verdict, so `go test -tags sofab_no_strict_utf8`
+// — a build the README documents — was red and could never be run.
+//
+// utf8Invalid is what an invalid-UTF-8 payload that IS materialized into a
+// destination is worth in THIS build: the INVALID outcome where the validator
+// is compiled in, and nothing at all where §6.4 let it be compiled out. A
+// payload that is only SKIPPED is nil in both builds and needs no helper — that
+// rule (§6.4, never validate a skip) is build-independent.
+func utf8Invalid() error {
+	if utf8CheckCompiled {
+		return sofab.ErrInvalidMsg
+	}
+	return nil
+}
+
+// checkUTF8Decode asserts got is the decode verdict utf8Invalid describes.
+func checkUTF8Decode(t *testing.T, what string, got error) {
+	t.Helper()
+	if !utf8CheckCompiled {
+		if got != nil {
+			t.Fatalf("%s = %v, want nil (the validator is compiled out)", what, got)
+		}
+		return
+	}
+	if !errors.Is(got, sofab.ErrInvalidMsg) {
+		t.Fatalf("%s = %v, want ErrInvalidMsg", what, got)
+	}
+}
+
+// checkUTF8Encode is the encode-side twin: §6.4 makes the reject symmetric, so
+// where decode says INVALID, WriteString says ErrArgument — and where the check
+// is compiled out, the bytes go out verbatim.
+func checkUTF8Encode(t *testing.T, what string, got error) {
+	t.Helper()
+	if !utf8CheckCompiled {
+		if got != nil {
+			t.Fatalf("%s = %v, want nil (the validator is compiled out)", what, got)
+		}
+		return
+	}
+	if !errors.Is(got, sofab.ErrArgument) {
+		t.Fatalf("%s = %v, want ErrArgument", what, got)
+	}
+}
+
 // --- decode, strict ON (default): invalid UTF-8 is INVALID ------------------
 
 // TestStrictUTF8DecodeDefaultRejects proves SOFAB_STRICT_UTF8 defaults to ON:
@@ -55,12 +108,13 @@ func TestStrictUTF8DecodeDefaultRejects(t *testing.T) {
 
 	d := sofab.NewDecoder(bytes.NewReader(in))
 	mustNext(t, d)
-	if _, err := d.String(); !errors.Is(err, sofab.ErrInvalidMsg) {
-		t.Fatalf("pull String default = %v, want ErrInvalidMsg", err)
+	got, err := d.String()
+	checkUTF8Decode(t, "pull String default", err)
+	if err == nil && got != "\xFF" {
+		t.Fatalf("pull String default = % X, want FF verbatim", got)
 	}
-	if err := sofab.AcceptBytes(in, &bindStrV{id: 1}); !errors.Is(err, sofab.ErrInvalidMsg) {
-		t.Fatalf("visitor destination default = %v, want ErrInvalidMsg", err)
-	}
+	checkUTF8Decode(t, "visitor destination default",
+		sofab.AcceptBytes(in, &bindStrV{id: 1}))
 	var v capV
 	if err := sofab.AcceptBytes(in, &v); err != nil {
 		t.Fatalf("visitor without destination = %v, want nil", err)
@@ -86,18 +140,16 @@ func TestStrictUTF8DecodeRejectsVariants(t *testing.T) {
 		"bare-continuation": {0x80},
 	}
 	for name, payload := range cases {
-		if sofab.Utf8Valid(payload) {
-			t.Fatalf("%s Utf8Valid = true, want false", name)
+		if got, want := sofab.Utf8Valid(payload), !utf8CheckCompiled; got != want {
+			t.Fatalf("%s Utf8Valid = %v, want %v", name, got, want)
 		}
 		in := strField(0, payload)
-		if err := sofab.AcceptBytes(in, &bindStrV{id: 0}); !errors.Is(err, sofab.ErrInvalidMsg) {
-			t.Fatalf("%s visitor destination = %v, want ErrInvalidMsg", name, err)
-		}
+		checkUTF8Decode(t, name+" visitor destination",
+			sofab.AcceptBytes(in, &bindStrV{id: 0}))
 		d := sofab.NewDecoder(bytes.NewReader(in))
 		mustNext(t, d)
-		if _, err := d.String(); !errors.Is(err, sofab.ErrInvalidMsg) {
-			t.Fatalf("%s pull = %v, want ErrInvalidMsg", name, err)
-		}
+		_, err := d.String()
+		checkUTF8Decode(t, name+" pull", err)
 	}
 }
 
@@ -134,9 +186,12 @@ func TestUtf8ValidPrimitive(t *testing.T) {
 		"continuation-8A":  {0x8A},
 		"trailing-partial": {'a', 0xE2, 0x82},
 	}
+	// The reject side is exactly what the build tag folds away, so it is
+	// asserted against the build: false where the validator is compiled in,
+	// true where §6.4 let it be compiled out (never a third answer).
 	for name, b := range invalid {
-		if sofab.Utf8Valid(b) {
-			t.Fatalf("Utf8Valid(%s) = true, want false", name)
+		if got, want := sofab.Utf8Valid(b), !utf8CheckCompiled; got != want {
+			t.Fatalf("Utf8Valid(%s) = %v, want %v", name, got, want)
 		}
 	}
 }
@@ -202,8 +257,17 @@ func TestStrictUTF8EncodeDefaultRejects(t *testing.T) {
 
 	var buf bytes.Buffer
 	e := sofab.NewEncoder(&buf)
-	if err := e.WriteString(1, bad); !errors.Is(err, sofab.ErrArgument) {
-		t.Fatalf("WriteString default = %v, want ErrArgument", err)
+	checkUTF8Encode(t, "WriteString default", e.WriteString(1, bad))
+	if !utf8CheckCompiled {
+		// The check is compiled out: the bytes go out verbatim (§6.4 OFF is
+		// "raw or reject, never silent lossy"), so there is no sticky error.
+		if err := e.Flush(); err != nil {
+			t.Fatalf("Flush = %v, want nil", err)
+		}
+		if want := strField(1, []byte(bad)); !bytes.Equal(buf.Bytes(), want) {
+			t.Fatalf("wrote % X, want % X verbatim", buf.Bytes(), want)
+		}
+		return
 	}
 	if err := e.Flush(); !errors.Is(err, sofab.ErrArgument) {
 		t.Fatalf("Flush after reject = %v, want sticky ErrArgument", err)
@@ -219,9 +283,7 @@ func TestStrictUTF8EncodeRejectsSurrogate(t *testing.T) {
 	sur := string([]byte{0xED, 0xA0, 0x80}) // U+D800
 	var buf bytes.Buffer
 	e := sofab.NewEncoder(&buf)
-	if err := e.WriteString(0, sur); !errors.Is(err, sofab.ErrArgument) {
-		t.Fatalf("WriteString surrogate = %v, want ErrArgument", err)
-	}
+	checkUTF8Encode(t, "WriteString surrogate", e.WriteString(0, sur))
 }
 
 // TestStrictUTF8EncodeOffVerbatim proves WriteString writes arbitrary bytes
@@ -378,15 +440,22 @@ func TestStrictUTF8OffReachesVisitorDestination(t *testing.T) {
 // have turned the default lax — a policy value that is never delivered, or one
 // delivered with the wrong polarity, would silently accept malformed input.
 func TestStrictUTF8OnReachesVisitorDestination(t *testing.T) {
-	in := strField(1, []byte{0x41, 0xFF, 0x42})
+	payload := []byte{0x41, 0xFF, 0x42}
+	in := strField(1, payload)
 	for name, accept := range acceptPaths {
 		for _, opts := range [][]sofab.Option{nil, {sofab.WithStrictUTF8(true)}} {
 			v := &genStrV{id: 1}
-			if err := accept(in, v, opts...); !errors.Is(err, sofab.ErrInvalidMsg) {
-				t.Fatalf("%s on (%d opts) = %v, want ErrInvalidMsg", name, len(opts), err)
-			}
-			if v.set {
-				t.Fatalf("%s on bound %q, want the field rejected", name, v.got)
+			err := accept(in, v, opts...)
+			checkUTF8Decode(t, fmt.Sprintf("%s on (%d opts)", name, len(opts)), err)
+			if utf8CheckCompiled {
+				if v.set {
+					t.Fatalf("%s on bound %q, want the field rejected", name, v.got)
+				}
+			} else if !v.set || v.got != string(payload) {
+				// The compile-time gate wins over the runtime one, so the
+				// destination binds the wire bytes verbatim (§6.4).
+				t.Fatalf("%s (%d opts) bound % X (set=%v), want % X verbatim",
+					name, len(opts), v.got, v.set, payload)
 			}
 		}
 	}
@@ -419,9 +488,7 @@ func TestStrictUTF8PolicyReachesNestedScope(t *testing.T) {
 
 		inner = &genStrV{id: 1}
 		outer = &genStrV{id: 1, nested: inner}
-		if err := accept(in, outer); !errors.Is(err, sofab.ErrInvalidMsg) {
-			t.Fatalf("%s nested on = %v, want ErrInvalidMsg", name, err)
-		}
+		checkUTF8Decode(t, name+" nested on", accept(in, outer))
 	}
 }
 
@@ -449,39 +516,38 @@ func TestStrictUTF8ScopedCheckNeverValidatesASkip(t *testing.T) {
 // silently accept malformed input.
 func TestStringCheckZeroValueIsStrict(t *testing.T) {
 	var c sofab.StringCheck
-	if c.Utf8Valid([]byte{0xFF}) {
-		t.Fatal("zero-value StringCheck accepted invalid UTF-8, want strict")
+	if got, want := c.Utf8Valid([]byte{0xFF}), !utf8CheckCompiled; got != want {
+		t.Fatalf("zero-value StringCheck.Utf8Valid(FF) = %v, want %v", got, want)
 	}
 	if !c.Utf8Valid([]byte("ok")) {
 		t.Fatal("zero-value StringCheck rejected valid UTF-8")
 	}
 
 	v := &genStrV{id: 1}
-	if err := v.String(1, "\xFF"); !errors.Is(err, sofab.ErrInvalidMsg) {
-		t.Fatalf("undelivered destination = %v, want ErrInvalidMsg", err)
-	}
+	checkUTF8Decode(t, "undelivered destination", v.String(1, "\xFF"))
 
 	// And the delivered OFF policy is not sticky across decodes: a fresh
-	// destination is strict again.
+	// destination is strict again (in a build that has a check to be strict
+	// with — where it is compiled out, both decodes accept).
 	if err := sofab.AcceptBytes(strField(1, []byte{0xFF}), v, sofab.WithStrictUTF8(false)); err != nil {
 		t.Fatalf("off decode = %v, want nil", err)
 	}
-	if err := sofab.AcceptBytes(strField(1, []byte{0xFF}), &genStrV{id: 1}); !errors.Is(err, sofab.ErrInvalidMsg) {
-		t.Fatalf("fresh destination after an off decode = %v, want ErrInvalidMsg", err)
-	}
+	checkUTF8Decode(t, "fresh destination after an off decode",
+		sofab.AcceptBytes(strField(1, []byte{0xFF}), &genStrV{id: 1}))
 }
 
 // TestUtf8ValidPrimitiveStaysAlwaysStrict pins the compatibility contract the
-// fix keeps: the package-level primitive is the always-strict form, so code
+// fix keeps: the package-level primitive ignores the RUNTIME option, so code
 // generated before the scoped check existed still compiles and still rejects —
 // WithStrictUTF8(false) does not reach it, because a package-level function has
-// no decode scope to read the option from.
+// no decode scope to read the option from. The COMPILE-TIME gate is the one
+// thing that does reach it: §6.4 puts it first, so a `sofab_no_strict_utf8`
+// build folds the primitive to true and this test asserts that instead.
 func TestUtf8ValidPrimitiveStaysAlwaysStrict(t *testing.T) {
 	in := strField(1, []byte{0xFF})
-	if err := sofab.AcceptBytes(in, &bindStrV{id: 1}, sofab.WithStrictUTF8(false)); !errors.Is(err, sofab.ErrInvalidMsg) {
-		t.Fatalf("package-level primitive under off = %v, want ErrInvalidMsg", err)
-	}
-	if sofab.Utf8Valid([]byte{0xFF}) {
-		t.Fatal("Utf8Valid accepted invalid UTF-8")
+	checkUTF8Decode(t, "package-level primitive under off",
+		sofab.AcceptBytes(in, &bindStrV{id: 1}, sofab.WithStrictUTF8(false)))
+	if got, want := sofab.Utf8Valid([]byte{0xFF}), !utf8CheckCompiled; got != want {
+		t.Fatalf("Utf8Valid(FF) = %v, want %v", got, want)
 	}
 }
