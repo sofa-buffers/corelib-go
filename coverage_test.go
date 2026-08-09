@@ -161,43 +161,32 @@ func TestEmptyArraysRoundTripPull(t *testing.T) {
 	}
 }
 
-// --- decoder usage errors (right header, wrong typed reader) ------------------
+// --- decoder type mismatches (right header, wrong typed reader) ---------------
 
-func TestDecoderWrongTypeUsageErrors(t *testing.T) {
-	// An unsigned field: every other typed reader must report ErrUsage without
-	// consuming the value.
+// A typed reader run against a field of another type used to report ErrUsage —
+// the "invalid usage" code CORELIB_PLAN §6.3 removed. It is now the MESSAGE_SPEC
+// §7.3 skip (ErrTypeMismatch), and the reader consumes the field so the loop can
+// continue; the cross product of every reader against every other field type,
+// the resync, and what is left of ErrArgument live in type_mismatch_test.go
+// (issue #79). The two representative pairings stay here.
+func TestDecoderWrongTypeIsASkip(t *testing.T) {
 	d := newDec(encode(t, func(e *sofab.Encoder) { e.WriteUnsigned(1, 42) }))
 	mustNext(t, d)
-
-	if _, err := d.Signed(); !errors.Is(err, sofab.ErrUsage) {
-		t.Fatalf("Signed = %v", err)
+	if _, err := d.Signed(); !errors.Is(err, sofab.ErrTypeMismatch) {
+		t.Fatalf("Signed on unsigned = %v, want ErrTypeMismatch", err)
 	}
-	// And the mirror: Unsigned on a signed field is also a usage error.
+	if _, err := d.Next(); err != io.EOF {
+		t.Fatalf("Next = %v, want io.EOF: the mismatched field must be consumed", err)
+	}
+
+	// And the mirror direction.
 	ds := newDec(encode(t, func(e *sofab.Encoder) { e.WriteSigned(1, -42) }))
 	mustNext(t, ds)
-	if _, err := ds.Unsigned(); !errors.Is(err, sofab.ErrUsage) {
-		t.Fatalf("Unsigned on signed = %v", err)
+	if _, err := ds.Unsigned(); !errors.Is(err, sofab.ErrTypeMismatch) {
+		t.Fatalf("Unsigned on signed = %v, want ErrTypeMismatch", err)
 	}
-	if _, err := d.Float32(); !errors.Is(err, sofab.ErrUsage) {
-		t.Fatalf("Float32 = %v", err)
-	}
-	if _, err := d.Float64(); !errors.Is(err, sofab.ErrUsage) {
-		t.Fatalf("Float64 = %v", err)
-	}
-	if _, err := d.String(); !errors.Is(err, sofab.ErrUsage) {
-		t.Fatalf("String = %v", err)
-	}
-	if _, err := sofab.ReadUnsignedArray[uint32](d); !errors.Is(err, sofab.ErrUsage) {
-		t.Fatalf("ReadUnsignedArray = %v", err)
-	}
-	if _, err := sofab.ReadSignedArray[int32](d); !errors.Is(err, sofab.ErrUsage) {
-		t.Fatalf("ReadSignedArray = %v", err)
-	}
-	if _, err := d.ReadFloat32Array(); !errors.Is(err, sofab.ErrUsage) {
-		t.Fatalf("ReadFloat32Array = %v", err)
-	}
-	if _, err := d.ReadFloat64Array(); !errors.Is(err, sofab.ErrUsage) {
-		t.Fatalf("ReadFloat64Array = %v", err)
+	if _, err := ds.Next(); err != io.EOF {
+		t.Fatalf("Next = %v, want io.EOF: the mismatched field must be consumed", err)
 	}
 }
 
@@ -259,10 +248,13 @@ func TestDecoderTruncatedValues(t *testing.T) {
 			sofab.ErrIncomplete,
 		},
 		{
+			// A well-formed string read as a blob: the §7.3 skip, not a malformed
+			// message (issue #79). The payload is consumed, so it is not INCOMPLETE
+			// either.
 			"bytes wrong subtype (string, not blob)",
 			append(vhdr(0, sofab.TypeFixlen), append(vbytes((1<<3)|subStr), 'x')...),
 			func(d *sofab.Decoder) error { _, err := d.Bytes(); return err },
-			sofab.ErrInvalidMsg,
+			sofab.ErrTypeMismatch,
 		},
 		{
 			"fixlen length above max",
@@ -313,10 +305,13 @@ func TestDecoderTruncatedValues(t *testing.T) {
 			sofab.ErrIncomplete,
 		},
 		{
-			"float32-array wrong element header",
+			// A well-formed one-element fp64 array read as fp32: §7.3 skips it, and
+			// the skip runs off the end of the (payload-less) input — INCOMPLETE,
+			// the same verdict the matching read would give (issue #79).
+			"float32-array fp64 elements, payload truncated",
 			append(vhdr(0, sofab.TypeFixlenArray), append(vbytes(1), vbytes((8<<3)|subFP64)...)...),
 			func(d *sofab.Decoder) error { _, err := d.ReadFloat32Array(); return err },
-			sofab.ErrInvalidMsg,
+			sofab.ErrIncomplete,
 		},
 		{
 			"float32-array payload truncated",
@@ -337,10 +332,10 @@ func TestDecoderTruncatedValues(t *testing.T) {
 			sofab.ErrIncomplete,
 		},
 		{
-			"float64-array wrong element header",
+			"float64-array fp32 elements, payload truncated",
 			append(vhdr(0, sofab.TypeFixlenArray), append(vbytes(1), vbytes((4<<3)|subFP32)...)...),
 			func(d *sofab.Decoder) error { _, err := d.ReadFloat64Array(); return err },
-			sofab.ErrInvalidMsg,
+			sofab.ErrIncomplete,
 		},
 		{
 			"float64-array payload truncated",

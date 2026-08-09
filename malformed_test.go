@@ -699,7 +699,8 @@ func TestSkipFixlenHeaderChecked(t *testing.T) {
 
 // TestFixlenReservedSubtypeTypedReaders pins the typed pull readers on the same
 // words: a reserved subtype or a wrong-width float is INVALID there too, and is
-// never confused with the ErrUsage a caller gets for asking for the wrong type.
+// never confused with the ErrTypeMismatch skip a caller gets when the declared
+// type simply disagrees with a well-formed field (§7.3).
 func TestFixlenReservedSubtypeTypedReaders(t *testing.T) {
 	cases := []struct {
 		name string
@@ -738,8 +739,8 @@ func TestFixlenReservedSubtypeTypedReaders(t *testing.T) {
 			if !errors.Is(err, sofab.ErrInvalidMsg) {
 				t.Fatalf("read = %v, want ErrInvalidMsg", err)
 			}
-			if errors.Is(err, sofab.ErrUsage) || errors.Is(err, sofab.ErrIncomplete) {
-				t.Fatalf("read = %v, must not match ErrUsage/ErrIncomplete", err)
+			if errors.Is(err, sofab.ErrTypeMismatch) || errors.Is(err, sofab.ErrIncomplete) {
+				t.Fatalf("read = %v, must not match ErrTypeMismatch/ErrIncomplete", err)
 			}
 		})
 	}

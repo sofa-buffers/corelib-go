@@ -10,6 +10,7 @@ import (
 	"bytes"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
 	"math"
 	"os"
@@ -514,6 +515,84 @@ func TestVectorSkipIDs(t *testing.T) {
 	}
 	if ran == 0 {
 		t.Fatal("no vectors carried skip_ids; expected the suite to exercise the skip-ids scenario")
+	}
+}
+
+// --- §7.3 type-mismatch scenario ----------------------------------------------
+
+// readWrongType binds a deliberately wrong typed reader to the field the decoder
+// is sitting on: a signed read on an unsigned field, a blob read on a fixlen one
+// (which matches only an actual blob), an fp32-array read on a fixlen array
+// (which matches only an fp32 array), and so on. Sequence markers carry no
+// value, so there is nothing to bind.
+func readWrongType(d *sofab.Decoder, t sofab.WireType) error {
+	switch t {
+	case sofab.TypeVarintUnsigned:
+		_, err := d.Signed()
+		return err
+	case sofab.TypeVarintSigned:
+		_, err := d.Unsigned()
+		return err
+	case sofab.TypeFixlen:
+		_, err := d.Bytes()
+		return err
+	case sofab.TypeVarintArrayUnsigned:
+		_, err := sofab.ReadSignedArray[int64](d)
+		return err
+	case sofab.TypeVarintArraySigned:
+		_, err := sofab.ReadUnsignedArray[uint64](d)
+		return err
+	case sofab.TypeFixlenArray:
+		_, err := d.ReadFloat32Array()
+		return err
+	}
+	return nil
+}
+
+// TestVectorTypeMismatchStaysComplete replays every shared vector through the
+// pull parser with the wrong type bound to every field. MESSAGE_SPEC §7.3 makes
+// such a read a skip, exactly like an unknown id, so each of these decodes must
+// still walk the whole message and end COMPLETE (io.EOF at the top level) while
+// reporting nothing worse than ErrTypeMismatch. The vectors are valid messages,
+// and which type a *reader* asks for cannot make them malformed (issue #79) —
+// before the fix these same bytes came back as ErrInvalidMsg or as the "invalid
+// usage" code CORELIB_PLAN §6.3 removed, and the walk stopped at the first
+// mis-bound field.
+func TestVectorTypeMismatchStaysComplete(t *testing.T) {
+	vf := loadVectors(t)
+	mismatches := 0
+	for _, v := range vf.Vectors {
+		t.Run(v.Name, func(t *testing.T) {
+			raw, err := hex.DecodeString(v.Serialized.Hex)
+			if err != nil {
+				t.Fatalf("hex: %v", err)
+			}
+			d := sofab.NewDecoder(bytes.NewReader(raw))
+			for {
+				f, err := d.Next()
+				if err == io.EOF {
+					break // COMPLETE: the whole message was walked
+				}
+				if err != nil {
+					t.Fatalf("Next: %v", err)
+				}
+				switch err := readWrongType(d, f.Type); {
+				case err == nil:
+					// The wrong reader happened to be the right one for this
+					// field (a blob, or an fp32 array): a normal read.
+				case errors.Is(err, sofab.ErrTypeMismatch):
+					mismatches++
+					if errors.Is(err, sofab.ErrInvalidMsg) || errors.Is(err, sofab.ErrArgument) {
+						t.Fatalf("id %d: mismatch reported as %v", f.ID, err)
+					}
+				default:
+					t.Fatalf("id %d (wire type %d): %v, want nil or ErrTypeMismatch", f.ID, f.Type, err)
+				}
+			}
+		})
+	}
+	if mismatches == 0 {
+		t.Fatal("no vector produced a type mismatch; the scenario went vacuous")
 	}
 }
 

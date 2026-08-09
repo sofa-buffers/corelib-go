@@ -87,12 +87,36 @@ type Signed interface {
 // codes (write-buffer-full is reported via the underlying io.Writer instead).
 var (
 	// ErrArgument is an invalid caller argument (e.g. id > IDMax, opening a
-	// nested sequence past MaxDepth, or — with strict UTF-8 enabled, §6.4 — a
+	// nested sequence past MaxDepth, calling a typed pull reader when no field's
+	// value is waiting to be read, or — with strict UTF-8 enabled, §6.4 — a
 	// WriteString value that is not valid UTF-8). This is the InvalidArgument code
-	// (§6.3).
+	// (§6.3), and since §6.3 removed the separate "invalid usage" code it is the
+	// only code for a caller mistake.
 	ErrArgument = errors.New("sofab: invalid argument")
-	// ErrUsage is invalid API usage (e.g. reading a value as the wrong type).
-	ErrUsage = errors.New("sofab: invalid usage")
+	// ErrTypeMismatch reports that a typed pull read did not match the field on
+	// the wire — a different wire type, or for a fixlen a different subtype than
+	// the one the requested type maps to. Per MESSAGE_SPEC §7.3 this is *not an
+	// error about the message*: the field is skipped exactly like one with an
+	// unknown id, the destination is left untouched, and a decode that meets
+	// nothing else stays COMPLETE. The same bytes decode fine for a peer whose
+	// schema declares the other type, so reporting them as malformed would turn
+	// the forward-compatibility case §7.3 exists for into a hard failure.
+	//
+	// It is therefore a distinct sentinel, deliberately neither ErrInvalidMsg nor
+	// ErrArgument: a mismatch is not a caller mistake either, because nothing at
+	// the call distinguishes "the caller bound the wrong type" from "a peer sent
+	// another type for this id" — and §6.3 says the outcome is the same skip
+	// regardless.
+	//
+	// The value is consumed before the error is returned, so the decoder sits on
+	// the next field boundary and a pull loop simply continues with Next. The one
+	// exception is a sequence start/end, which carries no value: there nothing is
+	// consumed and the caller skips the sub-tree with Skip, exactly as it does for
+	// an unknown id.
+	//
+	// Test for it with errors.Is. Generated code decodes through Accept /
+	// AcceptBytes and applies §7.3 in its own field switch, so it never sees this.
+	ErrTypeMismatch = errors.New("sofab: field type does not match the read")
 	// ErrInvalidMsg is malformed input that is wrong regardless of what bytes
 	// might follow: varint overflow (> 64 bits), a bad type/subtype tag, a length
 	// or count past arrayMax, a dangling sequence end, nesting past MaxDepth, or

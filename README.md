@@ -124,6 +124,43 @@ held to the same absolute ceiling, and a pull loop reaches the same verdict as
 `Accept` / `AcceptBytes` on the same bytes. A balanced end marker is still
 delivered as an ordinary `TypeSequenceEnd` header.
 
+#### When the reader's type disagrees with the wire
+
+A typed reader bound to a field of another type — a different wire type, or for a
+`fixlen` a different subtype (`fp32`/`fp64`/`string`/`blob`) — returns
+**`ErrTypeMismatch`**. That is **not** an error about the message: MESSAGE_SPEC
+§7.3 says such a field is **skipped exactly like one with an unknown id**, so the
+reader consumes the value, leaves your destination untouched, and parks the
+decoder on the next field boundary — the loop simply continues with `Next`, and a
+decode that meets nothing else still ends `COMPLETE` (`io.EOF` at the top level).
+The same bytes decode fine for a peer whose schema declares the other type, which
+is why they are neither `ErrInvalidMsg` nor a caller error (CORELIB_PLAN §6.3
+removed the "invalid usage" code outright — there is no `ErrUsage`):
+
+```go
+case f.ID == 3:
+    s, err := d.String()
+    if errors.Is(err, sofab.ErrTypeMismatch) { break }  // a peer sent another type: keep the default
+    if err != nil { /* ErrInvalidMsg / ErrIncomplete / ErrLimitExceeded */ }
+    _ = s
+```
+
+The one exception is a sequence start/end, which carries no value: there
+`ErrTypeMismatch` consumes nothing and the caller skips the sub-tree with `Skip()`
+itself, exactly as it does for an unknown id.
+
+Framing is judged first and still wins: a reserved fixlen subtype, a wrong-width
+`fp32`/`fp64`, an element word that is not `fp32`/4 or `fp64`/8, a count past
+`ARRAY_MAX` — all `ErrInvalidMsg`, mismatch or not. And a mismatched field that
+runs off the end while being skipped is `ErrIncomplete`, the same verdict the
+matching read would give. What is left for **`ErrArgument`** is the genuine caller
+mistake: a typed reader called with no field waiting, or after the current value
+was already consumed.
+
+Generated code decodes through `Accept` / `AcceptBytes` and applies §7.3 in its
+own field switch, so it never sees `ErrTypeMismatch`; both surfaces reach the same
+verdict on the same bytes.
+
 ### Deserialize stream
 
 The very same loop reads a stream: hand `NewDecoder` any `io.Reader` and it refills

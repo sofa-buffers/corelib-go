@@ -91,6 +91,15 @@
 // Test the two with errors.Is; they are distinct sentinels, so a truncated
 // stream is never conflated with a malformed one.
 //
+// A further sentinel sits beside them on the pull path: ErrTypeMismatch, returned
+// when a typed reader is bound to a field of another wire type — or, for a
+// fixlen, another subtype. It is not a verdict on the message: MESSAGE_SPEC §7.3
+// skips such a field exactly like one with an unknown id, so the reader consumes
+// the value, leaves the destination untouched, and the decode stays COMPLETE.
+// CORELIB_PLAN §6.3 has no "invalid usage" code; what is left of caller error is
+// ErrArgument — a typed reader called with no field waiting, or after the current
+// value was already consumed.
+//
 // # Encoding example (what generated Marshal code looks like)
 //
 //	func (m *SensorReading) Marshal(e *sofab.Encoder) error {
