@@ -102,8 +102,10 @@ jobs:
           check-latest: true
 
       - name: Generate coverage profile
-        # Cover the library package; the perfbench command has no tests.
-        run: go test -covermode=atomic -coverprofile=coverage.out .
+        # Every package, not just the library: measuring `.` alone left the
+        # perfbench command (the §10 bench/perf harness) out of the profile, so
+        # it could rot untested while the badge stayed high.
+        run: go test -covermode=atomic -coverprofile=coverage.out ./...
 
       - name: Compute coverage badge data
         id: cov
