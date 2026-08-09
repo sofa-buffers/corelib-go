@@ -19,6 +19,15 @@ package sofab
 //
 // Limits apply per field occurrence: array element count for count-prefixed
 // arrays, and byte length for strings and blobs.
+//
+// They apply to SCHEMA-UNBOUNDED fields only. A cap is capacity the deployment
+// is willing to commit to a size the sender chose freely; where the schema
+// already states a `count:`/`maxlen:`, that bound governs and its violation is
+// INVALID, so §6.2.1 forbids the cap there and §6.3 forbids ErrLimitExceeded on
+// such a field. The decoder learns which fields those are from the destination:
+// a visitor that implements SchemaBoundVisitor (generated code does, wherever
+// its schema declares a bound) is exempt on the fields it names, and a pull
+// caller says so per field with Decoder.SchemaBounded.
 type Option func(*limits)
 
 // limits holds the optional per-field decode caps plus the string-validity
@@ -120,24 +129,33 @@ func (l limits) stringCheck() StringCheck {
 
 // checkArrayCount enforces maxArrayCount. The caller has already range-checked n
 // against arrayMax.
-func (l limits) checkArrayCount(n uint64) error {
-	if l.maxArrayCount != 0 && n > l.maxArrayCount {
-		return ErrLimitExceeded
+//
+// sb is consulted only once the cap is exceeded, and only to ask whether the
+// SCHEMA bounds this field's count: there the schema governs and the cap must
+// not fire (§6.2.1, §6.3 — see SchemaBoundVisitor). A decode with no cap set, or
+// a count within it, never reaches the question.
+func (l limits) checkArrayCount(n uint64, id ID, sb schemaBound) error {
+	if l.maxArrayCount == 0 || n <= l.maxArrayCount {
+		return nil
 	}
-	return nil
+	if sb.bounds(id, BoundArrayCount) {
+		return nil
+	}
+	return ErrLimitExceeded
 }
 
 // checkFixlen enforces the string/blob byte-length limits at the fixlen header,
 // before the payload is buffered. The fp32/fp64 subtypes carry no configurable
-// limit (their length is fixed at 4/8 bytes).
-func (l limits) checkFixlen(sub, length uint64) error {
+// limit (their length is fixed at 4/8 bytes). A field whose schema declares a
+// maxlen is exempt for the reason checkArrayCount spells out.
+func (l limits) checkFixlen(sub, length uint64, id ID, sb schemaBound) error {
 	switch sub {
 	case fixStr:
-		if l.maxStringLen != 0 && length > l.maxStringLen {
+		if l.maxStringLen != 0 && length > l.maxStringLen && !sb.bounds(id, BoundStringLen) {
 			return ErrLimitExceeded
 		}
 	case fixBlob:
-		if l.maxBlobLen != 0 && length > l.maxBlobLen {
+		if l.maxBlobLen != 0 && length > l.maxBlobLen && !sb.bounds(id, BoundBlobLen) {
 			return ErrLimitExceeded
 		}
 	}

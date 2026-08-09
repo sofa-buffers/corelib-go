@@ -47,6 +47,9 @@ func (d *Decoder) acceptStream(v Visitor, depth int) error {
 	var hooks hvCache
 	var bounds ebCache
 	var policy spCache
+	// The schema-bound extension (§6.2.1) is asked later still, and needs no cache
+	// of its own: only where a configured receiver cap has already been exceeded.
+	sb := schemaBound{v: v}
 	for {
 		h, err := d.readVarint(true)
 		if err != nil {
@@ -85,19 +88,19 @@ func (d *Decoder) acceptStream(v Visitor, depth int) error {
 				return err
 			}
 		case TypeFixlen:
-			if err := d.acceptStreamFixlen(v, hooks.of(v), &policy, id); err != nil {
+			if err := d.acceptStreamFixlen(v, hooks.of(v), &policy, sb, id); err != nil {
 				return err
 			}
 		case TypeVarintArrayUnsigned:
-			if err := d.acceptStreamUnsignedArray(v, hooks.of(v), &bounds, id); err != nil {
+			if err := d.acceptStreamUnsignedArray(v, hooks.of(v), &bounds, sb, id); err != nil {
 				return err
 			}
 		case TypeVarintArraySigned:
-			if err := d.acceptStreamSignedArray(v, hooks.of(v), &bounds, id); err != nil {
+			if err := d.acceptStreamSignedArray(v, hooks.of(v), &bounds, sb, id); err != nil {
 				return err
 			}
 		case TypeFixlenArray:
-			if err := d.acceptStreamFixlenArray(v, hooks.of(v), id); err != nil {
+			if err := d.acceptStreamFixlenArray(v, hooks.of(v), sb, id); err != nil {
 				return err
 			}
 		case TypeSequenceStart:
@@ -125,8 +128,8 @@ func (d *Decoder) acceptStream(v Visitor, depth int) error {
 	}
 }
 
-func (d *Decoder) acceptStreamFixlen(v Visitor, hv HeaderVisitor, sp *spCache, id ID) error {
-	n, sub, err := d.readFixlenHeader()
+func (d *Decoder) acceptStreamFixlen(v Visitor, hv HeaderVisitor, sp *spCache, sb schemaBound, id ID) error {
+	n, sub, err := d.readFixlenHeaderFor(id, sb)
 	if err != nil {
 		return err
 	}
@@ -181,8 +184,8 @@ func (d *Decoder) acceptStreamFixlen(v Visitor, hv HeaderVisitor, sp *spCache, i
 	}
 }
 
-func (d *Decoder) acceptStreamUnsignedArray(v Visitor, hv HeaderVisitor, eb *ebCache, id ID) error {
-	n, err := d.arrayCount()
+func (d *Decoder) acceptStreamUnsignedArray(v Visitor, hv HeaderVisitor, eb *ebCache, sb schemaBound, id ID) error {
+	n, err := d.arrayCountFor(id, sb)
 	if err != nil {
 		return err
 	}
@@ -214,8 +217,8 @@ func (d *Decoder) acceptStreamUnsignedArray(v Visitor, hv HeaderVisitor, eb *ebC
 	return v.UnsignedArray(id, out)
 }
 
-func (d *Decoder) acceptStreamSignedArray(v Visitor, hv HeaderVisitor, eb *ebCache, id ID) error {
-	n, err := d.arrayCount()
+func (d *Decoder) acceptStreamSignedArray(v Visitor, hv HeaderVisitor, eb *ebCache, sb schemaBound, id ID) error {
+	n, err := d.arrayCountFor(id, sb)
 	if err != nil {
 		return err
 	}
@@ -239,8 +242,8 @@ func (d *Decoder) acceptStreamSignedArray(v Visitor, hv HeaderVisitor, eb *ebCac
 	return v.SignedArray(id, out)
 }
 
-func (d *Decoder) acceptStreamFixlenArray(v Visitor, hv HeaderVisitor, id ID) error {
-	n, err := d.arrayCount()
+func (d *Decoder) acceptStreamFixlenArray(v Visitor, hv HeaderVisitor, sb schemaBound, id ID) error {
+	n, err := d.arrayCountFor(id, sb)
 	if err != nil {
 		return err
 	}
