@@ -446,7 +446,15 @@ func (d *Decoder) skipValue() error {
 		_, err = d.r.Discard(int(n))
 		return eofToIncomplete(err)
 	case TypeVarintArrayUnsigned, TypeVarintArraySigned:
-		n, err := d.readVarint(false)
+		// As on the fixlen-array arm below and in the typed readers, the count goes
+		// through arrayCount: the ceilings are properties of the wire format, so a
+		// count past arrayMax is INVALID (§6.2), and INVALID dominates INCOMPLETE
+		// (§5.2). Read as a bare varint, an over-ceiling count on a truncated array
+		// was masked by the element walk simply running out of bytes, and the caller
+		// was told to wait for more of a message that can never become valid (issue
+		// #77). Any receiver limit applies here too (§6.2.1, ErrLimitExceeded),
+		// matching the visitor paths on the same bytes.
+		n, err := d.arrayCount()
 		if err != nil {
 			return err
 		}
