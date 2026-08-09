@@ -8,10 +8,13 @@
 //
 // This package is the runtime stream core, equivalent to the C corelib's
 // istream/ostream. It is consumed by *generated code*: a schema-driven code
-// generator emits one Go struct per message plus Marshal/Unmarshal methods that
-// call the Encoder/Decoder primitives here. (This mirrors how protobuf-go
-// generated code calls its runtime.) The generator itself is out of scope for
-// this package.
+// generator emits one Go struct per message plus the Serialize/Visitor pair that
+// drives the Encoder/Decoder primitives here, wrapped in the one-shot
+// Encode/Decode<Name> helpers. Those names are fixed by CORELIB_PLAN §6.1.1,
+// which closes the generated layer's name set to encode/decode/try_decode/
+// serialize/deserialize/decoder and admits no second spelling beside them.
+// (This mirrors how protobuf-go generated code calls its runtime.) The
+// generator itself is out of scope for this package.
 //
 // # Streaming
 //
@@ -30,13 +33,13 @@
 //     materializing the whole message. Best for hand-written, power-user code.
 //   - Visitor: implement Visitor on the target type and call Decoder.Accept; the
 //     decoder drives, binding each field straight into a struct member. This is
-//     what generated Unmarshal code uses. See the Decoding example below.
+//     what a generated Decode<Name> uses. See the Decoding example below.
 //
 // The visitor path reads the message into one contiguous buffer and parses it by
 // advancing a cursor over it (the protobuf-style decode kernel), so for an
 // in-memory source it is faster than the pull parser but does buffer the whole
 // message. AcceptBytes is the zero-copy form when the message is already a
-// []byte (e.g. generated Unmarshal).
+// []byte (e.g. a generated Decode<Name>).
 //
 // # Sequence framing (omitting an all-default sequence)
 //
@@ -50,7 +53,7 @@
 //
 // Encoder.WriteSequenceBeginLazy resolves that by holding the header back: the
 // first field write inside the sequence emits the whole run of held-back
-// headers, outermost first. Since generated Marshal code already omits every
+// headers, outermost first. Since a generated Serialize already omits every
 // child equal to its default, "not one child was written" is exactly "the object
 // equals its declared default" — per child field, recursively, for free, and
 // never as a byte comparison, so struct padding cannot influence it.
@@ -109,19 +112,34 @@
 // payload or element count past FIXLEN_MAX/ARRAY_MAX, a sequence opened past
 // MaxDepth or closed with none open — is refused before any byte is written.
 //
-// # Encoding example (what generated Marshal code looks like)
+// # Encoding example (what a generated Serialize looks like)
 //
-//	func (m *SensorReading) Marshal(e *sofab.Encoder) error {
+//	func (m *SensorReading) Serialize(e *sofab.Encoder) {
 //		e.WriteUnsigned(1, uint64(m.ID))
 //		e.WriteSigned(2, int64(m.Temperature))
 //		e.WriteString(3, m.Name)
 //		sofab.WriteUnsignedArray(e, 4, m.Samples)
-//		return e.Flush()
 //	}
 //
-// # Decoding example (what generated Unmarshal code looks like)
+// Errors are sticky, so the one-shot wrapper over it checks once at the end:
 //
-//	func (m *SensorReading) Unmarshal(d *sofab.Decoder) error {
+//	func (m *SensorReading) Encode() ([]byte, error) {
+//		var buf bytes.Buffer
+//		e := sofab.NewEncoder(&buf)
+//		m.Serialize(e)
+//		if err := e.Flush(); err != nil {
+//			return nil, err
+//		}
+//		return buf.Bytes(), nil
+//	}
+//
+// # Decoding example (a hand-written Decode over the pull API)
+//
+// Generated code decodes through the visitor path instead — Decode<Name> runs
+// AcceptBytes over the message and binds each field in the Visitor methods —
+// but both surfaces reach the same verdict on the same bytes.
+//
+//	func (m *SensorReading) Decode(d *sofab.Decoder) error {
 //		for {
 //			f, err := d.Next()
 //			if err == io.EOF {

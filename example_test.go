@@ -9,9 +9,10 @@ import (
 )
 
 // SensorReading stands in for a struct emitted by the SofaBuffers code
-// generator. The generator would produce the struct plus the Marshal/Unmarshal
-// methods below; both delegate entirely to the corelib runtime. Field ids are
-// fixed by the schema.
+// generator. The generator would produce the struct plus the Serialize/Decode
+// methods below — the names CORELIB_PLAN §6.1.1 fixes for the generated layer —
+// which delegate entirely to the corelib runtime. Field ids are fixed by the
+// schema.
 type SensorReading struct {
 	ID          uint32
 	Temperature int32
@@ -36,11 +37,11 @@ const (
 	calGain   sofab.ID = 2
 )
 
-// Marshal writes the message the way generated code does: each field is written
-// only when it differs from its declared default — here the zero value —
-// because a field equal to its default is omitted from the wire (MESSAGE_SPEC
-// §2). The reader reconstructs it from the schema.
-func (m *SensorReading) Marshal(e *sofab.Encoder) {
+// Serialize writes the message the way generated code does: each field is
+// written only when it differs from its declared default — here the zero
+// value — because a field equal to its default is omitted from the wire
+// (MESSAGE_SPEC §2). The reader reconstructs it from the schema.
+func (m *SensorReading) Serialize(e *sofab.Encoder) {
 	if m.ID != 0 {
 		e.WriteUnsigned(fieldID, uint64(m.ID))
 	}
@@ -54,19 +55,19 @@ func (m *SensorReading) Marshal(e *sofab.Encoder) {
 		sofab.WriteUnsignedArray(e, fieldSamples, m.Samples)
 	}
 	// A struct FIELD: BeginLazy holds the header back and End drops the frame if
-	// the nested marshal writes nothing, so an all-default sub-message is omitted
+	// the nested serialize writes nothing, so an all-default sub-message is omitted
 	// rather than framed empty (MESSAGE_SPEC §2). That is what makes the per-field
-	// test above compose: because Calibration.marshal omits each of its own
+	// test above compose: because Calibration.serialize omits each of its own
 	// default-valued fields, "not one child was written" is exactly "the
 	// sub-message equals its default" — no extra whole-object comparison needed.
 	// A wrapper-array ELEMENT would close with WriteSequenceEndKeep instead — its
 	// presence is what carries the array's length (§5.1).
 	e.WriteSequenceBeginLazy(fieldCalibration)
-	m.Calibration.marshal(e)
+	m.Calibration.serialize(e)
 	e.WriteSequenceEnd()
 }
 
-func (c *Calibration) marshal(e *sofab.Encoder) {
+func (c *Calibration) serialize(e *sofab.Encoder) {
 	if c.Offset != 0 {
 		e.WriteFloat32(calOffset, c.Offset)
 	}
@@ -75,7 +76,7 @@ func (c *Calibration) marshal(e *sofab.Encoder) {
 	}
 }
 
-func (m *SensorReading) Unmarshal(d *sofab.Decoder) error {
+func (m *SensorReading) Decode(d *sofab.Decoder) error {
 	for {
 		f, err := d.Next()
 		if err == io.EOF {
@@ -96,7 +97,7 @@ func (m *SensorReading) Unmarshal(d *sofab.Decoder) error {
 		case f.ID == fieldSamples && f.Type == sofab.TypeVarintArrayUnsigned:
 			m.Samples, _ = sofab.ReadUnsignedArray[uint16](d)
 		case f.ID == fieldCalibration && f.Type == sofab.TypeSequenceStart:
-			if err := m.Calibration.unmarshal(d); err != nil {
+			if err := m.Calibration.decode(d); err != nil {
 				return err
 			}
 		default:
@@ -107,7 +108,7 @@ func (m *SensorReading) Unmarshal(d *sofab.Decoder) error {
 	}
 }
 
-func (c *Calibration) unmarshal(d *sofab.Decoder) error {
+func (c *Calibration) decode(d *sofab.Decoder) error {
 	for {
 		f, err := d.Next()
 		if err != nil {
@@ -141,32 +142,32 @@ func Example() {
 
 	var buf bytes.Buffer
 	enc := sofab.NewEncoder(&buf)
-	in.Marshal(enc)
+	in.Serialize(enc)
 	if err := enc.Flush(); err != nil {
 		panic(err)
 	}
 
 	var out SensorReading
-	if err := out.Unmarshal(sofab.NewDecoder(&buf)); err != nil {
+	if err := out.Decode(sofab.NewDecoder(&buf)); err != nil {
 		panic(err)
 	}
 
 	fmt.Printf("id=%d temp=%d name=%s samples=%v offset=%.1f gain=%.1f\n",
 		out.ID, out.Temperature, out.Name, out.Samples, out.Calibration.Offset, out.Calibration.Gain)
 
-	// The same Marshal on an all-default value writes nothing at all: every
+	// The same Serialize on an all-default value writes nothing at all: every
 	// field is omitted, so the nested Calibration receives no content and its
 	// held-back header is dropped along with its end marker (MESSAGE_SPEC §2).
 	// An all-default message is the empty byte string, and decoding it back
 	// yields the defaults again.
 	var empty bytes.Buffer
 	def := sofab.NewEncoder(&empty)
-	(&SensorReading{}).Marshal(def)
+	(&SensorReading{}).Serialize(def)
 	if err := def.Flush(); err != nil {
 		panic(err)
 	}
 	var back SensorReading
-	if err := back.Unmarshal(sofab.NewDecoder(&empty)); err != nil {
+	if err := back.Decode(sofab.NewDecoder(&empty)); err != nil {
 		panic(err)
 	}
 	fmt.Printf("all-default: %d bytes, decodes back to id=%d gain=%.1f\n",

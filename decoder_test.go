@@ -211,7 +211,7 @@ func TestOverlongVarintInvalid(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			in := msg(c.last)
 
-			// Visitor path (what generated Unmarshal uses).
+			// Visitor path (what a generated Decode<Name> uses).
 			verr := sofab.AcceptBytes(in, baseV{})
 			if c.wantErr {
 				if !errors.Is(verr, sofab.ErrInvalidMsg) {
