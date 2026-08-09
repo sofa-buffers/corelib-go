@@ -285,55 +285,22 @@ func TestVisitorReaderError(t *testing.T) {
 	}
 }
 
+// TestVisitorMalformed pins the cursor path to the INVALID/INCOMPLETE verdicts
+// of malformedCases (malformed_test.go) — the table shared with the streaming
+// visitor and the pull API, so a case can never hold one surface only.
 func TestVisitorMalformed(t *testing.T) {
-	cases := map[string]struct {
-		in   []byte
-		want error
-	}{
-		"truncated unsigned":    {append(vhdr(1, sofab.TypeVarintUnsigned), 0x80), sofab.ErrIncomplete},
-		"truncated fixlen":      {append(vhdr(1, sofab.TypeFixlen), 0x80), sofab.ErrIncomplete},
-		"bad fixlen subtype":    {append(vhdr(1, sofab.TypeFixlen), vbytes((4<<3)|0x4)...), sofab.ErrInvalidMsg},
-		"truncated array":       {append(vhdr(1, sofab.TypeVarintArrayUnsigned), append(vbytes(2), 0x01, 0x80)...), sofab.ErrIncomplete},
-		"bad fixlen-array elem": {append(vhdr(1, sofab.TypeFixlenArray), append(vbytes(1), vbytes((2<<3)|0x0)...)...), sofab.ErrInvalidMsg},
-		"dangling sequence end": {vhdr(0, sofab.TypeSequenceEnd), sofab.ErrInvalidMsg},
-		"unterminated sequence": {vhdr(3, sofab.TypeSequenceStart), sofab.ErrIncomplete},
-		"fp32 wrong length":     {append(vhdr(1, sofab.TypeFixlen), vbytes((2<<3)|0x0)...), sofab.ErrInvalidMsg},
-		"fp64 wrong length":     {append(vhdr(1, sofab.TypeFixlen), vbytes((4<<3)|0x1)...), sofab.ErrInvalidMsg},
-		"truncated fp32":        {append(vhdr(1, sofab.TypeFixlen), append(vbytes((4<<3)|0x0), 0xAA, 0xBB)...), sofab.ErrIncomplete},
-		"truncated fp64":        {append(vhdr(1, sofab.TypeFixlen), append(vbytes((8<<3)|0x1), 0x01)...), sofab.ErrIncomplete},
-		"truncated string":      {append(vhdr(1, sofab.TypeFixlen), append(vbytes((4<<3)|0x2), 'h', 'i')...), sofab.ErrIncomplete},
-		"truncated blob":        {append(vhdr(1, sofab.TypeFixlen), append(vbytes((4<<3)|0x3), 0x01)...), sofab.ErrIncomplete},
-		"fp32 array truncated":  {append(vhdr(1, sofab.TypeFixlenArray), append(vbytes(1), append(vbytes((4<<3)|0x0), 0x00, 0x00)...)...), sofab.ErrIncomplete},
-		"fp64 array bad elem":   {append(vhdr(1, sofab.TypeFixlenArray), append(vbytes(1), vbytes((4<<3)|0x1)...)...), sofab.ErrInvalidMsg},
-		"signed array trunc":    {append(vhdr(1, sofab.TypeVarintArraySigned), append(vbytes(2), 0x02, 0x80)...), sofab.ErrIncomplete},
-		"array count truncated": {append(vhdr(1, sofab.TypeVarintArrayUnsigned), 0x80), sofab.ErrIncomplete},
-		"id above max":          {append(vhdr(sofab.IDMax+1, sofab.TypeVarintUnsigned), 0x00), sofab.ErrInvalidMsg},
-		// The ID_MAX ceiling binds the sequence-end header too (§4.9, §6.2). The
-		// end marker sits in a valid position — it closes the open sequence — so
-		// its over-ceiling id is the sole reason this is INVALID, isolating the
-		// bound from the dangling-end check. Bytes: 76 87 80 80 80 40 (id 2^31).
-		"seq-end id above max": {append(vhdr(14, sofab.TypeSequenceStart), vhdr(sofab.IDMax+1, sofab.TypeSequenceEnd)...), sofab.ErrInvalidMsg},
-		"truncated signed":     {append(vhdr(1, sofab.TypeVarintSigned), 0x80), sofab.ErrIncomplete},
-		"signed array count":   {append(vhdr(1, sofab.TypeVarintArraySigned), 0x80), sofab.ErrIncomplete},
-		"fixlen array count":   {append(vhdr(1, sofab.TypeFixlenArray), 0x80), sofab.ErrIncomplete},
-		"fixlen array header":  {append(vhdr(1, sofab.TypeFixlenArray), append(vbytes(1), 0x80)...), sofab.ErrIncomplete},
-		"fp64 array payload":   {append(vhdr(1, sofab.TypeFixlenArray), append(vbytes(1), append(vbytes((8<<3)|0x1), 0, 0, 0, 0, 0, 0, 0)...)...), sofab.ErrIncomplete},
-		// cursor-specific boundaries: a value expected exactly at end-of-buffer,
-		// a varint that overflows 64 bits while reading the next header, and a
-		// fixlen length past the cap. (A zero-count array is no longer malformed
-		// — see TestVisitorEmptyArrays — so it is not listed here.)
-		"value at buffer end":    {vhdr(1, sofab.TypeVarintUnsigned), sofab.ErrIncomplete},
-		"header varint overflow": {bytes.Repeat([]byte{0x80}, 11), sofab.ErrInvalidMsg},
-		"fixlen length over max": {append(vhdr(1, sofab.TypeFixlen), vbytes((uint64(sofab.IDMax+1)<<3)|subStr)...), sofab.ErrInvalidMsg},
-	}
-	for name, c := range cases {
-		t.Run(name, func(t *testing.T) {
-			var log []string
-			if err := newDec(c.in).Accept(recorder{&log}); !errors.Is(err, c.want) {
-				t.Fatalf("Accept = %v, want %v", err, c.want)
-			}
+	// Both cursor entry points: the slurping Decoder.Accept and the zero-copy
+	// AcceptBytes that generated Unmarshal code uses.
+	t.Run("Accept", func(t *testing.T) {
+		runMalformedCases(t, func(in []byte, v sofab.Visitor) error {
+			return newDec(in).Accept(v)
 		})
-	}
+	})
+	t.Run("AcceptBytes", func(t *testing.T) {
+		runMalformedCases(t, func(in []byte, v sofab.Visitor) error {
+			return sofab.AcceptBytes(in, v)
+		})
+	})
 }
 
 // TestSequenceEndIDCeilingAndTolerance pins both edges of the id bound on a

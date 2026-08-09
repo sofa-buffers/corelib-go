@@ -507,6 +507,13 @@ boundary (`streaming_test.go`), byte-exact encode/decode and malformed-input
 errors, the visitor path (`visitor_test.go`), roundtrip value preservation, and
 the generated-code-style walkthrough (`example_test.go`).
 
+The malformed and truncated inputs of §7.2 are declared once, as
+`malformedCases` in `malformed_test.go`, and driven through every decode surface:
+the cursor path (`Decoder.Accept` and `AcceptBytes`), the reader-driven
+`Decoder.AcceptStream` byte at a time, and the pull API (`Next`/`Skip`). §5.2
+defines one outcome per message rather than one per entry point, so a new case
+holds all three surfaces by construction.
+
 The suite runs in **both** UTF-8 build configurations. Every UTF-8 assertion is
 written against `utf8CheckCompiled`, a per-build constant declared in
 `utf8_build_on_test.go` / `utf8_build_off_test.go`, so one test body states the
