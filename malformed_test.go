@@ -3,6 +3,7 @@ package sofab_test
 import (
 	"bytes"
 	"errors"
+	"io"
 	"testing"
 
 	sofab "github.com/sofa-buffers/corelib-go"
@@ -23,10 +24,13 @@ const overArrayMax = arrayMaxCount + 1
 // payload, so these inputs deliberately carry none. Complements the at-limit
 // value 0x7FFF_FFFF exercised in limits_test.go, which passes the check.
 //
-// The count check lives in arrayCount (decoder.go / cursor.go) and is reached via
-// the typed array readers, not pull Skip — skipValue reads the count as a raw
-// varint, so the pull cases below drive the typed readers, matching the visitor
-// path's cursor.arrayCount.
+// The count check lives in arrayCount (decoder.go / cursor.go), so the pull cases
+// below drive the typed readers, matching the visitor path's cursor.arrayCount.
+// The integer-array arms of skipValue still read their count as a raw varint —
+// harmless there, because every element is decoded one varint at a time and the
+// bytes simply run out — while the fixlen-array arm, which discards a computed
+// payload length, goes through arrayCount too (issue #75,
+// TestSkipFixlenArrayHeaderChecked).
 func TestOversizedCountLengthInvalid(t *testing.T) {
 	cases := []struct {
 		name string
@@ -207,5 +211,198 @@ func TestDeepNestingEncoderWritesNoBytes(t *testing.T) {
 	}
 	if after := buf.Len(); after != before {
 		t.Fatalf("buffer grew from %d to %d bytes on rejected open, want no growth", before, after)
+	}
+}
+
+// drainPull drives the pull parser over b to the end of the stream, consuming
+// every field's value, and returns the field headers it handed out plus the
+// terminating error (nil for a clean EOF). autoSkip picks which of the two skip
+// entry points is exercised: Decoder.Skip explicitly, or Next's auto-skip of an
+// unconsumed value — both land in skipValue, and issue #75 was reachable from
+// either.
+func drainPull(b []byte, autoSkip bool, opts ...sofab.Option) ([]sofab.Field, error) {
+	d := sofab.NewDecoder(bytes.NewReader(b), opts...)
+	var seen []sofab.Field
+	for {
+		f, err := d.Next()
+		if err == io.EOF {
+			return seen, nil
+		}
+		if err != nil {
+			return seen, err
+		}
+		seen = append(seen, f)
+		if autoSkip {
+			continue // let the next Next auto-skip the unconsumed value
+		}
+		if err := d.Skip(); err != nil {
+			return seen, err
+		}
+	}
+}
+
+// TestSkipFixlenArrayHeaderChecked covers issue #75: skipping a fixlen array must
+// apply the same header checks as reading one. skipValue used to read the element
+// count as a raw varint and discard int(n*size) bytes, so a count past arrayMax
+// (§6.2) was accepted and the product wrapped mod 2^64 — 2^61 elements of 8 bytes
+// discarded nothing at all, the parser resynchronised mid-message and handed the
+// caller a phantom field on a COMPLETE decode, while 2^60 elements turned the
+// int conversion negative and surfaced a raw "bufio: negative count" outside the
+// §6.3 result set.
+//
+// Both skip entry points are driven (Decoder.Skip and Next's auto-skip), and every
+// case is pinned against AcceptBytes: the visitor paths always validated this
+// header, so the two must agree on every input (§4.8, §5.2).
+func TestSkipFixlenArrayHeaderChecked(t *testing.T) {
+	hdr := vhdr(0, sofab.TypeFixlenArray)
+	fp32Word := vbytes((4 << 3) | subFP32)
+	fp64Word := vbytes((8 << 3) | subFP64)
+
+	// arr builds a complete fixlen-array field from a count and a fixlen word.
+	arr := func(count uint64, word []byte, payload ...byte) []byte {
+		out := append(append([]byte{}, hdr...), vbytes(count)...)
+		out = append(out, word...)
+		return append(out, payload...)
+	}
+
+	cases := []struct {
+		name string
+		in   []byte
+		want error // nil = clean decode to end of stream
+	}{
+		{
+			// The isolate: count 2^61 × 8 bytes wraps to a zero-byte discard, so the
+			// stream resynchronised on the payload and produced a second field.
+			name: "count wraps the payload size to zero",
+			in:   append(arr(1<<61, fp64Word), 0x00, 0x7F),
+			want: sofab.ErrInvalidMsg,
+		},
+		{
+			// count 2^60 × 8 = 2^63: int() goes negative and bufio.Discard panicked
+			// its way out of the §6.3 taxonomy.
+			name: "count makes the payload size negative",
+			in:   append(arr(1<<60, fp64Word), 0x00),
+			want: sofab.ErrInvalidMsg,
+		},
+		{
+			name: "count one past arrayMax",
+			in:   arr(overArrayMax, fp32Word),
+			want: sofab.ErrInvalidMsg,
+		},
+		{
+			// §4.8 admits only fp32/4 and fp64/8 as fixlen-array elements; a string
+			// subtype is malformed regardless of the schema, exactly as the visitor
+			// paths already ruled.
+			name: "fixlen word carries a string subtype",
+			in:   arr(1, vbytes((4<<3)|subStr), 'a', 'b', 'c', 'd'),
+			want: sofab.ErrInvalidMsg,
+		},
+		{
+			name: "fixlen word width contradicts its subtype",
+			in:   arr(1, vbytes((8<<3)|subFP32), 0, 0, 0, 0, 0, 0, 0, 0),
+			want: sofab.ErrInvalidMsg,
+		},
+		{
+			// Truncation is still truncation: a well-formed header whose payload runs
+			// out is INCOMPLETE, not INVALID.
+			name: "payload truncated",
+			in:   arr(2, fp64Word, 0, 0, 0, 0),
+			want: sofab.ErrIncomplete,
+		},
+		{
+			// Control: a legal array is skipped by exactly its payload length, so the
+			// field that follows it is read at the right offset.
+			name: "well-formed array skips its payload exactly",
+			in: append(arr(2, fp32Word, 0, 0, 0, 0, 0, 0, 0, 0),
+				append(vhdr(3, sofab.TypeVarintUnsigned), 0x7F)...),
+			want: nil,
+		},
+		{
+			// Control: an empty array still carries its fixlen word (§4.8) and no
+			// payload.
+			name: "empty array",
+			in: append(arr(0, fp64Word),
+				append(vhdr(3, sofab.TypeVarintUnsigned), 0x7F)...),
+			want: nil,
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			for _, mode := range []struct {
+				name     string
+				autoSkip bool
+			}{{"Skip", false}, {"NextAutoSkip", true}} {
+				t.Run(mode.name, func(t *testing.T) {
+					seen, err := drainPull(c.in, mode.autoSkip)
+					if c.want == nil {
+						if err != nil {
+							t.Fatalf("pull = %v, want clean decode", err)
+						}
+						if len(seen) != 2 || seen[1].ID != 3 || seen[1].Type != sofab.TypeVarintUnsigned {
+							t.Fatalf("pull saw %+v, want the array then the id-3 unsigned field", seen)
+						}
+						return
+					}
+					if !errors.Is(err, c.want) {
+						t.Fatalf("pull = %v, want %v", err, c.want)
+					}
+					// INVALID and INCOMPLETE are distinct outcomes (§5.2); guard the
+					// one this case is not, so a regression that swaps them is caught.
+					other := sofab.ErrIncomplete
+					if c.want == sofab.ErrIncomplete {
+						other = sofab.ErrInvalidMsg
+					}
+					if errors.Is(err, other) {
+						t.Fatalf("pull = %v, must not also match %v", err, other)
+					}
+					// A rejected array never yields a field past itself: the phantom
+					// second field was the visible half of the wrap.
+					if len(seen) != 1 {
+						t.Fatalf("pull handed out %d fields on a rejected array: %+v", len(seen), seen)
+					}
+				})
+			}
+
+			// The visitor path is the reference: it always checked this header.
+			verr := sofab.AcceptBytes(c.in, baseV{})
+			if c.want == nil {
+				if verr != nil {
+					t.Fatalf("AcceptBytes = %v, want clean decode", verr)
+				}
+				return
+			}
+			if !errors.Is(verr, c.want) {
+				t.Fatalf("AcceptBytes = %v, want %v (pull and visitor must agree)", verr, c.want)
+			}
+		})
+	}
+}
+
+// TestSkipFixlenArrayHonoursArrayCountLimit pins the receiver-side half of the
+// same header (§6.2.1): the count word of a skipped fixlen array goes through the
+// configured WithMaxArrayCount cap, reported as ErrLimitExceeded and never
+// conflated with ErrInvalidMsg — matching what the visitor path already did with
+// the identical bytes and options.
+func TestSkipFixlenArrayHonoursArrayCountLimit(t *testing.T) {
+	in := append(append(vhdr(0, sofab.TypeFixlenArray), vbytes(2)...),
+		append(vbytes((4<<3)|subFP32), 0, 0, 0, 0, 0, 0, 0, 0)...)
+
+	// Under a cap of 1 the two-element array is refused on both paths.
+	if _, err := drainPull(in, false, sofab.WithMaxArrayCount(1)); !errors.Is(err, sofab.ErrLimitExceeded) {
+		t.Fatalf("pull Skip = %v, want ErrLimitExceeded", err)
+	} else if errors.Is(err, sofab.ErrInvalidMsg) {
+		t.Fatalf("pull Skip = %v, must not also match ErrInvalidMsg", err)
+	}
+	if err := sofab.AcceptBytes(in, baseV{}, sofab.WithMaxArrayCount(1)); !errors.Is(err, sofab.ErrLimitExceeded) {
+		t.Fatalf("AcceptBytes = %v, want ErrLimitExceeded", err)
+	}
+
+	// At the cap it decodes cleanly on both.
+	if _, err := drainPull(in, false, sofab.WithMaxArrayCount(2)); err != nil {
+		t.Fatalf("pull Skip at the cap = %v, want clean decode", err)
+	}
+	if err := sofab.AcceptBytes(in, baseV{}, sofab.WithMaxArrayCount(2)); err != nil {
+		t.Fatalf("AcceptBytes at the cap = %v, want clean decode", err)
 	}
 }

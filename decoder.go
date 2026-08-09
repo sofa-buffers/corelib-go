@@ -432,7 +432,14 @@ func (d *Decoder) skipValue() error {
 		}
 		return nil
 	case TypeFixlenArray:
-		n, err := d.readVarint(false)
+		// The count goes through arrayCount, exactly as the typed readers and the
+		// visitor paths do: skipping a field checks its framing, it does not trust
+		// it. That enforces the format ceiling arrayMax (§6.2, INVALID) and any
+		// receiver limit (§6.2.1, ErrLimitExceeded) here, and it is what keeps the
+		// payload length below computable — with n ≤ arrayMax and size ≤ 8 the
+		// product is at most 2^34, so it can neither wrap mod 2^64 nor go negative
+		// when converted to int (issue #75).
+		n, err := d.arrayCount()
 		if err != nil {
 			return err
 		}
@@ -442,8 +449,17 @@ func (d *Decoder) skipValue() error {
 		if err != nil {
 			return err
 		}
+		sub := h & 0x07
 		size := h >> 3
-		_, err = d.r.Discard(int(n * size))
+		// §4.8 admits only fp32/4 and fp64/8 as fixlen-array elements. Anything
+		// else — a string/blob subtype, a width that contradicts its subtype — is
+		// malformed regardless of the schema, so a skip rejects it just as
+		// cursor.acceptFixlenArray and acceptStreamFixlenArray do; the size would
+		// otherwise be an attacker-chosen stride the parser resynchronises on.
+		if !((sub == fixFp32 && size == 4) || (sub == fixFp64 && size == 8)) {
+			return ErrInvalidMsg
+		}
+		_, err = d.r.Discard(int(n) * int(size))
 		return eofToIncomplete(err)
 	}
 	return nil
