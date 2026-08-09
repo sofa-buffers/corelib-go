@@ -98,7 +98,10 @@
 // the value, leaves the destination untouched, and the decode stays COMPLETE.
 // CORELIB_PLAN §6.3 has no "invalid usage" code; what is left of caller error is
 // ErrArgument — a typed reader called with no field waiting, or after the current
-// value was already consumed.
+// value was already consumed. On the encode side it is the same sentinel for the
+// same reason: an argument no valid field can be built from — an id past IDMax, a
+// payload or element count past FIXLEN_MAX/ARRAY_MAX, a sequence opened past
+// MaxDepth or closed with none open — is refused before any byte is written.
 //
 // # Encoding example (what generated Marshal code looks like)
 //

@@ -351,9 +351,36 @@ func (e *Encoder) WriteBool(id ID, b bool) error {
 	return e.WriteUnsigned(id, 0)
 }
 
+// overCeiling reports whether a caller-supplied payload length or element count
+// exceeds the format-wide FIXLEN_MAX / ARRAY_MAX ceiling (§6.2) — 2³¹−1 for
+// both, the same arrayMax the decoder enforces on the wire word.
+//
+// A field past it cannot be encoded, only mis-encoded: the length/count word
+// would go out looking well-formed and every conformant decoder, this package's
+// own included, would reject the message as INVALID. So the writers test it on
+// the same argument branch that already tests id > IDMax — before a single byte
+// is written — and the verdict is the same ErrArgument (§6.3). Where int is 32
+// bits the comparison is trivially false and the compiler drops it.
+func overCeiling(n int) bool { return uint64(n) > arrayMax }
+
+// rejectArgument records a caller-argument rejection as the sticky error and
+// reports it. It is out of line so a guard that calls it costs one
+// well-predicted compare on the hot path and nothing else.
+//
+//go:noinline
+func (e *Encoder) rejectArgument() error {
+	e.setErr(ErrArgument)
+	return e.err
+}
+
 // writeFixlen writes a fixed-length field: the header, then a length-and-subtype
 // varint (len(data)<<3 | sub), then the raw bytes. sub selects float/string/blob.
+// A payload past FIXLEN_MAX is refused with ErrArgument and writes nothing.
 func (e *Encoder) writeFixlen(id ID, data []byte, sub uint64) {
+	if overCeiling(len(data)) {
+		e.rejectArgument()
+		return
+	}
 	if e.writeHeaderRoom(id, TypeFixlen, maxVarintLen) {
 		e.putVarintFit((uint64(len(data)) << 3) | sub)
 		e.putRaw(data)
@@ -396,9 +423,16 @@ func (e *Encoder) WriteFloat64(id ID, f float64) error {
 // (WithStrictUTF8(false)) the bytes are written verbatim. utf8.ValidString
 // correctly rejects overlong encodings, surrogate code points, and code points
 // above U+10FFFF, while accepting an embedded NUL.
+//
+// A string past FIXLEN_MAX is refused with ErrArgument, and refused first: the
+// ceiling is a comparison, the UTF-8 scan is a pass over the whole string, and a
+// string that cannot be encoded at all need not be validated.
 func (e *Encoder) WriteString(id ID, s string) error {
 	if e.err != nil {
 		return e.err
+	}
+	if overCeiling(len(s)) {
+		return e.rejectArgument()
 	}
 	if e.lim.strictUTF8 && !utf8.ValidString(s) {
 		e.setErr(ErrArgument)
@@ -493,9 +527,18 @@ func (e *Encoder) WriteSequenceBeginLazy(id ID) error {
 // struct/union field, and an array field whose declared default is the empty
 // collection (MESSAGE_SPEC §2). Where the frame must be visible, close with
 // WriteSequenceEndKeep instead.
+//
+// Closing when nothing is open is rejected with ErrArgument and writes no bytes:
+// a bare 0x07 is an unbalanced sequence end, which every decoder must reject as
+// INVALID (§4.9, §6.3). It is the closing-direction twin of the MaxDepth guard
+// in WriteSequenceBeginLazy — the encoder never emits a frame it cannot balance,
+// in either direction.
 func (e *Encoder) WriteSequenceEnd() error {
 	if e.err != nil {
 		return e.err
+	}
+	if e.depth == 0 {
+		return e.rejectArgument()
 	}
 	if n := len(e.pending); n != 0 {
 		// The innermost open sequence is the last held-back one (pending is a
@@ -506,7 +549,7 @@ func (e *Encoder) WriteSequenceEnd() error {
 		return e.err
 	}
 	e.writeHeader(0, TypeSequenceEnd)
-	if e.err == nil && e.depth > 0 {
+	if e.err == nil {
 		e.depth--
 	}
 	return e.err
@@ -533,23 +576,34 @@ func (e *Encoder) WriteSequenceEnd() error {
 // choice when a call site is ambiguous: using it where WriteSequenceEnd would do
 // costs one non-canonical empty frame that every decoder normalizes away, while
 // the reverse silently changes an array's length.
+//
+// Closing when nothing is open is rejected with ErrArgument and writes no bytes,
+// exactly as in WriteSequenceEnd: the frame this one insists on emitting is
+// precisely the one there is no opening for.
 func (e *Encoder) WriteSequenceEndKeep() error {
 	if e.err != nil {
 		return e.err
+	}
+	if e.depth == 0 {
+		return e.rejectArgument()
 	}
 	if len(e.pending) != 0 {
 		e.commitPending()
 	}
 	e.writeHeader(0, TypeSequenceEnd)
-	if e.err == nil && e.depth > 0 {
+	if e.err == nil {
 		e.depth--
 	}
 	return e.err
 }
 
 // WriteUnsignedArray writes an array of unsigned integers. An empty array is
-// valid and emits exactly [header][count=0] (§4.7).
+// valid and emits exactly [header][count=0] (§4.7); one longer than ARRAY_MAX is
+// refused with ErrArgument and emits nothing.
 func WriteUnsignedArray[T Unsigned](e *Encoder, id ID, a []T) error {
+	if overCeiling(len(a)) {
+		return e.rejectArgument()
+	}
 	if !e.writeHeaderRoom(id, TypeVarintArrayUnsigned, maxVarintLen) {
 		return e.err
 	}
@@ -558,8 +612,12 @@ func WriteUnsignedArray[T Unsigned](e *Encoder, id ID, a []T) error {
 }
 
 // WriteSignedArray writes an array of signed integers. An empty array is valid
-// and emits exactly [header][count=0] (§4.7).
+// and emits exactly [header][count=0] (§4.7); one longer than ARRAY_MAX is
+// refused with ErrArgument and emits nothing.
 func WriteSignedArray[T Signed](e *Encoder, id ID, a []T) error {
+	if overCeiling(len(a)) {
+		return e.rejectArgument()
+	}
 	if !e.writeHeaderRoom(id, TypeVarintArraySigned, maxVarintLen) {
 		return e.err
 	}
@@ -757,7 +815,11 @@ func putZigzagRun[T Signed](e *Encoder, a []T) error {
 // WriteFloat32Array writes an array of 32-bit floats. An empty array is valid
 // and emits exactly [header][count=0][fixlen_word] — the fixlen_word is always
 // present (even when empty) so the element subtype is never ambiguous (§4.8).
+// An array longer than ARRAY_MAX is refused with ErrArgument and emits nothing.
 func (e *Encoder) WriteFloat32Array(id ID, a []float32) error {
+	if overCeiling(len(a)) {
+		return e.rejectArgument()
+	}
 	if !e.writeHeaderRoom(id, TypeFixlenArray, 2*maxVarintLen) {
 		return e.err
 	}
@@ -786,7 +848,11 @@ func (e *Encoder) WriteFloat32Array(id ID, a []float32) error {
 // WriteFloat64Array writes an array of 64-bit floats. An empty array is valid
 // and emits exactly [header][count=0][fixlen_word] — the fixlen_word is always
 // present (even when empty) so the element subtype is never ambiguous (§4.8).
+// An array longer than ARRAY_MAX is refused with ErrArgument and emits nothing.
 func (e *Encoder) WriteFloat64Array(id ID, a []float64) error {
+	if overCeiling(len(a)) {
+		return e.rejectArgument()
+	}
 	if !e.writeHeaderRoom(id, TypeFixlenArray, 2*maxVarintLen) {
 		return e.err
 	}
