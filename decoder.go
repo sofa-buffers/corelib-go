@@ -174,7 +174,8 @@ func (d *Decoder) readVarintBatch(dst []uint64) (int, error) {
 
 // readFixlenHeader reads a fixed-length field's length-and-subtype varint,
 // splitting it into the byte length (h>>3) and the 3-bit subtype (h&0x07). A
-// length past arrayMax is rejected as a malformed message.
+// length past arrayMax, a reserved subtype, or a width that contradicts an
+// fp32/fp64 subtype is rejected as a malformed message.
 func (d *Decoder) readFixlenHeader() (length uint64, sub uint64, err error) {
 	h, err := d.readVarint(false)
 	if err != nil {
@@ -185,10 +186,45 @@ func (d *Decoder) readFixlenHeader() (length uint64, sub uint64, err error) {
 	if length > arrayMax {
 		return 0, 0, ErrInvalidMsg
 	}
+	// §4.6 defines subtypes 0x0-0x3 only — 0x4-0x7 are reserved — and pins the
+	// float widths: fp32 carries 4 payload bytes, fp64 carries 8; strings and
+	// blobs take any length. §6.3 names a reserved subtype and a wrong-width
+	// fp32/fp64 as InvalidMessage. This is framing, not schema, so it holds
+	// whether or not the field is materialised: the check lives here so that
+	// every pull consumer — Float32, Float64, String, Bytes, Skip and Next's
+	// auto-skip — inherits it from one place, and a skipped field is a length
+	// jump over a validated word rather than one over an attacker-chosen stride
+	// the parser resynchronises on (issue #76). The visitor paths already ruled
+	// the same way in their subtype switch (cursor.acceptFixlen,
+	// acceptStreamFixlen), so all three surfaces now agree on every word.
+	if err := checkFixlenSubtype(sub, length); err != nil {
+		return 0, 0, err
+	}
 	if err := d.lim.checkFixlen(sub, length); err != nil {
 		return 0, 0, err
 	}
 	return length, sub, nil
+}
+
+// checkFixlenSubtype validates a fixlen word's subtype and its declared width
+// against §4.6. It is pure framing: it never consults the schema or the
+// receiver-side limits (those come after it, as ErrLimitExceeded).
+func checkFixlenSubtype(sub, length uint64) error {
+	switch sub {
+	case fixFp32:
+		if length != 4 {
+			return ErrInvalidMsg
+		}
+	case fixFp64:
+		if length != 8 {
+			return ErrInvalidMsg
+		}
+	case fixStr, fixBlob:
+		// Any length, including zero.
+	default:
+		return ErrInvalidMsg // reserved subtype 0x4-0x7
+	}
+	return nil
 }
 
 // readRaw reads exactly n bytes. A short read (the stream ending early) is
