@@ -6,7 +6,14 @@ ENV DEBIAN_FRONTEND=noninteractive
 ENV GOPATH=/root/go
 ENV PATH=/usr/local/go/bin:/root/go/bin:$PATH
 
-# Base tooling
+# Base tooling.
+#
+# valgrind is not a convenience here: CORELIB_PLAN §10 requires
+# bench/run_callgrind.sh (instructions/op, Callgrind Ir/op) and §13 requires the
+# bench tools to be *runnable*, while BENCH_SPEC has the central harness build
+# this implementation in this very container. The package also ships
+# callgrind_annotate, which bench/profile.sh needs. bench_env_test.go pins the
+# link between what the bench scripts require and what is installed here.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
         curl \
@@ -14,6 +21,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         git \
         build-essential \
         gnupg \
+        valgrind \
     && rm -rf /var/lib/apt/lists/*
 
 # Go toolchain

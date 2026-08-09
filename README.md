@@ -578,8 +578,20 @@ go run ./cmd/perfbench perf    # per-op cost (CPU time/op ns + MB/s) for the 12-
 Single-workload subcommands (`encode_u64_array`, `encode_typical`,
 `decode_u64_array`, `decode_typical`) run one `//go:noinline` `run_*` function once
 with setup excluded, so a Callgrind harness can toggle collection on
-`main.run_<workload>`. The decode path also has `go test` benchmarks in
-`decode_bench_test.go`:
+`main.run_<workload>`. `bench/run_callgrind.sh` is that harness — the third tool
+of the shared set, reporting machine-independent instructions/op:
+
+```bash
+bash bench/run_callgrind.sh           # Ir/op table over the four workloads
+bash bench/profile.sh decode_typical  # per-function breakdown of one workload
+```
+
+Both need `valgrind` installed (`profile.sh` also uses `callgrind_annotate`,
+which ships in the same package). The dev container in `.devcontainer/` installs
+it, so both tools run in the environment the central benchmark harness builds
+this repo in; `bench_env_test.go` keeps the two in step.
+
+The decode path also has `go test` benchmarks in `decode_bench_test.go`:
 
 ```bash
 go test -run '^$' -bench BenchmarkDecode -benchmem -count=8 -cpu=1 -benchtime=300ms
