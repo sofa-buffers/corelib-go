@@ -22,10 +22,10 @@ import (
 // (MESSAGE_SPEC §7.3, which routes to the same skip), arrive at Visitor.String
 // exactly like a declared field does. So the cursor hands the wire bytes through
 // verbatim (legal — Go's string is a byte-container type per §6.4) and the
-// consumer validates at the destination with sofab.Utf8Valid.
+// consumer validates at the destination with sofab.UTF8Valid.
 //
 // probeV below mirrors the shape sofabgen emits for the Crucible probe schema:
-// the destination switch comes FIRST, and the maxlen bound and Utf8Valid run
+// the destination switch comes FIRST, and the maxlen bound and UTF8Valid run
 // inside the matched arm. An id with no arm falls out untouched.
 
 // --- a probe-shaped visitor over the Crucible schema ids ---------------------
@@ -81,7 +81,7 @@ func (n *probeNestedV) String(id sofab.ID, v string) error {
 		if len(v) > 32 { // schema maxlen (§7.1), checked before the content
 			return sofab.ErrInvalidMsg
 		}
-		if !sofab.Utf8Valid([]byte(v)) {
+		if !sofab.UTF8Valid([]byte(v)) {
 			return sofab.ErrInvalidMsg
 		}
 		n.str, n.strSet = v, true
@@ -100,7 +100,7 @@ func (s *probeStrArrayV) String(id sofab.ID, v string) error {
 	if len(v) > 64 { // element maxlen
 		return sofab.ErrInvalidMsg
 	}
-	if !sofab.Utf8Valid([]byte(v)) {
+	if !sofab.UTF8Valid([]byte(v)) {
 		return sofab.ErrInvalidMsg
 	}
 	for len(s.p.strArray) <= int(id) {
@@ -135,7 +135,7 @@ func (e *probeStructElemV) String(id sofab.ID, v string) error {
 		if len(v) > 16 { // element `v` maxlen
 			return sofab.ErrInvalidMsg
 		}
-		if !sofab.Utf8Valid([]byte(v)) {
+		if !sofab.UTF8Valid([]byte(v)) {
 			return sofab.ErrInvalidMsg
 		}
 		e.p.structV = append(e.p.structV, v)
@@ -440,7 +440,7 @@ func (probeHookV) String(id sofab.ID, v string) error {
 		if len(v) > 4 {
 			return sofab.ErrInvalidMsg
 		}
-		if !sofab.Utf8Valid([]byte(v)) {
+		if !sofab.UTF8Valid([]byte(v)) {
 			return sofab.ErrInvalidMsg
 		}
 	}

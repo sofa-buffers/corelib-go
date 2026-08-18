@@ -92,8 +92,8 @@ func WithMaxBlobLen(n int) Option {
 // skip; there the check belongs to the destination. The option still reaches it:
 // the decoder hands the resolved policy to a visitor that implements
 // StringPolicyVisitor — typically by embedding a StringCheck — before that
-// scope's first string, and the destination arm calls StringCheck.Utf8Valid
-// (utf8.go). A destination that instead calls the package-level Utf8Valid is
+// scope's first string, and the destination arm calls StringCheck.UTF8Valid
+// (utf8.go). A destination that instead calls the package-level UTF8Valid is
 // always strict, since a package-level function has no decode scope to read.
 //
 // The knob never changes how valid data is encoded, so two peers with different

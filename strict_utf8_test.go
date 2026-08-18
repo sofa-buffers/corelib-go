@@ -100,7 +100,7 @@ func checkUTF8Encode(t *testing.T, what string, got error) {
 // an invalid-UTF-8 string that is *materialized* is the INVALID outcome
 // (ErrInvalidMsg), with no option supplied — on the pull path (Decoder.String
 // validates internally) and at a visitor destination (generated code calls
-// sofab.Utf8Valid in the arm that binds the value). A visitor with no
+// sofab.UTF8Valid in the arm that binds the value). A visitor with no
 // destination for the id must not be affected: §6.4 forbids validating a field
 // that is only skipped.
 func TestStrictUTF8DecodeDefaultRejects(t *testing.T) {
@@ -140,8 +140,8 @@ func TestStrictUTF8DecodeRejectsVariants(t *testing.T) {
 		"bare-continuation": {0x80},
 	}
 	for name, payload := range cases {
-		if got, want := sofab.Utf8Valid(payload), !utf8CheckCompiled; got != want {
-			t.Fatalf("%s Utf8Valid = %v, want %v", name, got, want)
+		if got, want := sofab.UTF8Valid(payload), !utf8CheckCompiled; got != want {
+			t.Fatalf("%s UTF8Valid = %v, want %v", name, got, want)
 		}
 		in := strField(0, payload)
 		checkUTF8Decode(t, name+" visitor destination",
@@ -153,11 +153,11 @@ func TestStrictUTF8DecodeRejectsVariants(t *testing.T) {
 	}
 }
 
-// TestUtf8ValidPrimitive pins the exported §6.4 primitive: it accepts
+// TestUTF8ValidPrimitive pins the exported §6.4 primitive: it accepts
 // well-formed UTF-8 (including an embedded U+0000 and the empty slice) and is a
 // real validator on the reject side. This is the check generated code calls at
 // every materialized destination, so its correctness is the whole fix.
-func TestUtf8ValidPrimitive(t *testing.T) {
+func TestUTF8ValidPrimitive(t *testing.T) {
 	valid := map[string][]byte{
 		"empty":         {},
 		"ascii":         []byte("hello"),
@@ -169,8 +169,8 @@ func TestUtf8ValidPrimitive(t *testing.T) {
 		"max-codepoint": {0xF4, 0x8F, 0xBF, 0xBF}, // U+10FFFF
 	}
 	for name, b := range valid {
-		if !sofab.Utf8Valid(b) {
-			t.Fatalf("Utf8Valid(%s) = false, want true", name)
+		if !sofab.UTF8Valid(b) {
+			t.Fatalf("UTF8Valid(%s) = false, want true", name)
 		}
 	}
 	invalid := map[string][]byte{
@@ -190,8 +190,8 @@ func TestUtf8ValidPrimitive(t *testing.T) {
 	// asserted against the build: false where the validator is compiled in,
 	// true where §6.4 let it be compiled out (never a third answer).
 	for name, b := range invalid {
-		if got, want := sofab.Utf8Valid(b), !utf8CheckCompiled; got != want {
-			t.Fatalf("Utf8Valid(%s) = %v, want %v", name, got, want)
+		if got, want := sofab.UTF8Valid(b), !utf8CheckCompiled; got != want {
+			t.Fatalf("UTF8Valid(%s) = %v, want %v", name, got, want)
 		}
 	}
 }
@@ -365,7 +365,7 @@ func TestStrictUTF8SkipNotValidated(t *testing.T) {
 // genStrV models the shape sofabgen emits for a `string` destination, in the
 // form that carries this decode's policy: the embedded sofab.StringCheck gives
 // it both the StringPolicyVisitor setter the decoder calls at scope entry and
-// the promoted Utf8Valid the destination arm runs. The destination lookup still
+// the promoted UTF8Valid the destination arm runs. The destination lookup still
 // comes first, so an id this visitor does not bind is never inspected.
 type genStrV struct {
 	baseV
@@ -379,7 +379,7 @@ type genStrV struct {
 func (v *genStrV) String(id sofab.ID, s string) error {
 	switch id {
 	case v.id:
-		if !v.Utf8Valid([]byte(s)) {
+		if !v.UTF8Valid([]byte(s)) {
 			return sofab.ErrInvalidMsg
 		}
 		v.got, v.set = s, true
@@ -414,7 +414,7 @@ var acceptPaths = map[string]func(in []byte, v sofab.Visitor, opts ...sofab.Opti
 // visitor path. §6.4 puts both gates inside the primitive — it "folds to true
 // when compiled OFF and reads the runtime option otherwise" — so flipping the
 // option must never require regenerating or rebuilding anything. Before the
-// fix the destination could only reach the package-level Utf8Valid, whose sole
+// fix the destination could only reach the package-level UTF8Valid, whose sole
 // gate is the build tag, and the OFF state was unreachable on the entire
 // generated decode surface.
 //
@@ -516,10 +516,10 @@ func TestStrictUTF8ScopedCheckNeverValidatesASkip(t *testing.T) {
 // silently accept malformed input.
 func TestStringCheckZeroValueIsStrict(t *testing.T) {
 	var c sofab.StringCheck
-	if got, want := c.Utf8Valid([]byte{0xFF}), !utf8CheckCompiled; got != want {
-		t.Fatalf("zero-value StringCheck.Utf8Valid(FF) = %v, want %v", got, want)
+	if got, want := c.UTF8Valid([]byte{0xFF}), !utf8CheckCompiled; got != want {
+		t.Fatalf("zero-value StringCheck.UTF8Valid(FF) = %v, want %v", got, want)
 	}
-	if !c.Utf8Valid([]byte("ok")) {
+	if !c.UTF8Valid([]byte("ok")) {
 		t.Fatal("zero-value StringCheck rejected valid UTF-8")
 	}
 
@@ -536,18 +536,18 @@ func TestStringCheckZeroValueIsStrict(t *testing.T) {
 		sofab.AcceptBytes(strField(1, []byte{0xFF}), &genStrV{id: 1}))
 }
 
-// TestUtf8ValidPrimitiveStaysAlwaysStrict pins the compatibility contract the
+// TestUTF8ValidPrimitiveStaysAlwaysStrict pins the compatibility contract the
 // fix keeps: the package-level primitive ignores the RUNTIME option, so code
 // generated before the scoped check existed still compiles and still rejects —
 // WithStrictUTF8(false) does not reach it, because a package-level function has
 // no decode scope to read the option from. The COMPILE-TIME gate is the one
 // thing that does reach it: §6.4 puts it first, so a `sofab_no_strict_utf8`
 // build folds the primitive to true and this test asserts that instead.
-func TestUtf8ValidPrimitiveStaysAlwaysStrict(t *testing.T) {
+func TestUTF8ValidPrimitiveStaysAlwaysStrict(t *testing.T) {
 	in := strField(1, []byte{0xFF})
 	checkUTF8Decode(t, "package-level primitive under off",
 		sofab.AcceptBytes(in, &bindStrV{id: 1}, sofab.WithStrictUTF8(false)))
-	if got, want := sofab.Utf8Valid([]byte{0xFF}), !utf8CheckCompiled; got != want {
-		t.Fatalf("Utf8Valid(FF) = %v, want %v", got, want)
+	if got, want := sofab.UTF8Valid([]byte{0xFF}), !utf8CheckCompiled; got != want {
+		t.Fatalf("UTF8Valid(FF) = %v, want %v", got, want)
 	}
 }
