@@ -464,6 +464,22 @@ wire, _ := (&Point{X: 3, Y: 4}).Encode()
 got, _ := DecodePoint(wire)              // got.X == 3, got.Y == 4
 ```
 
+What that layer does **not** have to bring is the machinery around arrays. An
+array whose elements are strings, blobs, structs/unions or arrays arrives as a
+nested sequence whose child ids are the array indices, and rebuilding a slice
+from those events — place at the id, fill the gap an omitted interior element
+left, refuse an index past the declared capacity — is the same code for every
+schema. It is this package's: `sofab.VisitorBase` supplies the no-op Visitor
+methods a message does not bind, `StringSeq` / `BlobSeq` / `MessageSeq` /
+`NestedSeq`, the matrix collectors and `PlaceRow` collect the elements, and
+`PayloadAcc` reassembles a payload delivered in chunks. The schema travels as
+arguments — the count bound, the element maxlen, the declared element width — so
+a generated `BeginSequence` arm is one line that hands back the collector its
+field is bound to. Generated code still carries its own copies of these; the
+generator switches over in
+[generator#345](https://github.com/sofa-buffers/generator/issues/345), and both
+spellings compile against this package meanwhile.
+
 ## Memory handling
 
 Buffer ownership is the part that most affects how callers wire the library in.

@@ -53,6 +53,20 @@
 // schema bound reach the decoder; each is consulted on every visitor path, and a
 // visitor that implements none decodes exactly as before.
 //
+// # Collectors
+//
+// A wrapper-sequence array — one whose elements are strings, blobs,
+// structs/unions or arrays — reaches a visitor as a nested sequence whose child
+// ids are the array indices (MESSAGE_SPEC §5.1). Turning that back into a slice
+// is the same code for every schema, so it lives here rather than in every
+// generated package: StringSeq, BlobSeq, MessageSeq, NestedSeq, the matrix
+// collectors and PlaceRow, all built on the no-op VisitorBase. The schema
+// travels as arguments — Cap is the count bound, ElemMax the element maxlen,
+// Hi/Lo the declared element width — exactly as NarrowUnsigned/NarrowSigned take
+// the element type as a type parameter, and a generated BeginSequence arm is
+// then one line handing back the collector its field is bound to. PayloadAcc is
+// the same idea for a payload that arrives in chunks.
+//
 // # Sequence framing (omitting an all-default sequence)
 //
 // MESSAGE_SPEC §2 omits a sequence-typed *field* whose value equals its declared
