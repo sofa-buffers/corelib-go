@@ -528,7 +528,7 @@ func (c *cursor) acceptFixlen(v Visitor, hv HeaderVisitor, sp *spCache, sb schem
 		// exactly like a declared one, and validating here would turn a field
 		// that is merely skipped into INVALID. Go's string is a byte-container
 		// type (§6.4), so the wire bytes pass through verbatim and validation
-		// belongs at the destination: generated code calls the Utf8Valid
+		// belongs at the destination: generated code calls the UTF8Valid
 		// primitive (utf8.go) inside the arm that binds the value. The framing —
 		// the fixlen word, the reserved-subtype rejection, arrayMax, and the
 		// exact length advance in c.take — is fully checked either way, which is

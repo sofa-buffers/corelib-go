@@ -79,7 +79,7 @@ func (d *utf8Dest) String(id sofab.ID, v string) error {
 	if id != 2 {
 		return nil
 	}
-	if !d.Utf8Valid([]byte(v)) {
+	if !d.UTF8Valid([]byte(v)) {
 		return sofab.ErrInvalidMsg
 	}
 	d.got = v

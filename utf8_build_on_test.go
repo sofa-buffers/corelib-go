@@ -26,17 +26,17 @@ import (
 // that can only exist in the footprint build.
 const utf8CheckCompiled = true
 
-// TestUtf8ValidatorIsCompiledIn pins what the default build owes: the validator
+// TestUTF8ValidatorIsCompiledIn pins what the default build owes: the validator
 // is really linked in, not folded away. It is the direct counterpart of
-// TestUtf8ValidatorIsCompiledOut in the twin file, so whichever build runs, one
+// TestUTF8ValidatorIsCompiledOut in the twin file, so whichever build runs, one
 // of the two proves which half of the §6.4 gate this binary was built with.
-func TestUtf8ValidatorIsCompiledIn(t *testing.T) {
-	if sofab.Utf8Valid([]byte{0xFF}) {
-		t.Fatal("Utf8Valid(FF) = true in the default build, want false")
+func TestUTF8ValidatorIsCompiledIn(t *testing.T) {
+	if sofab.UTF8Valid([]byte{0xFF}) {
+		t.Fatal("UTF8Valid(FF) = true in the default build, want false")
 	}
 	var c sofab.StringCheck // zero value is strict (§6.4 default ON)
-	if c.Utf8Valid([]byte{0xC0, 0x80}) {
-		t.Fatal("StringCheck.Utf8Valid(C0 80) = true in the default build, want false")
+	if c.UTF8Valid([]byte{0xC0, 0x80}) {
+		t.Fatal("StringCheck.UTF8Valid(C0 80) = true in the default build, want false")
 	}
 
 	in := strField(1, []byte{0xFF})

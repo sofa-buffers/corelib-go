@@ -22,18 +22,18 @@ import (
 // never replaced, dropped or emptied.
 const utf8CheckCompiled = false
 
-// TestUtf8ValidatorIsCompiledOut is the counterpart of
-// TestUtf8ValidatorIsCompiledIn: it proves the build tag actually reached the
+// TestUTF8ValidatorIsCompiledOut is the counterpart of
+// TestUTF8ValidatorIsCompiledIn: it proves the build tag actually reached the
 // library. Without it a mis-tagged build would just run the ON suite's
 // relaxed-by-branching assertions and look green while validating everything.
-func TestUtf8ValidatorIsCompiledOut(t *testing.T) {
+func TestUTF8ValidatorIsCompiledOut(t *testing.T) {
 	for _, b := range [][]byte{{0xFF}, {0xC0, 0x80}, {0xED, 0xA0, 0x80}, {0x80}} {
-		if !sofab.Utf8Valid(b) {
-			t.Fatalf("Utf8Valid(% X) = false, want true (validator compiled out)", b)
+		if !sofab.UTF8Valid(b) {
+			t.Fatalf("UTF8Valid(% X) = false, want true (validator compiled out)", b)
 		}
 		var c sofab.StringCheck // the zero value is strict — the build tag still wins
-		if !c.Utf8Valid(b) {
-			t.Fatalf("zero StringCheck.Utf8Valid(% X) = false, want true", b)
+		if !c.UTF8Valid(b) {
+			t.Fatalf("zero StringCheck.UTF8Valid(% X) = false, want true", b)
 		}
 	}
 }

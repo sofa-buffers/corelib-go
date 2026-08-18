@@ -458,7 +458,7 @@ func TestMaxDepthRoundTrip(t *testing.T) {
 // UTF-8 is rejected as ErrInvalidMsg where it is materialized. Decoder.String is
 // a materializing read and rejects it itself; on the visitor path the bytes are
 // handed through verbatim (the cursor cannot know whether the visitor has a
-// destination for the id) and the destination rejects them with Utf8Valid.
+// destination for the id) and the destination rejects them with UTF8Valid.
 // Blobs stay unchecked on every path.
 func TestInvalidUTF8Rejected(t *testing.T) {
 	// fixlen string, length 1, payload 0xFF (an invalid UTF-8 byte).
@@ -487,7 +487,7 @@ func TestInvalidUTF8Rejected(t *testing.T) {
 }
 
 // bindStrV models the shape sofabgen emits: the destination lookup comes first
-// and Utf8Valid runs inside the matched arm, so an id with no destination is
+// and UTF8Valid runs inside the matched arm, so an id with no destination is
 // never inspected.
 type bindStrV struct {
 	baseV
@@ -498,7 +498,7 @@ type bindStrV struct {
 func (v *bindStrV) String(id sofab.ID, s string) error {
 	switch id {
 	case v.id:
-		if !sofab.Utf8Valid([]byte(s)) {
+		if !sofab.UTF8Valid([]byte(s)) {
 			return sofab.ErrInvalidMsg
 		}
 		v.got = s

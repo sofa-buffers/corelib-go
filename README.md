@@ -56,7 +56,7 @@ encoder's **pass-through permission**; neither changes a byte on the wire:
 |--------|---------|--------|
 | `WithStrictUTF8(bool)` (`SOFAB_STRICT_UTF8`) | on | Passed to `NewEncoder`, `NewDecoder` or `AcceptBytes`. On: an invalid-UTF-8 `string` is rejected — `ErrArgument` on encode, `ErrInvalidMsg` where a string is read on decode. Off: bytes are stored/written verbatim (never lossy). It reaches every path a string is materialized on, the visitor destination included (below). |
 | `WithPassThrough(bool)` | off | Whether a `string`/blob payload larger than the buffer may be handed to the sink directly instead of being copied through it (CORELIB_PLAN §5.1) — see [Memory handling](#memory-handling) for what a sink then owes. |
-| `-tags sofab_no_strict_utf8` | off (check compiled in) | Compiles the validator out for footprint builds (§6.4 "compiled OFF means the validation code is not compiled in"). It folds the check away **everywhere**, not only in `Utf8Valid`: `Decoder.String` and `Encoder.WriteString` stop validating too, and it wins over `WithStrictUTF8` — the compile-time gate is checked first, so the option cannot resurrect a check that is not in the binary. OFF is still constrained: bytes are stored and written verbatim, never replaced. A documented non-strict build; CI builds and tests it (`no-strict-utf8`), and the **default** build remains the one that is conformance-tested against the shared vectors. |
+| `-tags sofab_no_strict_utf8` | off (check compiled in) | Compiles the validator out for footprint builds (§6.4 "compiled OFF means the validation code is not compiled in"). It folds the check away **everywhere**, not only in `UTF8Valid`: `Decoder.String` and `Encoder.WriteString` stop validating too, and it wins over `WithStrictUTF8` — the compile-time gate is checked first, so the option cannot resurrect a check that is not in the binary. OFF is still constrained: bytes are stored and written verbatim, never replaced. A documented non-strict build; CI builds and tests it (`no-strict-utf8`), and the **default** build remains the one that is conformance-tested against the shared vectors. |
 
 **Where validation happens on decode.** A Go `string` is a byte-container type,
 so validation runs where the payload is *materialized into a destination* and
@@ -79,14 +79,14 @@ handed to it:
 
 ```go
 type Msg struct {
-	sofab.StringCheck // gives Msg SetStringCheck + Utf8Valid
+	sofab.StringCheck // gives Msg SetStringCheck + UTF8Valid
 	Name string
 }
 
 func (m *Msg) String(id sofab.ID, v string) error {
 	switch id {
 	case 1:
-		if !m.Utf8Valid([]byte(v)) { // this decode's policy, not the build's
+		if !m.UTF8Valid([]byte(v)) { // this decode's policy, not the build's
 			return sofab.ErrInvalidMsg
 		}
 		m.Name = v
@@ -103,12 +103,18 @@ accepting. Memory-wise it adds one `bool` to the visitor and no allocation: the
 value is a plain struct, the type assertion is made at most once per scope, and
 only at a scope that actually carries a string.
 
-The package-level `Utf8Valid(b []byte) bool` primitive stays exported and is the
+The package-level `UTF8Valid(b []byte) bool` primitive stays exported and is the
 **always-strict** form — a package-level function has no decode to read the
 option from — so destinations written against it keep compiling and keep
 rejecting, whatever the option says. "Always" here means against the *runtime*
 option only: the compile-time gate comes first, so a `sofab_no_strict_utf8`
 build folds this primitive to `true` as well.
+
+The primitive and the method were both spelled `Utf8Valid` until the initialism
+was made consistent with `WithStrictUTF8`. `Utf8Valid` and
+`StringCheck.Utf8Valid` are still exported as deprecated one-line forwards,
+because generated code emits them today; they go away once the generator has
+switched.
 
 Framing is checked on every field regardless: the fixlen word, the reserved
 subtype rejection, `ARRAY_MAX`, `MAX_DEPTH`, varint overflow, and the exact

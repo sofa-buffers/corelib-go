@@ -167,7 +167,7 @@ func (d *Decoder) acceptStreamFixlen(v Visitor, hv HeaderVisitor, sp *spCache, s
 		// No UTF-8 validation here, exactly as on the cursor path (§6.4 "Skipped
 		// fields are never validated"): the decoder cannot know whether v has a
 		// destination for this id, so validation belongs at the destination —
-		// generated code calls Utf8Valid inside the arm that binds the value. The
+		// generated code calls UTF8Valid inside the arm that binds the value. The
 		// POLICY it validates under is this decode's, handed to the scope here
 		// exactly as on the cursor path (issue #82).
 		sp.deliver(v, d.lim)
