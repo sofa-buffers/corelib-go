@@ -29,10 +29,16 @@ type skipVisitor struct{}
 
 var skipV Visitor = skipVisitor{}
 
-func (skipVisitor) Unsigned(ID, uint64) error        { return nil }
-func (skipVisitor) Signed(ID, int64) error           { return nil }
-func (skipVisitor) Float32(ID, float32) error        { return nil }
-func (skipVisitor) Float64(ID, float64) error        { return nil }
+func (skipVisitor) Unsigned(ID, uint64) error { return nil }
+func (skipVisitor) Signed(ID, int64) error    { return nil }
+func (skipVisitor) Float32(ID, float32) error { return nil }
+func (skipVisitor) Float64(ID, float64) error { return nil }
+
+// String and Bytes are the two the skipping path never reaches: acceptFixlen
+// returns at the counter before it would build the value, which is the whole
+// point of the counter. They exist because Visitor has no optional methods, and
+// they are the only members of this type that coverage reports as unreached —
+// not a gap to close, but the design showing through.
 func (skipVisitor) String(ID, string) error          { return nil }
 func (skipVisitor) Bytes(ID, []byte) error           { return nil }
 func (skipVisitor) UnsignedArray(ID, []uint64) error { return nil }
