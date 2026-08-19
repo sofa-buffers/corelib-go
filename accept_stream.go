@@ -110,6 +110,19 @@ func (d *Decoder) acceptStream(v Visitor, depth int) error {
 			if err != nil {
 				return err
 			}
+			// nil = skip: route the scope to the no-op visitor and count the
+			// depth, so the materializing paths below advance instead of
+			// building (see skip.go). No EndSequence fires for a scope the
+			// consumer never took.
+			if child == nil {
+				d.skipping++
+				err := d.acceptStream(skipV, depth+1)
+				d.skipping--
+				if err != nil {
+					return err
+				}
+				continue
+			}
 			if err := d.acceptStream(child, depth+1); err != nil {
 				return err
 			}
@@ -170,12 +183,18 @@ func (d *Decoder) acceptStreamFixlen(v Visitor, hv HeaderVisitor, sp *spCache, s
 		// generated code calls UTF8Valid inside the arm that binds the value. The
 		// POLICY it validates under is this decode's, handed to the scope here
 		// exactly as on the cursor path (issue #82).
+		if d.skipping > 0 {
+			return nil // parsed and advanced; not built
+		}
 		sp.deliver(v, d.lim)
 		return v.String(id, string(b))
 	case fixBlob:
 		b, err := d.readRaw(n)
 		if err != nil {
 			return err
+		}
+		if d.skipping > 0 {
+			return nil
 		}
 		return v.Bytes(id, b)
 	default:

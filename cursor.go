@@ -17,6 +17,10 @@ type cursor struct {
 	buf []byte
 	pos int
 	lim limits
+	// skipping is the number of declined sequences currently open (skip.go).
+	// Nonzero means the materializing paths advance rather than build, and the
+	// receiver's caps stand down: what they bound is not being handed to anyone.
+	skipping int
 }
 
 // uvarint1 is the single-byte varint — every field header for id < 16, and every
@@ -269,8 +273,10 @@ func (c *cursor) fixlenHeader(id ID, sb schemaBound) (length, sub uint64, err er
 	if length > arrayMax {
 		return 0, 0, ErrInvalidMsg
 	}
-	if err := c.lim.checkFixlen(sub, length, id, sb); err != nil {
-		return 0, 0, err
+	if c.skipping == 0 {
+		if err := c.lim.checkFixlen(sub, length, id, sb); err != nil {
+			return 0, 0, err
+		}
 	}
 	return length, sub, nil
 }
@@ -290,8 +296,10 @@ func (c *cursor) arrayCount(id ID, sb schemaBound) (n uint64, err error) {
 	if n > arrayMax {
 		return 0, ErrInvalidMsg
 	}
-	if err := c.lim.checkArrayCount(n, id, sb); err != nil {
-		return 0, err
+	if c.skipping == 0 {
+		if err := c.lim.checkArrayCount(n, id, sb); err != nil {
+			return 0, err
+		}
 	}
 	return n, nil
 }
@@ -309,6 +317,9 @@ func (c *cursor) arrayCount(id ID, sb schemaBound) (n uint64, err error) {
 //
 // Still at most one assertion per scope: the answer is cached, including a nil
 // one (known is what distinguishes "no hooks" from "not asked yet").
+// skipping is the number of declined sequences currently open (see skip.go).
+// Nonzero means the paths below advance rather than build, and the receiver's
+// caps stand down — what they bound is not being handed to anyone.
 type hvCache struct {
 	hv    HeaderVisitor
 	known bool
@@ -468,6 +479,19 @@ func (c *cursor) accept(v Visitor, depth int) error {
 			if err != nil {
 				return err
 			}
+			// nil = skip: route the scope to the no-op visitor and count the
+			// depth, so the materializing paths below advance instead of
+			// building (see skip.go). No EndSequence fires for a scope the
+			// consumer never took.
+			if child == nil {
+				c.skipping++
+				err := c.accept(skipV, depth+1)
+				c.skipping--
+				if err != nil {
+					return err
+				}
+				continue
+			}
 			if err := c.accept(child, depth+1); err != nil {
 				return err
 			}
@@ -538,12 +562,18 @@ func (c *cursor) acceptFixlen(v Visitor, hv HeaderVisitor, sp *spCache, sb schem
 		// belongs to this decode, not to the build, so the scope's visitor is
 		// handed its StringCheck here — once per scope, at the first string, and
 		// only if it accepts one (issue #82).
+		if c.skipping > 0 {
+			return nil // parsed and advanced; not built
+		}
 		sp.deliver(v, c.lim)
 		return v.String(id, string(b))
 	case fixBlob:
 		b, err := c.take(n)
 		if err != nil {
 			return err
+		}
+		if c.skipping > 0 {
+			return nil
 		}
 		return v.Bytes(id, b)
 	default:

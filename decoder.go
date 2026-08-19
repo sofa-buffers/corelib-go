@@ -23,6 +23,7 @@ type Decoder struct {
 	bounded     bool // the caller declared cur schema-bounded (SchemaBounded, §6.2.1)
 	depth       int  // sequences open on this stream (0 at the top level), §4.9
 	lim         limits
+	skipping    int // declined sequences currently open (skip.go)
 }
 
 // NewDecoder returns a Decoder reading from r. The internal buffer for the
@@ -269,8 +270,10 @@ func (d *Decoder) readFixlenHeaderFor(id ID, sb schemaBound) (length uint64, sub
 	if err := checkFixlenSubtype(sub, length); err != nil {
 		return 0, 0, err
 	}
-	if err := d.lim.checkFixlen(sub, length, id, sb); err != nil {
-		return 0, 0, err
+	if d.skipping == 0 {
+		if err := d.lim.checkFixlen(sub, length, id, sb); err != nil {
+			return 0, 0, err
+		}
 	}
 	return length, sub, nil
 }
@@ -761,8 +764,10 @@ func (d *Decoder) arrayCountFor(id ID, sb schemaBound) (uint64, error) {
 	if n > arrayMax {
 		return 0, ErrInvalidMsg
 	}
-	if err := d.lim.checkArrayCount(n, id, sb); err != nil {
-		return 0, err
+	if d.skipping == 0 {
+		if err := d.lim.checkArrayCount(n, id, sb); err != nil {
+			return 0, err
+		}
 	}
 	return n, nil
 }
