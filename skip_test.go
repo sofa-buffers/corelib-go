@@ -70,10 +70,18 @@ func declinedSubtree(t *testing.T) []byte {
 	}
 	must(e.WriteUnsigned(1, 7))
 	must(e.WriteSequenceBeginLazy(2)) // <- declined
+	// One of EVERY field kind, so the declined path is exercised for all of
+	// them rather than for the three that happened to be here first.
 	must(e.WriteUnsigned(1, 99))
+	must(e.WriteSigned(10, -99))
+	must(e.WriteFloat32(11, 1.5))
+	must(e.WriteFloat64(12, 2.5))
 	must(e.WriteString(2, "discarded"))
 	must(e.WriteBytes(3, []byte{1, 2, 3}))
 	must(sofab.WriteUnsignedArray(e, 4, []uint64{1, 2, 3}))
+	must(sofab.WriteSignedArray(e, 13, []int64{-1, -2}))
+	must(e.WriteFloat32Array(14, []float32{1.5, 2.5}))
+	must(e.WriteFloat64Array(15, []float64{3.5, 4.5}))
 	must(e.WriteSequenceBeginLazy(5)) // a scope inside the declined one
 	must(e.WriteUnsigned(1, 1))
 	must(e.WriteSequenceEnd())
@@ -119,7 +127,7 @@ func TestDecliningIsNotTheSameAsAcceptingAndIgnoring(t *testing.T) {
 		t.Fatalf("decode: %v", err)
 	}
 	got := strings.Join(log, ",")
-	want := "u,begin,u,str:discarded,blob,ua,begin,u,end,end,u"
+	want := "u,begin,u,s,f32,f64,str:discarded,blob,ua,sa,f32a,f64a,begin,u,end,end,u"
 	if got != want {
 		t.Fatalf("control event stream = %q, want %q", got, want)
 	}
@@ -280,4 +288,62 @@ func BenchmarkDeclinedSubtreeNewWay(b *testing.B) {
 			b.Fatal(err)
 		}
 	}
+}
+
+// A wrapper-array collector must survive an element whose WIRE TYPE contradicts
+// the declared element type: MESSAGE_SPEC §7.3 skips such a field rather than
+// rejecting it, and that clause wins against the schema bound — so neither the
+// element's id nor its length may be measured against this array's.
+//
+// It reaches StringSeq.ArrayBegin / BlobSeq.ArrayBegin, which exist because the
+// decoder resolves both header hooks through one v.(HeaderVisitor) assertion:
+// implementing FixlenHeader alone would leave the assertion failing and silently
+// disable it. Nothing is judged in them, and this is what proves it.
+func TestWrapperCollectorSkipsAMistypedElement(t *testing.T) {
+	var out bytes.Buffer
+	e := sofab.NewEncoder(&out)
+	_ = e.WriteSequenceBeginLazy(1)
+	// An integer ARRAY at element id 9, in an array whose elements are strings —
+	// and id 9 is past the capacity of 2, so if the bound were applied to it the
+	// decode would be INVALID.
+	_ = sofab.WriteUnsignedArray(e, 9, []uint64{1, 2, 3})
+	_ = e.WriteSequenceEnd()
+	_ = e.Flush()
+	msg := out.Bytes()
+
+	for _, tc := range []struct {
+		name string
+		mk   func(*[]string, *[][]byte) sofab.Visitor
+	}{
+		{"StringSeq", func(s *[]string, _ *[][]byte) sofab.Visitor {
+			return &collectorRoot{child: &sofab.StringSeq{Out: s, Cap: 2, ElemMax: 4}}
+		}},
+		{"BlobSeq", func(_ *[]string, b *[][]byte) sofab.Visitor {
+			return &collectorRoot{child: &sofab.BlobSeq{Out: b, Cap: 2, ElemMax: 4}}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var ss []string
+			var bb [][]byte
+			if err := sofab.AcceptBytes(msg, tc.mk(&ss, &bb)); err != nil {
+				t.Fatalf("a mistyped element is skipped, not rejected (§7.3): %v", err)
+			}
+			if len(ss) != 0 || len(bb) != 0 {
+				t.Fatalf("nothing may be collected from it: strings=%v blobs=%v", ss, bb)
+			}
+		})
+	}
+}
+
+// collectorRoot routes the one sequence field to the collector under test.
+type collectorRoot struct {
+	sofab.VisitorBase
+	child sofab.Visitor
+}
+
+func (r *collectorRoot) BeginSequence(id sofab.ID) (sofab.Visitor, error) {
+	if id == 1 {
+		return r.child, nil
+	}
+	return nil, nil
 }
