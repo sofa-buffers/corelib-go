@@ -23,7 +23,22 @@ type Visitor interface {
 	SignedArray(id ID, v []int64) error
 	Float32Array(id ID, v []float32) error
 	Float64Array(id ID, v []float64) error
-	// BeginSequence returns the visitor that receives the nested scope's fields.
+	// BeginSequence returns the visitor that receives the nested scope's fields,
+	// or nil to SKIP the scope: nothing in it is delivered, nothing under it is
+	// offered again however deep, and no EndSequence fires for it.
+	//
+	// Skipping is what a consumer says about a subtree it has no destination for
+	// — an unknown id, a field it does not care about. The bytes are still parsed
+	// (a sequence is framed by markers, not by a length, so its end has to be
+	// found) but nothing in it is built: no string is allocated, no element slice
+	// made. Before nil meant this, a consumer had to hand over a no-op visitor
+	// instead, and this interface has no optional methods — so every value in the
+	// discarded subtree was decoded and every string built before an empty method
+	// threw it away.
+	//
+	// The receiver caps (WithMaxStringLen and friends) do not fire inside a
+	// skipped scope: they bound what this consumer is handed, and it is handed
+	// nothing. Format ceilings still do, everywhere.
 	BeginSequence(id ID) (Visitor, error)
 	// EndSequence is called on that nested visitor once its scope closes, so a
 	// generated nested object can finalize itself.
