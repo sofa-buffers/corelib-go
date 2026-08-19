@@ -110,12 +110,6 @@ rejecting, whatever the option says. "Always" here means against the *runtime*
 option only: the compile-time gate comes first, so a `sofab_no_strict_utf8`
 build folds this primitive to `true` as well.
 
-The primitive and the method were both spelled `Utf8Valid` until the initialism
-was made consistent with `WithStrictUTF8`. `Utf8Valid` and
-`StringCheck.Utf8Valid` are still exported as deprecated one-line forwards,
-because generated code emits them today; they go away once the generator has
-switched.
-
 Framing is checked on every field regardless: the fixlen word, the reserved
 subtype rejection, `ARRAY_MAX`, `MAX_DEPTH`, varint overflow, and the exact
 `length`-byte advance. Only the *content* check moves.
