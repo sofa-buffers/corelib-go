@@ -15,9 +15,46 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Every job below carries a timeout-minutes. A wedged step must fail fast and
+  # say which job it was: the account's Actions concurrency is 20 slots, and a
+  # job left to GitHub's 360-minute default holds one of them for six hours
+  # while everyone else queues. The values are ~4x the observed runtime.
+
+  lint:
+    # gofmt used to run once per matrix leg. Its output does not depend on the
+    # Go version, so running it once here is the same check for a fraction of
+    # the cost -- and a tree that is not formatted never reaches the matrix.
+    # `go vet` deliberately did NOT move here: its analysers ship with the
+    # toolchain, so it belongs in the matrix, once per version.
+    name: lint (gofmt)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: stable
+          check-latest: true
+
+      - name: Download modules
+        run: go mod download
+
+      - name: Verify formatting (gofmt)
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "::error::These files are not gofmt-formatted:"
+            echo "$unformatted"
+            exit 1
+          fi
+
   build-test:
     name: build & test (Go ${{ matrix.go }})
+    needs: [lint]
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
@@ -35,15 +72,10 @@ jobs:
       - name: Download modules
         run: go mod download
 
-      - name: Verify formatting (gofmt)
-        run: |
-          unformatted=$(gofmt -l .)
-          if [ -n "$unformatted" ]; then
-            echo "::error::These files are not gofmt-formatted:"
-            echo "$unformatted"
-            exit 1
-          fi
-
+      # `go vet` runs per Go version, not once in the gate: its analysers ship
+      # with the toolchain, so a finding that only the 1.21 vet reports -- or
+      # one only a newer vet knows about -- is invisible if it runs on stable
+      # alone. gofmt stays in the gate; its output is stable across versions.
       - name: Vet
         run: go vet ./...
 
@@ -65,7 +97,9 @@ jobs:
     # the default build stays the one the shared vectors and the differential
     # fuzzer run in; this is one extra leg beside it, never a substitute.
     name: build & test (-tags sofab_no_strict_utf8)
+    needs: [lint]
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
 
@@ -89,7 +123,9 @@ jobs:
 
   coverage:
     name: Coverage
+    needs: [lint]
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: write # to publish the generated badge to the `badges` branch
     steps:

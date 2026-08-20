@@ -19,9 +19,16 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # Both jobs are time-bounded. A wedged step must fail fast and name itself:
+  # the account's Actions concurrency is 20 slots, and a job on GitHub's
+  # 360-minute default would hold one of them for six hours. The godoc mirror
+  # loops over a local server and the Pages deploy waits on an external API —
+  # exactly the shapes that hang rather than fail. Values are ~4x observed.
+
   build:
     name: Build godoc HTML
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     env:
       MODULE: github.com/sofa-buffers/corelib-go
       PORT: "6060"
@@ -86,6 +93,7 @@ jobs:
     name: Deploy to GitHub Pages
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
