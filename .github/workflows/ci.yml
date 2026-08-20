@@ -21,11 +21,12 @@ jobs:
   # while everyone else queues. The values are ~4x the observed runtime.
 
   lint:
-    # gofmt and go vet used to run once per matrix leg. They are version-
-    # independent style/soundness checks, so they run once here, on stable, and
-    # gate the rest of the workflow: a formatting slip now fails in ~30 s
-    # instead of after every build-and-test leg has paid for a full run.
-    name: lint (gofmt, vet)
+    # gofmt used to run once per matrix leg. Its output does not depend on the
+    # Go version, so running it once here is the same check for a fraction of
+    # the cost -- and a tree that is not formatted never reaches the matrix.
+    # `go vet` deliberately did NOT move here: its analysers ship with the
+    # toolchain, so it belongs in the matrix, once per version.
+    name: lint (gofmt)
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -49,9 +50,6 @@ jobs:
             exit 1
           fi
 
-      - name: Vet
-        run: go vet ./...
-
   build-test:
     name: build & test (Go ${{ matrix.go }})
     needs: [lint]
@@ -73,6 +71,13 @@ jobs:
 
       - name: Download modules
         run: go mod download
+
+      # `go vet` runs per Go version, not once in the gate: its analysers ship
+      # with the toolchain, so a finding that only the 1.21 vet reports -- or
+      # one only a newer vet knows about -- is invisible if it runs on stable
+      # alone. gofmt stays in the gate; its output is stable across versions.
+      - name: Vet
+        run: go vet ./...
 
       - name: Build
         run: go build ./...
