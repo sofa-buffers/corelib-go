@@ -10,9 +10,11 @@ on:
 permissions:
   contents: read
 
+# One in-flight run per ref: a new push supersedes the old one everywhere
+# except on main, whose runs carry the main-only `coverage` work and are kept.
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
   # Every job below carries a timeout-minutes. A wedged step must fail fast and
