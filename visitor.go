@@ -2,8 +2,8 @@ package sofab
 
 import "io"
 
-// Visitor is the push/visitor counterpart to the pull parser (Decoder.Next):
-// the decoder drives, calling a typed method per field. Generated code
+// Visitor is the ONLY decode surface this package exposes (CORELIB_PLAN
+// §5.3.1): the decoder drives, calling a typed method per field. Generated code
 // implements Visitor on the target struct and binds each field straight into a
 // member — so a generated object can be deserialized without the caller ever
 // writing a Next/Skip loop. Nested sequences descend into the visitor returned

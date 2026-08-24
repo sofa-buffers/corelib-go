@@ -37,7 +37,7 @@ func (w *refusingWriter) Write(p []byte) (int, error) {
 	return 0, w.err
 }
 
-// plainWriter is an io.Writer WITHOUT WriteString, so the string pass-through
+// plainWriter is an io.Writer WITHOUT WriteString, so the string write
 // has to fall back to Write. bytes.Buffer implements io.StringWriter, which is
 // why the fallback needs a writer of its own to be exercised at all.
 type plainWriter struct {

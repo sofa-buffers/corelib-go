@@ -14,9 +14,9 @@ import "unicode/utf8"
 // point the payload is bound into a declared destination — which only generated
 // code can identify. Generated code calls UTF8Valid inside each destination arm
 // and rejects with ErrInvalidMsg (the INVALID outcome, §5.2) when it returns
-// false. The pull parser needs no such help: Decoder.String is by construction a
-// materializing read and validates internally, while Decoder.Skip stays a pure
-// Discard.
+// false. The destination is the only place that knows a value was materialized
+// at all, which is why the check lives there and not in the codec (§6.4.5: a
+// field that is only skipped is never validated).
 //
 // It is a real validator, not a byte-range shortcut (§6.4 "Validator
 // correctness", normative): overlong encodings (including C0 80, Java's

@@ -8,9 +8,9 @@ import (
 // AcceptStream decodes the top-level stream into v exactly as Accept does — the
 // same visitor events, the same HeaderVisitor hooks, and the same
 // INVALID/INCOMPLETE outcomes — but WITHOUT slurping the whole message into one
-// contiguous buffer first. It drives the pull parser directly: every field's
-// value is read and dispatched as the reader delivers it, so peak memory is
-// bounded by the largest single field rather than by the whole wire image.
+// contiguous buffer first. It drives the reader primitives directly: every
+// field's value is read and dispatched as the reader delivers it, so peak memory
+// is bounded by the largest single field rather than by the whole wire image.
 //
 // This is what makes generated Go decode memory-bounded over a byte stream, as
 // CORELIB_PLAN §5.6 requires ("Generated code MUST support processing a message
@@ -320,7 +320,7 @@ func (d *Decoder) acceptStreamFixlenArray(v Visitor, hv HeaderVisitor, sb schema
 // count: the slice grows via append as elements actually decode, so a hostile
 // count costs memory only in proportion to the bytes delivered before the stream
 // ends (issue #40). Elements go through the same batch/tail split as
-// ReadUnsignedArray, and a truncated or overlong element surfaces its outcome
+// the cursor path, and a truncated or overlong element surfaces its outcome
 // (ErrIncomplete / ErrInvalidMsg) exactly where readVarint decides it — the
 // reader-side analogue of cursor.scanTruncatedArray (issue #66).
 //

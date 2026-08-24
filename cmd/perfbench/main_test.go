@@ -72,7 +72,7 @@ func captureStdout(t *testing.T, fn func()) string {
 	return out
 }
 
-// field is one decoded field, in the order the pull parser delivered it.
+// field is one decoded field, in the order the decoder delivered it.
 type field struct {
 	id   sofab.ID
 	kind string

@@ -1,7 +1,7 @@
 package sofab
 
 // Option configures optional decode-time limits. Options are passed to
-// NewDecoder (covering the pull parser and Decoder.Accept) or to AcceptBytes.
+// NewDecoder (Accept / AcceptStream) or to AcceptBytes.
 //
 // With no options the decoder enforces no limits and behaves bit-for-bit as it
 // did before limits existed. Limits are strictly opt-in: this package invents no

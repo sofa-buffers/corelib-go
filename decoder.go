@@ -96,7 +96,7 @@ func (d *Decoder) readVarint(firstEOFok bool) (uint64, error) {
 // to readVarint for the next element, which is where truncation and end-of-
 // stream are judged.
 //
-// It exists because Peek and Discard are the pull parser's per-varint cost once
+// It exists because Peek and Discard are the reader's per-varint cost once
 // the byte-at-a-time reads are gone. One Peek/Discard pair per batch amortizes
 // that away, and the elements decode through the same shared kernel the visitor
 // path uses (varint.go).

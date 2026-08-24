@@ -3,7 +3,7 @@ package sofab_test
 // Caller-supplied output buffer (CORELIB_PLAN §5.1) and the §7.2 item 4 encode
 // tests that only become reachable with one: encoding into a buffer of exactly
 // MinOutputBuffer, rejecting an undersized buffer where it is handed over,
-// the taking-sink handover, the start offset, and the pass-through permission.
+// the taking-sink handover, the start offset, and the no-foreign-memory rule.
 
 import (
 	"bytes"

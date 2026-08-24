@@ -26,7 +26,9 @@ package sofab
 // only place a []uint64 array comes from — that means implementing
 // ElemBoundVisitor, which lets the decoder reject an over-width element while
 // the array goes past (see visitor.go); a caller that instead reads through
-// ReadUnsignedArray[T] gets the bound from T and never needs this helper. The
+// A caller instantiating a generic reader for T would get the bound from T; the
+// visitor hands the whole slice over widened to 64 bits, so the bound has to
+// reach the decoder another way. The
 // signature stays value-in/value-out deliberately: generated code calls it in
 // expression position, and the bound belongs where the array is still being
 // decoded, not after the fact (issue #83).

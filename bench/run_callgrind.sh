@@ -19,10 +19,9 @@
 # cmd/perfbench/main.go appears here on the next run.
 #
 # The `blob 1MB` rows are where the instruction count earns its keep: the delta
-# between one-shot and streaming is the divisible-run cost (CORELIB_PLAN §5.1)
-# with the host's memory subsystem taken out of it, and the gap from streaming to
-# pass-through is what the §5.1 permission buys. Under MB/s those differences
-# drown in memory bandwidth; here they do not.
+# between one-shot and streaming is the divisible-run cost (CORELIB_PLAN §5.1.3)
+# with the host's memory subsystem taken out of it — what the flush machinery
+# costs. Under MB/s that difference drowns in memory bandwidth; here it does not.
 #
 # The Go runtime is tamed so the single op is deterministic under Valgrind:
 # GOMAXPROCS=1 (one OS thread), GODEBUG=asyncpreemptoff=1 (no preemption signal
@@ -77,4 +76,4 @@ done < <("$BIN" workloads)
 echo
 echo "Ir = instructions retired (Callgrind). Independent of CPU clock and OS"
 echo "scheduling; depends only on the executed code, so it compares across machines."
-echo "blob 1MB: read one-shot vs streaming vs pass-through against each other."
+echo "blob 1MB: read one-shot vs streaming against each other."
