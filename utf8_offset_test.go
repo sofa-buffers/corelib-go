@@ -89,8 +89,8 @@ func (d *utf8Dest) String(id sofab.ID, v string) error {
 func (d *utf8Dest) BeginSequence(sofab.ID) (sofab.Visitor, error) { return d, nil }
 
 // checkLateInvalid asserts the verdict on one malformed payload placed late,
-// across all three decode surfaces, under whichever half of the §6.4 gate this
-// build compiled.
+// across all three visitor entry points, under whichever half of the §6.4 gate
+// this build compiled.
 func checkLateInvalid(t *testing.T, bad string, padLen int) {
 	t.Helper()
 	msg, start := lateStringMsg(t, padLen, bad)
@@ -98,23 +98,18 @@ func checkLateInvalid(t *testing.T, bad string, padLen int) {
 		t.Fatalf("vector does not exercise the gap: payload starts at %d, length is %d", start, len(bad))
 	}
 
-	// (a) the pull surface validates internally.
-	s, err := readLateString(t, msg)
-	if utf8CheckCompiled {
-		if !errors.Is(err, sofab.ErrInvalidMsg) {
-			t.Errorf("Decoder.String = %q, %v; want ErrInvalidMsg", s, err)
-		}
-	} else if err != nil || s != bad {
-		t.Errorf("Decoder.String = %q, %v; the non-strict build must return the bytes verbatim", s, err)
-	}
-
-	// (b) the zero-copy visitor surface: the payload aliases the message buffer
-	// at a high offset, which is the exact shape the gap hides in.
+	// (a) the zero-copy entry point: the payload is delivered as a slice of the
+	// message buffer at a high offset, which is the exact shape the gap hides in.
 	var dst utf8Dest
-	err = sofab.AcceptBytes(msg, &dst)
+	err := sofab.AcceptBytes(msg, &dst)
 	wantVisitor(t, "AcceptBytes", err, dst.got, bad)
 
-	// (c) the reader-driven surface, fed one byte at a time so the field is
+	// (b) the slurping entry point.
+	dst = utf8Dest{}
+	err = sofab.NewDecoder(bytes.NewReader(msg)).Accept(&dst)
+	wantVisitor(t, "Accept", err, dst.got, bad)
+
+	// (c) the reader-driven entry point, fed one byte at a time so the field is
 	// reassembled across chunk boundaries before it is judged.
 	dst = utf8Dest{}
 	err = sofab.NewDecoder(&chunkReader{b: append([]byte(nil), msg...), n: 1}).AcceptStream(&dst)
@@ -132,23 +127,6 @@ func wantVisitor(t *testing.T, what string, err error, got, bad string) {
 	if err != nil || got != bad {
 		t.Errorf("%s = %q, %v; the non-strict build must deliver the bytes verbatim", what, got, err)
 	}
-}
-
-// readLateString walks past the padding blob and reads the string field with the
-// pull parser, which is a materializing read and validates internally.
-func readLateString(t *testing.T, msg []byte) (string, error) {
-	t.Helper()
-	d := sofab.NewDecoder(bytes.NewReader(msg))
-	if _, err := d.Next(); err != nil {
-		t.Fatalf("Next(blob): %v", err)
-	}
-	if err := d.Skip(); err != nil {
-		t.Fatalf("Skip(blob): %v", err)
-	}
-	if _, err := d.Next(); err != nil {
-		t.Fatalf("Next(string): %v", err)
-	}
-	return d.String()
 }
 
 func TestInvalidUTF8AtAnOffsetPastItsOwnLength(t *testing.T) {
@@ -177,9 +155,6 @@ func TestValidUTF8AtTheSameLateOffsetIsAccepted(t *testing.T) {
 	msg, start := lateStringMsg(t, 200, good)
 	if start < len(good) {
 		t.Fatalf("vector does not exercise the gap: payload starts at %d, length is %d", start, len(good))
-	}
-	if s, err := readLateString(t, msg); err != nil || s != good {
-		t.Errorf("Decoder.String = %q, %v; want %q, nil", s, err, good)
 	}
 	var dst utf8Dest
 	if err := sofab.AcceptBytes(msg, &dst); err != nil {

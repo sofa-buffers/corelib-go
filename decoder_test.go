@@ -1,11 +1,21 @@
 package sofab_test
 
+// Wire-level decode tests, one byte string per case, driven through EVERY
+// visitor entry point.
+//
+// CORELIB_PLAN §5.3.1 makes the visitor the only decode surface — "every
+// additional surface is a second implementation of every rule in this document"
+// — so these cases used to run on the pull parser and are now run on all three
+// entry points at once. That is the point of the clause: a guard added to one
+// path and not another is the recurring defect, and this table is where it would
+// show up as a disagreement rather than as a passing test on the surface the
+// author happened to pick.
+
 import (
 	"bytes"
 	"errors"
-	"io"
 	"math"
-	"reflect"
+	"strings"
 	"testing"
 
 	sofab "github.com/sofa-buffers/corelib-go"
@@ -13,426 +23,286 @@ import (
 
 func newDec(b []byte) *sofab.Decoder { return sofab.NewDecoder(bytes.NewReader(b)) }
 
-func TestDecodeUnsigned(t *testing.T) {
-	d := newDec([]byte{0x00, 0x80, 0x01})
-	f, err := d.Next()
-	if err != nil || f.ID != 0 || f.Type != sofab.TypeVarintUnsigned {
-		t.Fatalf("next: %+v %v", f, err)
+// decodeAll drives one entry point by name and returns the recorded events.
+func decodeAll(t *testing.T, surface string, in []byte) ([]string, error) {
+	t.Helper()
+	var log []string
+	r := recorder{&log}
+	var err error
+	switch surface {
+	case "AcceptBytes":
+		err = sofab.AcceptBytes(in, r)
+	case "Accept":
+		err = newDec(in).Accept(r)
+	case "AcceptStream":
+		err = newDec(in).AcceptStream(r)
+	default:
+		t.Fatalf("unknown surface %q", surface)
 	}
-	v, err := d.Unsigned()
-	if err != nil || v != 128 {
-		t.Fatalf("got %d %v", v, err)
-	}
+	return log, err
 }
 
-func TestDecodeUnsignedMax(t *testing.T) {
-	d := newDec([]byte{0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01})
-	d.Next()
-	v, err := d.Unsigned()
-	if err != nil || v != math.MaxUint64 {
-		t.Fatalf("got %d %v", v, err)
-	}
-}
+var surfaces = []string{"AcceptBytes", "Accept", "AcceptStream"}
 
-func TestDecodeSigned(t *testing.T) {
-	d := newDec([]byte{0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01})
-	d.Next()
-	v, err := d.Signed()
-	if err != nil || v != math.MinInt64 {
-		t.Fatalf("got %d %v", v, err)
-	}
-}
-
-func TestDecodeFloat32(t *testing.T) {
-	d := newDec([]byte{0x02, 0x20, 0x56, 0x0E, 0x49, 0x40})
-	d.Next()
-	v, err := d.Float32()
-	if err != nil || v != 3.1415 {
-		t.Fatalf("got %v %v", v, err)
-	}
-}
-
-func TestDecodeFloat64(t *testing.T) {
-	d := newDec([]byte{0x02, 0x41, 0x00, 0x00, 0x00, 0x60, 0xFB, 0x21, 0x09, 0x40})
-	d.Next()
-	v, err := d.Float64()
-	if err != nil || v != float64(float32(3.14159265)) {
-		t.Fatalf("got %v %v", v, err)
-	}
-}
-
-func TestDecodeString(t *testing.T) {
-	d := newDec([]byte{0x02, 0x62, 0x48, 0x65, 0x6C, 0x6C, 0x6F, 0x20, 0x43, 0x6F, 0x75, 0x63, 0x68, 0x21})
-	d.Next()
-	s, err := d.String()
-	if err != nil || s != "Hello Couch!" {
-		t.Fatalf("got %q %v", s, err)
-	}
-}
-
-func TestDecodeStringEmpty(t *testing.T) {
-	d := newDec([]byte{0x02, 0x02})
-	d.Next()
-	s, err := d.String()
-	if err != nil || s != "" {
-		t.Fatalf("got %q %v", s, err)
-	}
-}
-
-func TestDecodeBlob(t *testing.T) {
-	d := newDec([]byte{0x02, 0x2B, 0x01, 0x02, 0x03, 0x04, 0x05})
-	d.Next()
-	b, err := d.Bytes()
-	if err != nil || !bytes.Equal(b, []byte{1, 2, 3, 4, 5}) {
-		t.Fatalf("got % X %v", b, err)
-	}
-}
-
-func TestDecodeArrayU32(t *testing.T) {
-	d := newDec([]byte{0x03, 0x05, 0x01, 0x02, 0x03, 0x80, 0x80, 0x80, 0x80, 0x08, 0xFF, 0xFF, 0xFF, 0xFF, 0x0F})
-	f, _ := d.Next()
-	if f.Type != sofab.TypeVarintArrayUnsigned {
-		t.Fatalf("type %v", f.Type)
-	}
-	got, err := sofab.ReadUnsignedArray[uint32](d)
-	want := []uint32{1, 2, 3, 0x8000_0000, 0xFFFF_FFFF}
-	if err != nil || !reflect.DeepEqual(got, want) {
-		t.Fatalf("got %v %v", got, err)
-	}
-}
-
-func TestDecodeArrayI32(t *testing.T) {
-	d := newDec([]byte{0x04, 0x05, 0x01, 0x03, 0x05, 0xFF, 0xFF, 0xFF, 0xFF, 0x0F, 0xFE, 0xFF, 0xFF, 0xFF, 0x0F})
-	d.Next()
-	got, err := sofab.ReadSignedArray[int32](d)
-	want := []int32{-1, -2, -3, -2147483648, 2147483647}
-	if err != nil || !reflect.DeepEqual(got, want) {
-		t.Fatalf("got %v %v", got, err)
-	}
-}
-
-func TestDecodeArrayFloat32(t *testing.T) {
-	d := newDec([]byte{0x05, 0x05, 0x20, 0x00, 0x00, 0x80, 0x3F, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00,
-		0x40, 0x40, 0xFF, 0xFF, 0x7F, 0xFF, 0xFF, 0xFF, 0x7F, 0x7F})
-	d.Next()
-	got, err := d.ReadFloat32Array()
-	want := []float32{1, 2, 3, -math.MaxFloat32, math.MaxFloat32}
-	if err != nil || !reflect.DeepEqual(got, want) {
-		t.Fatalf("got %v %v", got, err)
-	}
-}
-
-func TestDecodeNestedSequence(t *testing.T) {
-	d := newDec([]byte{0x00, 0x2A, 0x0E, 0x00, 0x2A, 0x11, 0x53, 0x07, 0x11, 0x53})
-	type ev struct {
-		id  sofab.ID
-		typ sofab.WireType
-		val int64
-	}
-	var got []ev
-	for {
-		f, err := d.Next()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			t.Fatal(err)
-		}
-		switch f.Type {
-		case sofab.TypeVarintUnsigned:
-			v, _ := d.Unsigned()
-			got = append(got, ev{f.ID, f.Type, int64(v)})
-		case sofab.TypeVarintSigned:
-			v, _ := d.Signed()
-			got = append(got, ev{f.ID, f.Type, v})
-		default:
-			got = append(got, ev{f.ID, f.Type, 0})
-		}
-	}
-	want := []ev{
-		{0, sofab.TypeVarintUnsigned, 42},
-		{1, sofab.TypeSequenceStart, 0},
-		{0, sofab.TypeVarintUnsigned, 42},
-		{2, sofab.TypeVarintSigned, -42},
-		{0, sofab.TypeSequenceEnd, 0},
-		{2, sofab.TypeVarintSigned, -42},
-	}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("got %+v", got)
-	}
-}
-
-// --- error cases ------------------------------------------------------------
-
-// TestArrayCountZeroIsEmpty confirms a zero-count array is now valid (§4.7) and
-// decodes to an empty, non-error slice — exactly the bytes [header][count=0].
-func TestArrayCountZeroIsEmpty(t *testing.T) {
-	d := newDec([]byte{0x03, 0x00}) // id 0, unsigned array, count 0
-	d.Next()
-	if a, err := sofab.ReadUnsignedArray[uint32](d); err != nil || len(a) != 0 {
-		t.Fatalf("want [] nil, got %v %v", a, err)
-	}
-}
-
-func TestVarintOverflowInvalid(t *testing.T) {
-	d := newDec([]byte{0x00, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80})
-	d.Next()
-	if _, err := d.Unsigned(); !errors.Is(err, sofab.ErrInvalidMsg) {
-		t.Fatalf("want ErrInvalidMsg, got %v", err)
-	}
-}
-
-// TestOverlongVarintInvalid pins the fix for issue #48 (Crucible F-0016): a
-// varint whose payload spills past bit 63 is malformed (§4.1/§6.3) and must be
-// rejected as ErrInvalidMsg, not silently truncated. A 64-bit value uses at
-// most 10 bytes, and in the 10th byte only the low bit may be set — anything
-// above it is a >64-bit overflow, even though the varint terminates on that
-// byte (no 11th continuation byte). Both the visitor and pull paths are driven;
-// the …01 maximum (2^64-1) is the control that must still decode.
-func TestOverlongVarintInvalid(t *testing.T) {
-	// id 6, unsigned varint (0x30 = 6<<3 | TypeVarintUnsigned), matching the
-	// issue's reproducer.
-	const hdr = 0x30
-	cont := []byte{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF} // 9 continuation bytes
-	msg := func(last byte) []byte { return append(append([]byte{hdr}, cont...), last) }
-
-	cases := []struct {
-		name    string
-		last    byte
-		wantErr bool
-		want    uint64 // only checked when wantErr is false
+// TestDecodeEveryValueKind is the value table: each row is a complete message,
+// and every surface must produce exactly the listed events and reach COMPLETE.
+func TestDecodeEveryValueKind(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		in   []byte
+		want []string
 	}{
-		{name: "10th byte 65th bit set", last: 0x02, wantErr: true},
-		{name: "10th byte bits 64..69 set", last: 0x7F, wantErr: true},
-		{name: "control 2^64-1", last: 0x01, wantErr: false, want: math.MaxUint64},
-	}
-
-	for _, c := range cases {
+		{"unsigned", []byte{0x00, 0x80, 0x01}, []string{evU(0, 128)}},
+		{"unsigned max", []byte{0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01},
+			[]string{evU(0, math.MaxUint64)}},
+		{"signed", []byte{0x01, 0x53}, []string{evS(0, -42)}},
+		{"fp32", []byte{0x02, 0x20, 0x00, 0x00, 0x80, 0x3F}, []string{evF32(0, 1)}},
+		{"fp64", []byte{0x02, 0x41, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xF0, 0x3F},
+			[]string{evF64(0, 1)}},
+		{"string", []byte{0x02, 0x12, 'h', 'i'}, []string{evStr(0, "hi")}},
+		{"string empty", []byte{0x02, 0x02}, []string{evStr(0, "")}},
+		{"blob", []byte{0x02, 0x2B, 1, 2, 3, 4, 5}, []string{evBlob(0, []byte{1, 2, 3, 4, 5})}},
+		{"unsigned array", []byte{0x03, 0x05, 0x01, 0x02, 0x03, 0x80, 0x80, 0x80, 0x80, 0x08,
+			0xFF, 0xFF, 0xFF, 0xFF, 0x0F},
+			[]string{evAU(0, []uint64{1, 2, 3, 0x8000_0000, 0xFFFF_FFFF})}},
+		{"signed array", []byte{0x04, 0x05, 0x01, 0x03, 0x05, 0xFF, 0xFF, 0xFF, 0xFF, 0x0F,
+			0xFE, 0xFF, 0xFF, 0xFF, 0x0F},
+			[]string{evAS(0, []int64{-1, -2, -3, -2147483648, 2147483647})}},
+		{"fp32 array", []byte{0x05, 0x05, 0x20, 0x00, 0x00, 0x80, 0x3F, 0x00, 0x00, 0x00, 0x40,
+			0x00, 0x00, 0x40, 0x40, 0xFF, 0xFF, 0x7F, 0xFF, 0xFF, 0xFF, 0x7F, 0x7F},
+			[]string{evAF32(0, []float32{1, 2, 3, -math.MaxFloat32, math.MaxFloat32})}},
+		// A zero-count array is valid (§4.7/§4.8) and decodes to an empty slice.
+		{"empty unsigned array", []byte{0x03, 0x00}, []string{evAU(0, nil)}},
+		// [u 0=42][seq 1: [u 0=42][s 2=-42]][s 2=-42]
+		{"nested sequence", []byte{0x00, 0x2A, 0x0E, 0x00, 0x2A, 0x11, 0x53, 0x07, 0x11, 0x53},
+			[]string{evU(0, 42), "seqbegin/1", evU(0, 42), evS(2, -42), "seqend", evS(2, -42)}},
+	} {
 		t.Run(c.name, func(t *testing.T) {
-			in := msg(c.last)
-
-			// Visitor path (what a generated Decode<Name> uses).
-			verr := sofab.AcceptBytes(in, baseV{})
-			if c.wantErr {
-				if !errors.Is(verr, sofab.ErrInvalidMsg) {
-					t.Fatalf("AcceptBytes = %v, want ErrInvalidMsg", verr)
+			for _, s := range surfaces {
+				log, err := decodeAll(t, s, c.in)
+				if err != nil {
+					t.Fatalf("%s = %v, want COMPLETE", s, err)
 				}
-				if errors.Is(verr, sofab.ErrIncomplete) {
-					t.Fatalf("AcceptBytes = %v, overlong varint is malformed, not truncated", verr)
-				}
-			} else if verr != nil {
-				t.Fatalf("AcceptBytes control = %v, want nil", verr)
-			}
-
-			// Pull path.
-			d := newDec(in)
-			if _, err := d.Next(); err != nil {
-				t.Fatalf("pull Next = %v", err)
-			}
-			v, perr := d.Unsigned()
-			if c.wantErr {
-				if !errors.Is(perr, sofab.ErrInvalidMsg) {
-					t.Fatalf("pull Unsigned = %v, want ErrInvalidMsg", perr)
-				}
-				if errors.Is(perr, sofab.ErrIncomplete) {
-					t.Fatalf("pull Unsigned = %v, overlong varint is malformed, not truncated", perr)
-				}
-			} else {
-				if perr != nil {
-					t.Fatalf("pull Unsigned control = %v, want nil", perr)
-				}
-				if v != c.want {
-					t.Fatalf("pull Unsigned control = %d, want %d", v, c.want)
+				if strings.Join(log, "|") != strings.Join(c.want, "|") {
+					t.Fatalf("%s events = %v, want %v", s, log, c.want)
 				}
 			}
 		})
 	}
 }
 
-func TestDanglingSequenceEndInvalid(t *testing.T) {
-	// header 0x07 = id 0, type SequenceEnd with nothing open. §6.3 names an
-	// unbalanced sequence end as InvalidMessage, so the pull surface rejects it
-	// rather than surfacing it as a token the caller has to judge (issue #78);
-	// the visitor kernels already did. Balanced end markers are covered by the
-	// nesting round-trips (TestMaxDepthRoundTrip, TestSkipSequenceEndIsNoop).
-	d := newDec([]byte{0x07})
-	if _, err := d.Next(); !errors.Is(err, sofab.ErrInvalidMsg) {
-		t.Fatalf("Next on a dangling end = %v, want ErrInvalidMsg", err)
-	}
-}
-
-func TestIDAboveMaxInvalid(t *testing.T) {
-	// Craft a header whose id field is IDMax+1, type unsigned (tag 0).
-	var buf bytes.Buffer
-	h := (uint64(sofab.IDMax) + 1) << 3
-	for {
+// TestDecodeMalformedOnEverySurface is the §5.2.2 half of the same table: each
+// row must be INVALID on every surface, never a crash and never INCOMPLETE.
+func TestDecodeMalformedOnEverySurface(t *testing.T) {
+	// A header whose id field is IDMax+1, wire type unsigned.
+	var overID bytes.Buffer
+	for h := (uint64(sofab.IDMax) + 1) << 3; ; {
 		b := byte(h & 0x7F)
 		h >>= 7
 		if h != 0 {
 			b |= 0x80
 		}
-		buf.WriteByte(b)
+		overID.WriteByte(b)
 		if h == 0 {
 			break
 		}
 	}
-	buf.WriteByte(0x00)
-	d := sofab.NewDecoder(&buf)
-	if _, err := d.Next(); !errors.Is(err, sofab.ErrInvalidMsg) {
-		t.Fatalf("want ErrInvalidMsg, got %v", err)
-	}
-}
-
-func TestFloat32WrongLengthInvalid(t *testing.T) {
-	d := newDec([]byte{0x02, (2 << 3) | 0x00, 0xAA, 0xBB}) // FIXLEN FP32 but length 2
-	d.Next()
-	if _, err := d.Float32(); !errors.Is(err, sofab.ErrInvalidMsg) {
-		t.Fatalf("want ErrInvalidMsg, got %v", err)
-	}
-}
-
-func TestSkipAndStreaming(t *testing.T) {
-	// Encode three fields; skip the middle one while decoding.
-	var buf bytes.Buffer
-	e := sofab.NewEncoder(&buf)
-	e.WriteUnsigned(1, 100)
-	e.WriteString(2, "skip me")
-	e.WriteSigned(3, -5)
-	if err := e.Flush(); err != nil {
-		t.Fatal(err)
-	}
-	d := sofab.NewDecoder(&buf)
-	f, _ := d.Next()
-	if v, _ := d.Unsigned(); f.ID != 1 || v != 100 {
-		t.Fatal("field 1")
-	}
-	d.Next() // field 2: do not read it; Next on the following call auto-skips
-	f, _ = d.Next()
-	if v, _ := d.Signed(); f.ID != 3 || v != -5 {
-		t.Fatal("field 3")
-	}
-}
-
-func TestSkipNestedSequence(t *testing.T) {
-	// field 1, a nested (and doubly-nested) sequence in field 2, then field 3.
-	var buf bytes.Buffer
-	e := sofab.NewEncoder(&buf)
-	e.WriteUnsigned(1, 11)
-	e.WriteSequenceBeginLazy(2)
-	e.WriteUnsigned(0, 99)
-	e.WriteSequenceBeginLazy(5) // nested sequence inside
-	e.WriteString(0, "deep")
-	e.WriteSequenceEnd()
-	e.WriteSigned(0, -1)
-	e.WriteSequenceEnd()
-	e.WriteSigned(3, 7)
-	if err := e.Flush(); err != nil {
-		t.Fatal(err)
-	}
-
-	d := sofab.NewDecoder(&buf)
-	f, _ := d.Next()
-	if v, _ := d.Unsigned(); f.ID != 1 || v != 11 {
-		t.Fatal("field 1")
-	}
-	f, _ = d.Next()
-	if f.ID != 2 || f.Type != sofab.TypeSequenceStart {
-		t.Fatal("expected sequence start")
-	}
-	if err := d.Skip(); err != nil { // skip the whole subtree
-		t.Fatalf("skip: %v", err)
-	}
-	f, _ = d.Next()
-	if v, _ := d.Signed(); f.ID != 3 || v != 7 {
-		t.Fatalf("field 3 after skip: %+v %d", f, v)
-	}
-	if _, err := d.Next(); err != io.EOF {
-		t.Fatalf("want EOF, got %v", err)
-	}
-}
-
-// TestSequenceEndIDDiscarded pins CORELIB_PLAN §4.9: "a decoder MUST discard the
-// id" of a sequence-end marker. The id sub-field exists only to keep the header
-// format uniform; on wire type 7 it carries no information and never will, so a
-// sender can express nothing by varying it. Next must therefore hand the caller
-// a marker with ID 0 whatever spelling arrived — otherwise "the id is discarded"
-// is a convention a pull consumer has to know rather than a property the API
-// enforces, and a consumer that switches on f.ID sees a sender-chosen number
-// (issue #94).
-//
-// Discarded is not unvalidated: the ID_MAX ceiling still applies to the raw
-// header, so the over-ceiling case below stays ErrInvalidMsg (§6.2, PR #70).
-func TestSequenceEndIDDiscarded(t *testing.T) {
-	open := vhdr(0, sofab.TypeSequenceStart)
+	overID.WriteByte(0x00)
 
 	for _, c := range []struct {
 		name string
-		end  []byte
+		in   []byte
 	}{
-		{"canonical 0x07", vhdr(0, sofab.TypeSequenceEnd)},
-		{"id 3", vhdr(3, sofab.TypeSequenceEnd)},
-		{"id at ID_MAX", vhdr(sofab.IDMax, sofab.TypeSequenceEnd)},
-		// A non-minimal spelling of id 0 is an ordinary in-range id (§4.9): it
-		// is accepted, and discarded like every other.
-		{"non-minimal id 0", []byte{0x87, 0x00}},
+		{"varint over 64 bits", []byte{0x00, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80}},
+		{"dangling sequence end", []byte{0x07}},
+		{"id above ID_MAX", overID.Bytes()},
+		{"fp32 fixlen of the wrong length", []byte{0x02, (2 << 3) | 0x00, 0xAA, 0xBB}},
+		{"fp64 fixlen of the wrong length", []byte{0x02, (7 << 3) | 0x01, 1, 2, 3, 4, 5, 6, 7}},
+		{"reserved fixlen subtype", []byte{0x02, (1 << 3) | 0x04, 0xAA}},
 	} {
 		t.Run(c.name, func(t *testing.T) {
-			d := newDec(append(append([]byte{}, open...), c.end...))
-			mustNext(t, d)
-			f := mustNext(t, d)
-			if f.Type != sofab.TypeSequenceEnd || f.ID != 0 {
-				t.Fatalf("Next = %+v, want {ID:0 Type:TypeSequenceEnd}", f)
-			}
-			// Field() replays the same header and must not leak the id either.
-			if g := d.Field(); g != f {
-				t.Fatalf("Field() = %+v, want %+v", g, f)
-			}
-			if _, err := d.Next(); err != io.EOF {
-				t.Fatalf("after end: %v, want EOF", err)
+			for _, s := range surfaces {
+				if _, err := decodeAll(t, s, c.in); !errors.Is(err, sofab.ErrInvalidMsg) {
+					t.Fatalf("%s = %v, want ErrInvalidMsg", s, err)
+				}
 			}
 		})
 	}
-
-	t.Run("id above ID_MAX", func(t *testing.T) {
-		d := newDec(append(append([]byte{}, open...), vhdr(sofab.IDMax+1, sofab.TypeSequenceEnd)...))
-		mustNext(t, d)
-		if _, err := d.Next(); !errors.Is(err, sofab.ErrInvalidMsg) {
-			t.Fatalf("Next = %v, want ErrInvalidMsg", err)
-		}
-	})
 }
 
-// TestSequenceEndIDDiscardedNested checks the discard on an inner marker too:
-// the id is dropped, and the marker still closes the innermost open scope, so
-// the field that follows belongs to the outer one.
-func TestSequenceEndIDDiscardedNested(t *testing.T) {
-	var in []byte
-	in = append(in, vhdr(1, sofab.TypeSequenceStart)...)
-	in = append(in, vhdr(2, sofab.TypeSequenceStart)...)
-	in = append(in, vhdr(9, sofab.TypeSequenceEnd)...) // closes id-2 scope
-	in = append(in, vhdr(4, sofab.TypeVarintUnsigned)...)
-	in = append(in, 0x2A)
-	in = append(in, vhdr(7, sofab.TypeSequenceEnd)...) // closes id-1 scope
+// TestDecodeTolerance is §7.2 item 5b: input that is non-canonical but
+// well-formed decodes to the value it denotes on every surface.
+func TestDecodeTolerance(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		in   []byte
+		want []string
+	}{
+		// A non-minimal varint at a field header (§4.1.2).
+		{"non-minimal field header", []byte{0x80, 0x00, 0x2A}, []string{evU(0, 42)}},
+		// A non-minimal varint in the value itself.
+		{"non-minimal value", []byte{0x00, 0x80, 0x80, 0x00}, []string{evU(0, 0)}},
+		// A sequence-end header whose id is non-zero but within ID_MAX (§4.9):
+		// it closes the innermost sequence and the id is discarded.
+		{"sequence end with a non-zero id", []byte{0x06, 0x00, 0x2A, 0x3F},
+			[]string{"seqbegin/0", evU(0, 42), "seqend"}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			for _, s := range surfaces {
+				log, err := decodeAll(t, s, c.in)
+				if err != nil {
+					t.Fatalf("%s = %v, want COMPLETE", s, err)
+				}
+				if strings.Join(log, "|") != strings.Join(c.want, "|") {
+					t.Fatalf("%s events = %v, want %v", s, log, c.want)
+				}
+			}
+		})
+	}
+}
 
-	d := newDec(in)
-	if f := mustNext(t, d); f.ID != 1 || f.Type != sofab.TypeSequenceStart {
-		t.Fatalf("outer start: %+v", f)
+// TestDecodeSkipsWhatTheVisitorDeclines is §7.2 item 7: a visitor that binds
+// only some ids must resync correctly onto the field after the ones it ignored,
+// and a declined sub-sequence must be walked whole.
+func TestDecodeSkipsWhatTheVisitorDeclines(t *testing.T) {
+	in := encode(t, func(e *sofab.Encoder) {
+		e.WriteUnsigned(1, 100)
+		e.WriteString(2, "skip me")
+		e.WriteSequenceBeginLazy(3)
+		e.WriteUnsigned(1, 7)
+		e.WriteBytes(2, []byte{9, 9, 9})
+		e.WriteSequenceEndKeep()
+		e.WriteSigned(4, -5)
+	})
+
+	for _, s := range surfaces {
+		t.Run(s, func(t *testing.T) {
+			var log []string
+			var err error
+			v := &declineSeqV{log: &log}
+			switch s {
+			case "AcceptBytes":
+				err = sofab.AcceptBytes(in, v)
+			case "Accept":
+				err = newDec(in).Accept(v)
+			case "AcceptStream":
+				err = newDec(in).AcceptStream(v)
+			}
+			if err != nil {
+				t.Fatalf("%s = %v, want COMPLETE", s, err)
+			}
+			want := []string{evU(1, 100), evStr(2, "skip me"), evS(4, -5)}
+			if strings.Join(log, "|") != strings.Join(want, "|") {
+				t.Fatalf("%s events = %v, want %v", s, log, want)
+			}
+		})
 	}
-	if f := mustNext(t, d); f.ID != 2 || f.Type != sofab.TypeSequenceStart {
-		t.Fatalf("inner start: %+v", f)
+}
+
+// declineSeqV records top-level scalars and declines every sub-sequence, which
+// is how a consumer says "no destination for this subtree" (§6.0).
+type declineSeqV struct {
+	baseV
+	log *[]string
+}
+
+func (v *declineSeqV) Unsigned(id sofab.ID, x uint64) error {
+	*v.log = append(*v.log, evU(id, x))
+	return nil
+}
+func (v *declineSeqV) Signed(id sofab.ID, x int64) error {
+	*v.log = append(*v.log, evS(id, x))
+	return nil
+}
+func (v *declineSeqV) String(id sofab.ID, s string) error {
+	*v.log = append(*v.log, evStr(id, s))
+	return nil
+}
+func (v *declineSeqV) BeginSequence(sofab.ID) (sofab.Visitor, error) { return nil, nil }
+
+// TestNoPartialEvaluationOfATruncatedFixlenWord is §7.2 item 6's dedicated
+// case: a `fixlen_word` cut after its first byte, with that byte carrying a
+// RESERVED subtype (0x4–0x7).
+//
+// The subtype is already settled by the low three bits, so an implementation
+// that evaluates it early answers INVALID where §4.1.1 requires INCOMPLETE —
+// "an unfinished varint carries no verdict at all". Nothing else in the suite
+// reaches this rule: the dangling 0x80 of the ordinary truncation cases carries
+// no settled sub-field to peek at.
+func TestNoPartialEvaluationOfATruncatedFixlenWord(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		in   []byte
+	}{
+		// id 0, fixlen; the word's first byte is 0x84: continuation set, low
+		// three bits = subtype 0x4, which is reserved. The word never finishes.
+		{"reserved subtype 0x4", []byte{0x02, 0x84}},
+		{"reserved subtype 0x5", []byte{0x02, 0x85}},
+		{"reserved subtype 0x6", []byte{0x02, 0x86}},
+		{"reserved subtype 0x7", []byte{0x02, 0x87}},
+		// The same rule one level down: a fixlen ARRAY's element word, cut after
+		// a first byte that already spells a reserved subtype.
+		{"fixlen array element word", []byte{0x05, 0x01, 0x84}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			for _, s := range surfaces {
+				err := func() error { _, e := decodeAll(t, s, c.in); return e }()
+				if !errors.Is(err, sofab.ErrIncomplete) {
+					t.Fatalf("%s = %v, want ErrIncomplete (§4.1.1: an unfinished "+
+						"varint carries no verdict, not even from a settled subtype)", s, err)
+				}
+				if errors.Is(err, sofab.ErrInvalidMsg) {
+					t.Fatalf("%s = %v: the reserved subtype was evaluated before "+
+						"the word finished", s, err)
+				}
+			}
+		})
 	}
-	if f := mustNext(t, d); f.ID != 0 || f.Type != sofab.TypeSequenceEnd {
-		t.Fatalf("inner end: %+v, want ID 0", f)
-	}
-	f := mustNext(t, d)
-	v, err := d.Unsigned()
-	if f.ID != 4 || err != nil || v != 42 {
-		t.Fatalf("field after inner end: %+v %d %v", f, v, err)
-	}
-	if f := mustNext(t, d); f.ID != 0 || f.Type != sofab.TypeSequenceEnd {
-		t.Fatalf("outer end: %+v, want ID 0", f)
-	}
-	if _, err := d.Next(); err != io.EOF {
-		t.Fatalf("trailing: %v, want EOF", err)
+}
+
+// TestNonMinimalFixlenWordAndElementCount completes §7.2 item 5b. The tolerance
+// cases already covered were a non-minimal field header, a non-minimal value and
+// a non-minimal sequence-end id; item 5b also names a non-minimal `fixlen_word`
+// and a non-minimal ELEMENT COUNT, neither of which any decode surface exercised.
+func TestNonMinimalFixlenWordAndElementCount(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		in   []byte
+		want []string
+	}{
+		{
+			// id 0, fixlen; word = (3<<3)|str = 0x1A, spelled non-minimally as
+			// 0x9A 0x00, then "abc".
+			"non-minimal fixlen_word",
+			[]byte{0x02, 0x9A, 0x00, 'a', 'b', 'c'},
+			[]string{evStr(0, "abc")},
+		},
+		{
+			// id 1, unsigned array; count = 1 spelled non-minimally as 0x81 0x00,
+			// then one element.
+			"non-minimal element count",
+			[]byte{0x0B, 0x81, 0x00, 0x01},
+			[]string{evAU(1, []uint64{1})},
+		},
+		{
+			// The fixlen-array form: count 1 non-minimal, then a canonical fp32
+			// element word and its four payload bytes.
+			"non-minimal fixlen array count",
+			[]byte{0x0D, 0x81, 0x00, 0x20, 0x00, 0x00, 0x80, 0x3F},
+			[]string{evAF32(1, []float32{1})},
+		},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			for _, s := range surfaces {
+				log, err := decodeAll(t, s, c.in)
+				if err != nil {
+					t.Fatalf("%s = %v, want COMPLETE (§4.1.2: non-minimal is "+
+						"well-formed and normalized away)", s, err)
+				}
+				if strings.Join(log, "|") != strings.Join(c.want, "|") {
+					t.Fatalf("%s events = %v, want %v", s, log, c.want)
+				}
+			}
+		})
 	}
 }

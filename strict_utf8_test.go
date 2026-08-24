@@ -98,23 +98,18 @@ func checkUTF8Encode(t *testing.T, what string, got error) {
 
 // TestStrictUTF8DecodeDefaultRejects proves SOFAB_STRICT_UTF8 defaults to ON:
 // an invalid-UTF-8 string that is *materialized* is the INVALID outcome
-// (ErrInvalidMsg), with no option supplied — on the pull path (Decoder.String
-// validates internally) and at a visitor destination (generated code calls
-// sofab.UTF8Valid in the arm that binds the value). A visitor with no
-// destination for the id must not be affected: §6.4 forbids validating a field
-// that is only skipped.
+// (ErrInvalidMsg), with no option supplied. The check lives at the destination
+// (§6.4.3: generated code calls sofab.UTF8Valid in the arm that binds the
+// value), because the codec cannot tell a field the visitor binds from one it
+// skips — and §6.4.5 forbids validating a skip. A visitor with no destination
+// for the id must therefore be unaffected.
 func TestStrictUTF8DecodeDefaultRejects(t *testing.T) {
 	in := strField(1, []byte{0xFF}) // 0xFF cannot begin any UTF-8 sequence.
 
-	d := sofab.NewDecoder(bytes.NewReader(in))
-	mustNext(t, d)
-	got, err := d.String()
-	checkUTF8Decode(t, "pull String default", err)
-	if err == nil && got != "\xFF" {
-		t.Fatalf("pull String default = % X, want FF verbatim", got)
-	}
 	checkUTF8Decode(t, "visitor destination default",
 		sofab.AcceptBytes(in, &bindStrV{id: 1}))
+	checkUTF8Decode(t, "AcceptStream destination default",
+		sofab.NewDecoder(bytes.NewReader(in)).AcceptStream(&bindStrV{id: 1}))
 	var v capV
 	if err := sofab.AcceptBytes(in, &v); err != nil {
 		t.Fatalf("visitor without destination = %v, want nil", err)
@@ -146,10 +141,8 @@ func TestStrictUTF8DecodeRejectsVariants(t *testing.T) {
 		in := strField(0, payload)
 		checkUTF8Decode(t, name+" visitor destination",
 			sofab.AcceptBytes(in, &bindStrV{id: 0}))
-		d := sofab.NewDecoder(bytes.NewReader(in))
-		mustNext(t, d)
-		_, err := d.String()
-		checkUTF8Decode(t, name+" pull", err)
+		checkUTF8Decode(t, name+" AcceptStream destination",
+			sofab.NewDecoder(bytes.NewReader(in)).AcceptStream(&bindStrV{id: 0}))
 	}
 }
 
@@ -200,20 +193,10 @@ func TestUTF8ValidPrimitive(t *testing.T) {
 
 // TestStrictUTF8DecodeOffVerbatim proves that with the check OFF the same
 // invalid-UTF-8 input decodes successfully and the wire bytes are kept verbatim
-// (never lossy, no U+FFFD) on both decode paths.
+// (never lossy, no U+FFFD).
 func TestStrictUTF8DecodeOffVerbatim(t *testing.T) {
 	payload := []byte{0x41, 0xFF, 0x42} // 'A', invalid, 'B'
 	in := strField(1, payload)
-
-	d := sofab.NewDecoder(bytes.NewReader(in), sofab.WithStrictUTF8(false))
-	mustNext(t, d)
-	got, err := d.String()
-	if err != nil {
-		t.Fatalf("pull String off = %v, want nil", err)
-	}
-	if got != string(payload) {
-		t.Fatalf("pull String off = % X, want % X", got, payload)
-	}
 
 	var v capV
 	if err := sofab.AcceptBytes(in, &v, sofab.WithStrictUTF8(false)); err != nil {
@@ -332,31 +315,39 @@ func TestStrictUTF8EmbeddedNUL(t *testing.T) {
 
 // --- skipped fields are never validated -------------------------------------
 
-// TestStrictUTF8SkipNotValidated proves the §6.4 rule that a skipped string is a
-// length jump that is never UTF-8-validated, even under strict ON: a message
-// with an invalid-UTF-8 string that the pull caller Skips decodes cleanly, and
-// resync onto the following field works.
+// TestStrictUTF8SkipNotValidated proves §6.4.5: a string the destination does
+// not bind is a length jump that is never UTF-8-validated, even under strict ON.
+// A message carrying an invalid-UTF-8 string at an id the visitor has no
+// destination for decodes cleanly, and the field after it still arrives.
 func TestStrictUTF8SkipNotValidated(t *testing.T) {
 	// [id 1: string 0xFF][id 2: unsigned 5]
 	in := strField(1, []byte{0xFF})
 	in = append(in, vhdr(2, sofab.TypeVarintUnsigned)...)
 	in = append(in, vbytes(5)...)
 
-	d := sofab.NewDecoder(bytes.NewReader(in)) // strict ON (default)
-	f := mustNext(t, d)
-	if f.ID != 1 {
-		t.Fatalf("first field id = %d, want 1", f.ID)
-	}
-	if err := d.Skip(); err != nil {
-		t.Fatalf("Skip invalid-utf8 string = %v, want nil (skips are never validated)", err)
-	}
-	f = mustNext(t, d)
-	if f.ID != 2 {
-		t.Fatalf("resync field id = %d, want 2", f.ID)
-	}
-	v, err := d.Unsigned()
-	if err != nil || v != 5 {
-		t.Fatalf("after skip Unsigned = (%d,%v), want (5,nil)", v, err)
+	for _, surface := range surfaces {
+		// bindStrV validates only the id it declares; here that is id 3, so the
+		// invalid payload at id 1 is never bound and never checked.
+		v := &bindStrV{id: 3}
+		var err error
+		switch surface {
+		case "AcceptBytes":
+			err = sofab.AcceptBytes(in, v)
+		case "Accept":
+			err = sofab.NewDecoder(bytes.NewReader(in)).Accept(v)
+		case "AcceptStream":
+			err = sofab.NewDecoder(bytes.NewReader(in)).AcceptStream(v)
+		}
+		if err != nil {
+			t.Fatalf("%s = %v, want nil (skips are never validated)", surface, err)
+		}
+		log, derr := decodeAll(t, surface, in)
+		if derr != nil {
+			t.Fatalf("%s resync = %v", surface, derr)
+		}
+		if len(log) == 0 || log[len(log)-1] != evU(2, 5) {
+			t.Fatalf("%s never resynced onto id 2: %v", surface, log)
+		}
 	}
 }
 

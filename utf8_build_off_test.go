@@ -48,16 +48,6 @@ func TestNoStrictBuildIgnoresTheRuntimeOption(t *testing.T) {
 	in := strField(1, payload)
 
 	for _, opts := range [][]sofab.Option{nil, {sofab.WithStrictUTF8(true)}, {sofab.WithStrictUTF8(false)}} {
-		d := sofab.NewDecoder(bytes.NewReader(in), opts...)
-		mustNext(t, d)
-		got, err := d.String()
-		if err != nil {
-			t.Fatalf("pull String (%d opts) = %v, want nil", len(opts), err)
-		}
-		if got != string(payload) {
-			t.Fatalf("pull String (%d opts) = % X, want % X verbatim", len(opts), got, payload)
-		}
-
 		for name, accept := range acceptPaths {
 			v := &genStrV{id: 1}
 			if err := accept(in, v, opts...); err != nil {

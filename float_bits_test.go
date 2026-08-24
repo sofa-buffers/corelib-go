@@ -29,7 +29,6 @@ package sofab_test
 import (
 	"bytes"
 	"errors"
-	"io"
 	"math"
 	"testing"
 
@@ -161,41 +160,16 @@ var f32Surfaces = []struct {
 		}
 		return c.scalar, c.elem
 	}},
-	{"pull", func(t *testing.T, raw []byte) (float32, float32) {
+	{"AcceptStream", func(t *testing.T, raw []byte) (float32, float32) {
 		t.Helper()
-		var scalar, elem float32
-		var sawS, sawA bool
-		d := sofab.NewDecoder(bytes.NewReader(raw))
-		for {
-			f, err := d.Next()
-			if errors.Is(err, io.EOF) {
-				break
-			}
-			if err != nil {
-				t.Fatalf("pull Next: %v", err)
-			}
-			switch f.ID {
-			case 1:
-				v, err := d.Float32()
-				if err != nil {
-					t.Fatalf("pull Float32: %v", err)
-				}
-				scalar, sawS = v, true
-			case 2:
-				a, err := d.ReadFloat32Array()
-				if err != nil {
-					t.Fatalf("pull ReadFloat32Array: %v", err)
-				}
-				if len(a) != 1 {
-					t.Fatalf("pull: array has %d elements, want 1", len(a))
-				}
-				elem, sawA = a[0], true
-			}
+		c := &f32Capture{}
+		if err := sofab.NewDecoder(bytes.NewReader(raw)).AcceptStream(c); err != nil {
+			t.Fatalf("AcceptStream: %v", err)
 		}
-		if !sawS || !sawA {
-			t.Fatal("pull: scalar or array not delivered")
+		if !c.sawS || !c.sawA {
+			t.Fatal("AcceptStream: scalar or array not delivered")
 		}
-		return scalar, elem
+		return c.scalar, c.elem
 	}},
 }
 

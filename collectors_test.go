@@ -753,3 +753,67 @@ func TestBoolMatrixSeqCapacity(t *testing.T) {
 		t.Fatalf("out grew to %d rows on a rejected id", len(out))
 	}
 }
+
+// TestSequenceGrowthIsGeometric is the one assertion in CORELIB_PLAN §7.2 item 8
+// that needs the language's own allocation-counting facility: growth geometry.
+//
+// "Extending to at least `id + 1` rather than exactly `id + 1`, so a sparse
+// array does not cost O(n²) copies — is the one property here needing the
+// language's own allocation-counting facility. Test it where the language offers
+// one." Go does, so it is tested rather than stated.
+//
+// The measurement is the allocation COUNT for placing n elements at ids 0..n-1.
+// Exact-length growth would reallocate once per element (n allocations); Go's
+// append doubles, so the count is O(log n) — and the test asserts the shape by
+// comparing two sizes an order of magnitude apart: ten times the elements must
+// not cost ten times the allocations.
+//
+// This is the ONLY place in this library where a container grows from a wire
+// value, and it is deliberately in the static helper layer (§6.6.1) rather than
+// in the codec: a wrapper array carries no count header, so its length is
+// "highest present id + 1" (MESSAGE_SPEC §5.1) and is not known until the array
+// ends. Everything with a count or length on the wire ahead of its payload
+// checks that word and allocates exactly it, once.
+func TestSequenceGrowthIsGeometric(t *testing.T) {
+	place := func(n int) float64 {
+		return testing.AllocsPerRun(20, func() {
+			out := make([]string, 0)
+			s := &sofab.StringSeq{Out: &out, Cap: -1, ElemMax: -1}
+			for i := 0; i < n; i++ {
+				if err := s.String(sofab.ID(i), "x"); err != nil {
+					t.Fatalf("place %d: %v", i, err)
+				}
+			}
+			if len(out) != n {
+				t.Fatalf("length %d, want %d", len(out), n)
+			}
+		})
+	}
+
+	small, big := place(64), place(640)
+	if big >= small*10 {
+		t.Errorf("640 elements cost %.0f allocations against %.0f for 64: growth is "+
+			"linear in the element count, i.e. one reallocation per element", big, small)
+	}
+	// A sanity floor: geometric growth over 640 elements is a handful of
+	// reallocations, not hundreds.
+	if big > 32 {
+		t.Errorf("640 elements cost %.0f allocations; geometric growth is O(log n)", big)
+	}
+
+	// The gap-filling half of the same property: placing ONE element at a high id
+	// extends the container to id+1 in geometric steps, not one step per slot.
+	sparse := testing.AllocsPerRun(20, func() {
+		out := make([]string, 0)
+		s := &sofab.StringSeq{Out: &out, Cap: -1, ElemMax: -1}
+		if err := s.String(1000, "x"); err != nil {
+			t.Fatalf("sparse place: %v", err)
+		}
+		if len(out) != 1001 {
+			t.Fatalf("length %d, want 1001", len(out))
+		}
+	})
+	if sparse > 32 {
+		t.Errorf("one element at id 1000 cost %.0f allocations; the gap fill is not geometric", sparse)
+	}
+}

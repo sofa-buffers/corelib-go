@@ -167,69 +167,6 @@ func TestAcceptStreamFloatScalarAllocsDoNotScale(t *testing.T) {
 	}
 }
 
-// TestPullFloatAllocsDoNotScale holds the pull surface to the same rule: it read
-// every fp32/fp64 element and every float scalar through the same allocating
-// helper.
-func TestPullFloatAllocsDoNotScale(t *testing.T) {
-	t.Run("fp32 array", func(t *testing.T) {
-		growth := allocGrowth(t, encodeFp32Array(t, 100), encodeFp32Array(t, 1100), func(msg []byte) {
-			d := sofab.NewDecoder(bytes.NewReader(msg))
-			if _, err := d.Next(); err != nil {
-				t.Fatalf("Next: %v", err)
-			}
-			if _, err := d.ReadFloat32Array(); err != nil {
-				t.Fatalf("ReadFloat32Array: %v", err)
-			}
-		})
-		if growth > 16 {
-			t.Fatalf("1000 extra elements cost %v extra allocations", growth)
-		}
-	})
-	t.Run("fp64 array", func(t *testing.T) {
-		growth := allocGrowth(t, encodeFp64Array(t, 100), encodeFp64Array(t, 1100), func(msg []byte) {
-			d := sofab.NewDecoder(bytes.NewReader(msg))
-			if _, err := d.Next(); err != nil {
-				t.Fatalf("Next: %v", err)
-			}
-			if _, err := d.ReadFloat64Array(); err != nil {
-				t.Fatalf("ReadFloat64Array: %v", err)
-			}
-		})
-		if growth > 16 {
-			t.Fatalf("1000 extra elements cost %v extra allocations", growth)
-		}
-	})
-	t.Run("scalars", func(t *testing.T) {
-		growth := allocGrowth(t, encodeFloatScalars(t, 100), encodeFloatScalars(t, 1100), func(msg []byte) {
-			d := sofab.NewDecoder(bytes.NewReader(msg))
-			// encodeFloatScalars alternates fp32, fp64, fp32, ...
-			for i := 0; ; i++ {
-				f, err := d.Next()
-				if err == io.EOF {
-					return
-				}
-				if err != nil {
-					t.Fatalf("Next: %v", err)
-				}
-				if f.Type != sofab.TypeFixlen {
-					t.Fatalf("unexpected wire type %v", f.Type)
-				}
-				if i%2 == 0 {
-					_, err = d.Float32()
-				} else {
-					_, err = d.Float64()
-				}
-				if err != nil {
-					t.Fatalf("read scalar %d: %v", i, err)
-				}
-			}
-		})
-		if growth > 4 {
-			t.Fatalf("1000 extra float fields cost %v extra allocations", growth)
-		}
-	})
-}
-
 // TestFixlenArrayBatchedReadIsBitExact guards the batching itself: a long array
 // is decoded element-for-element identically however the reader splits the
 // bytes, including splits that land inside an element and inside the fill of the
@@ -248,13 +185,9 @@ func TestFixlenArrayBatchedReadIsBitExact(t *testing.T) {
 	for name, mk := range readers {
 		t.Run("fp32/"+name, func(t *testing.T) {
 			var got []float32
-			d := sofab.NewDecoder(mk(msg32))
-			if _, err := d.Next(); err != nil {
-				t.Fatalf("Next: %v", err)
-			}
-			got, err := d.ReadFloat32Array()
-			if err != nil {
-				t.Fatalf("ReadFloat32Array: %v", err)
+			v := collectF32{&got}
+			if err := sofab.NewDecoder(mk(msg32)).AcceptStream(v); err != nil {
+				t.Fatalf("AcceptStream: %v", err)
 			}
 			if len(got) != len(want32) {
 				t.Fatalf("len = %d, want %d", len(got), len(want32))
@@ -267,13 +200,10 @@ func TestFixlenArrayBatchedReadIsBitExact(t *testing.T) {
 			}
 		})
 		t.Run("fp64/"+name, func(t *testing.T) {
-			d := sofab.NewDecoder(mk(msg64))
-			if _, err := d.Next(); err != nil {
-				t.Fatalf("Next: %v", err)
-			}
-			got, err := d.ReadFloat64Array()
-			if err != nil {
-				t.Fatalf("ReadFloat64Array: %v", err)
+			var got []float64
+			v := collectF64{out: &got}
+			if err := sofab.NewDecoder(mk(msg64)).AcceptStream(v); err != nil {
+				t.Fatalf("AcceptStream: %v", err)
 			}
 			if len(got) != len(want64) {
 				t.Fatalf("len = %d, want %d", len(got), len(want64))
@@ -282,22 +212,6 @@ func TestFixlenArrayBatchedReadIsBitExact(t *testing.T) {
 				if math.Float64bits(got[i]) != math.Float64bits(want64[i]) {
 					t.Fatalf("element %d = %016x, want %016x", i,
 						math.Float64bits(got[i]), math.Float64bits(want64[i]))
-				}
-			}
-		})
-		t.Run("stream/fp32/"+name, func(t *testing.T) {
-			var got []float32
-			v := collectF32{&got}
-			if err := sofab.NewDecoder(mk(msg32)).AcceptStream(v); err != nil {
-				t.Fatalf("AcceptStream: %v", err)
-			}
-			if len(got) != len(want32) {
-				t.Fatalf("len = %d, want %d", len(got), len(want32))
-			}
-			for i := range want32 {
-				if math.Float32bits(got[i]) != math.Float32bits(want32[i]) {
-					t.Fatalf("element %d = %08x, want %08x", i,
-						math.Float32bits(got[i]), math.Float32bits(want32[i]))
 				}
 			}
 		})
@@ -348,6 +262,16 @@ func (c collectF32) Float32Array(_ sofab.ID, v []float32) error {
 func (c collectF32) Float64Array(sofab.ID, []float64) error        { return nil }
 func (c collectF32) BeginSequence(sofab.ID) (sofab.Visitor, error) { return c, nil }
 func (c collectF32) EndSequence() error                            { return nil }
+
+type collectF64 struct {
+	baseV
+	out *[]float64
+}
+
+func (c collectF64) Float64Array(_ sofab.ID, v []float64) error {
+	*c.out = append(*c.out, v...)
+	return nil
+}
 
 // chunkReader hands out at most n bytes per Read, so element and buffer-fill
 // boundaries land at strides the batch loop must not assume anything about.

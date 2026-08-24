@@ -237,16 +237,12 @@ func TestStringStreamsThroughASmallSinkBuffer(t *testing.T) {
 	if err := e.Flush(); err != nil {
 		t.Fatalf("Flush = %v, want nil", err)
 	}
-	d := sofab.NewDecoder(bytes.NewReader(out))
-	if _, err := d.Next(); err != nil {
-		t.Fatalf("Next: %v", err)
+	var got stringCollector
+	if err := sofab.AcceptBytes(out, &got); err != nil {
+		t.Fatalf("AcceptBytes: %v", err)
 	}
-	got, err := d.String()
-	if err != nil {
-		t.Fatalf("String: %v", err)
-	}
-	if got != payload {
-		t.Errorf("streamed payload = %q…, want %q…", got[:min(16, len(got))], payload[:16])
+	if got.s != payload {
+		t.Errorf("streamed payload = %q…, want %q…", got.s[:min(16, len(got.s))], payload[:16])
 	}
 }
 

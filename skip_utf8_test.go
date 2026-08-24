@@ -395,33 +395,23 @@ func TestF0038ChunkBoundaryDeterminism(t *testing.T) {
 	}
 }
 
-// TestF0038PullPathUnchanged pins the two pull-parser behaviors that must NOT be
-// harmonized into this fix: Decoder.String is a materializing read and keeps
-// validating, and Decoder.Skip stays a pure discard that never inspects the
-// payload.
-func TestF0038PullPathUnchanged(t *testing.T) {
-	in := []byte{0x4a, 0x0a, 0x8a, 0x00, 0x2a}
+// TestF0038BoundVsSkipped pins the two halves of §6.4.5 on the one surface
+// there is: a string a destination BINDS is validated, and the identical bytes
+// at an id nothing binds are a length jump that is never inspected — with the
+// field after it still arriving.
+func TestF0038BoundVsSkipped(t *testing.T) {
+	in := []byte{0x4a, 0x0a, 0x8a, 0x00, 0x2a} // id 9: string 8A, then id 0: unsigned 42
 
-	d := sofab.NewDecoder(bytes.NewReader(in))
-	mustNext(t, d)
-	got, err := d.String()
-	checkUTF8Decode(t, "pull String (a materializing read)", err)
-	if err == nil && got != "\x8a" {
-		t.Fatalf("pull String = % X, want 8A verbatim", got)
-	}
+	// Bound: the destination validates.
+	checkUTF8Decode(t, "bound string", sofab.AcceptBytes(in, &bindStrV{id: 9}))
 
-	d = sofab.NewDecoder(bytes.NewReader(in))
-	mustNext(t, d)
-	if err := d.Skip(); err != nil {
-		t.Fatalf("pull Skip = %v, want nil (skips are never validated)", err)
+	// Not bound: no validation, and the decode reaches the following field.
+	log, err := decodeAll(t, "AcceptBytes", in)
+	if err != nil {
+		t.Fatalf("unbound decode = %v, want nil (skips are never validated)", err)
 	}
-	f := mustNext(t, d)
-	if f.ID != 0 {
-		t.Fatalf("resync field id = %d, want 0", f.ID)
-	}
-	v, uerr := d.Unsigned()
-	if uerr != nil || v != 42 {
-		t.Fatalf("after Skip Unsigned = (%d, %v), want (42, nil)", v, uerr)
+	if len(log) == 0 || log[len(log)-1] != evU(0, 42) {
+		t.Fatalf("never resynced onto id 0: %v", log)
 	}
 }
 

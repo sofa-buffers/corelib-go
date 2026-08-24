@@ -493,26 +493,24 @@ func do_decode_composite() {
 	must(sofab.NewDecoder(bytes.NewReader(decBuf)).Accept(foldVisitor{}))
 }
 
+// declineVisitor declines every sub-sequence: BeginSequence returning nil skips
+// the scope whole — nothing in it is delivered and nothing in it is built
+// (§6.0's "skip an unwanted sub-sequence whole").
+type declineVisitor struct{ baseVisitor }
+
+func (declineVisitor) BeginSequence(sofab.ID) (sofab.Visitor, error) { return nil, nil }
+
 // do_decode_composite_skip is `decode: composite skip-all`: walk the message,
-// materialize nothing — the path a router or filter runs in production.
+// materialize as little as the surface allows — the path a router or filter runs
+// in production.
 //
-// On this port that is the pull surface, because it is the only one that really
-// skips: Skip over a sequence start consumes the whole sub-tree and Skip over a
-// fixlen is a length jump over bytes that are never inspected, while the visitor
-// surfaces materialize each value before the destination can decline it (a
-// no-op Visitor would still allocate every string). The two composite decode
-// rows therefore differ in surface as well as in work — read the gap as "what
-// not-decoding is worth on this port", not as one surface's overhead.
+// It runs on the visitor surface like every other decode row, because that is
+// the only decode surface there is (§5.3.1). What it measures is the skip §6.0
+// makes normative: a declined sub-sequence is walked, not built. Top-level
+// scalars are still delivered, so read the gap to `decode: composite` as "what
+// declining the sub-trees is worth", not as a whole-message skip.
 func do_decode_composite_skip() {
-	d := sofab.NewDecoder(bytes.NewReader(decBuf))
-	for {
-		_, err := d.Next()
-		if err == io.EOF {
-			break
-		}
-		must(err)
-		must(d.Skip())
-	}
+	must(sofab.AcceptBytes(decBuf, declineVisitor{}))
 	sink++
 }
 

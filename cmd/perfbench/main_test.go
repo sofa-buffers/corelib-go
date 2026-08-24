@@ -79,102 +79,74 @@ type field struct {
 	val  string
 }
 
-// pullAll walks buf with the pull parser and records every field, descending
-// into sequences with a "seq:" prefix on the ids inside them. It is deliberately
-// an independent reader — not the harness's own visitors — so a visitor that
-// ignores a field cannot hide it. It handles one level of nesting, which is what
-// the flat workloads reach; the composite message has its own walker below.
-func pullAll(t *testing.T, buf []byte, fixKind map[sofab.ID]string) []field {
-	t.Helper()
-	d := sofab.NewDecoder(bytes.NewReader(buf))
-	var out []field
-	prefix := ""
-	for {
-		f, err := d.Next()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			t.Fatalf("Next: %v", err)
-		}
-		switch f.Type {
-		case sofab.TypeSequenceStart:
-			out = append(out, field{f.ID, prefix + "seq{", ""})
-			prefix = "seq:"
-			continue
-		case sofab.TypeSequenceEnd:
-			prefix = ""
-			out = append(out, field{0, "}", ""})
-			continue
-		case sofab.TypeVarintUnsigned:
-			v, err := d.Unsigned()
-			if err != nil {
-				t.Fatalf("Unsigned: %v", err)
-			}
-			out = append(out, field{f.ID, prefix + "u", fmt.Sprint(v)})
-		case sofab.TypeVarintSigned:
-			v, err := d.Signed()
-			if err != nil {
-				t.Fatalf("Signed: %v", err)
-			}
-			out = append(out, field{f.ID, prefix + "s", fmt.Sprint(v)})
-		case sofab.TypeVarintArrayUnsigned:
-			v, err := sofab.ReadUnsignedArray[uint64](d)
-			if err != nil {
-				t.Fatalf("ReadUnsignedArray: %v", err)
-			}
-			out = append(out, field{f.ID, prefix + "ua", fmt.Sprint(v)})
-		case sofab.TypeVarintArraySigned:
-			v, err := sofab.ReadSignedArray[int64](d)
-			if err != nil {
-				t.Fatalf("ReadSignedArray: %v", err)
-			}
-			out = append(out, field{f.ID, prefix + "sa", fmt.Sprint(v)})
-		case sofab.TypeFixlenArray:
-			v, err := d.ReadFloat64Array()
-			if err != nil {
-				t.Fatalf("ReadFloat64Array: %v", err)
-			}
-			out = append(out, field{f.ID, prefix + "f64a", fmt.Sprint(v)})
-		case sofab.TypeFixlen:
-			// A typed read consumes the field, so the reader is chosen from the
-			// schema the workload declares rather than by trial: the caller says
-			// which of fp32/fp64/string each fixlen id is.
-			out = append(out, field{f.ID, prefix + "fix", fixlenValue(t, d, fixKind[f.ID])})
-		default:
-			t.Fatalf("unexpected wire type %d at id %d", f.Type, f.ID)
-		}
-	}
-	return out
+// walkV is an independent recording visitor — deliberately NOT one of the
+// harness's own, so a visitor that ignores a field cannot hide it. Sequences are
+// flattened with a "seq:" prefix on the ids inside them, which is what the flat
+// workloads reach; the composite message has its own walker below.
+//
+// The fixlen kinds come from the workload's declared schema (fixKind) rather
+// than from the wire, so a field that changed type is a mismatch rather than a
+// silently different rendering.
+type walkV struct {
+	t       *testing.T
+	out     *[]field
+	fixKind map[sofab.ID]string
+	prefix  string
 }
 
-// fixlenValue reads the current fixlen field as the declared kind and renders
-// it canonically. An unmapped id is a workload that grew a field the test does
-// not know about — a failure, not something to guess at.
-func fixlenValue(t *testing.T, d *sofab.Decoder, kind string) string {
+func (v walkV) add(id sofab.ID, kind, val string) error {
+	*v.out = append(*v.out, field{id, v.prefix + kind, val})
+	return nil
+}
+
+func (v walkV) Unsigned(id sofab.ID, x uint64) error { return v.add(id, "u", fmt.Sprint(x)) }
+func (v walkV) Signed(id sofab.ID, x int64) error    { return v.add(id, "s", fmt.Sprint(x)) }
+
+func (v walkV) Float32(id sofab.ID, x float32) error {
+	return v.add(id, "fix", fmt.Sprintf("f32:%08x", math.Float32bits(x)))
+}
+
+func (v walkV) Float64(id sofab.ID, x float64) error {
+	return v.add(id, "fix", fmt.Sprintf("f64:%016x", math.Float64bits(x)))
+}
+
+func (v walkV) String(id sofab.ID, x string) error { return v.add(id, "fix", "str:"+x) }
+
+func (v walkV) Bytes(id sofab.ID, x []byte) error {
+	return v.add(id, "fix", fmt.Sprintf("blob:%x", x))
+}
+
+func (v walkV) UnsignedArray(id sofab.ID, x []uint64) error { return v.add(id, "ua", fmt.Sprint(x)) }
+func (v walkV) SignedArray(id sofab.ID, x []int64) error    { return v.add(id, "sa", fmt.Sprint(x)) }
+
+func (v walkV) Float32Array(id sofab.ID, x []float32) error {
+	return v.add(id, "f32a", fmt.Sprint(x))
+}
+
+func (v walkV) Float64Array(id sofab.ID, x []float64) error {
+	return v.add(id, "f64a", fmt.Sprint(x))
+}
+
+func (v walkV) BeginSequence(id sofab.ID) (sofab.Visitor, error) {
+	*v.out = append(*v.out, field{id, v.prefix + "seq{", ""})
+	child := v
+	child.prefix = "seq:"
+	return child, nil
+}
+
+func (v walkV) EndSequence() error {
+	*v.out = append(*v.out, field{0, "}", ""})
+	return nil
+}
+
+// walkAll decodes buf through walkV and returns the fields it delivered.
+func walkAll(t *testing.T, buf []byte, fixKind map[sofab.ID]string) []field {
 	t.Helper()
-	switch kind {
-	case "f32":
-		v, err := d.Float32()
-		if err != nil {
-			t.Fatalf("Float32: %v", err)
-		}
-		return fmt.Sprintf("f32:%08x", math.Float32bits(v))
-	case "f64":
-		v, err := d.Float64()
-		if err != nil {
-			t.Fatalf("Float64: %v", err)
-		}
-		return fmt.Sprintf("f64:%016x", math.Float64bits(v))
-	case "str":
-		s, err := d.String()
-		if err != nil {
-			t.Fatalf("String: %v", err)
-		}
-		return "str:" + s
+	var out []field
+	if err := sofab.AcceptBytes(buf, walkV{t: t, out: &out, fixKind: fixKind}); err != nil {
+		t.Fatalf("AcceptBytes: %v", err)
 	}
-	t.Fatalf("fixlen field %v has no declared kind in this workload", d.Field().ID)
-	return ""
+	return out
 }
 
 // The fixlen ids each shared workload declares, and as what.
@@ -230,7 +202,7 @@ func TestMakeBlobIsTheSharedPayload(t *testing.T) {
 
 func TestEncodeTypicalRoundTrips(t *testing.T) {
 	buf := encodeToBytes(t, encodeTypical)
-	wantFields(t, pullAll(t, buf, typicalFix), []field{
+	wantFields(t, walkAll(t, buf, typicalFix), []field{
 		{1, "u", "3735928559"},
 		{2, "s", "-12345"},
 		{3, "u", "1"}, // bool
@@ -246,7 +218,7 @@ func TestEncodeTypicalRoundTrips(t *testing.T) {
 
 func TestPerfEncodeRoundTrips(t *testing.T) {
 	buf := encodeToBytes(t, perfEncode)
-	wantFields(t, pullAll(t, buf, perfFix), []field{
+	wantFields(t, walkAll(t, buf, perfFix), []field{
 		{1, "u", "3735928559"},
 		{2, "s", "-12345"},
 		{3, "u", "81985529216486895"},
@@ -280,28 +252,23 @@ func TestPerfMessageSizeIsThe170ByteParityCheck(t *testing.T) {
 func TestEncodeU64ArrayCarriesAllElements(t *testing.T) {
 	setupEncodeU64()
 	run_encode_u64_array()
-	d := sofab.NewDecoder(bytes.NewReader(encOut[:used]))
-	f, err := d.Next()
-	if err != nil {
-		t.Fatalf("Next: %v", err)
+	c := &u64ArrayCapture{}
+	if err := sofab.AcceptBytes(encOut[:used], c); err != nil {
+		t.Fatalf("AcceptBytes: %v", err)
 	}
-	if f.ID != 1 || f.Type != sofab.TypeVarintArrayUnsigned {
-		t.Fatalf("header = id %d type %d, want id 1 type %d", f.ID, f.Type, sofab.TypeVarintArrayUnsigned)
+	if c.fields != 1 {
+		t.Fatalf("the message carries %d fields, want exactly the array", c.fields)
 	}
-	got, err := sofab.ReadUnsignedArray[uint64](d)
-	if err != nil {
-		t.Fatalf("ReadUnsignedArray: %v", err)
+	if c.id != 1 {
+		t.Fatalf("array id = %d, want 1", c.id)
 	}
-	if len(got) != n {
-		t.Fatalf("len = %d, want %d", len(got), n)
+	if len(c.got) != n {
+		t.Fatalf("len = %d, want %d", len(c.got), n)
 	}
-	for i := range got {
-		if got[i] != src[i] {
-			t.Fatalf("element %d = %d, want %d", i, got[i], src[i])
+	for i := range c.got {
+		if c.got[i] != src[i] {
+			t.Fatalf("element %d = %d, want %d", i, c.got[i], src[i])
 		}
-	}
-	if _, err := d.Next(); err != io.EOF {
-		t.Errorf("trailing data after the array: %v", err)
 	}
 }
 
@@ -313,48 +280,77 @@ func TestEncodeU64ArrayCarriesAllElements(t *testing.T) {
 // string, so no per-id kind table is needed.
 func walkComposite(t *testing.T, buf []byte) []string {
 	t.Helper()
-	d := sofab.NewDecoder(bytes.NewReader(buf))
 	var out []string
-	depth := 0
-	for {
-		f, err := d.Next()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			t.Fatalf("Next: %v", err)
-		}
-		switch f.Type {
-		case sofab.TypeSequenceStart:
-			out = append(out, fmt.Sprintf("%d seq{ %d", depth, f.ID))
-			depth++
-		case sofab.TypeSequenceEnd:
-			depth--
-			out = append(out, fmt.Sprintf("%d }", depth))
-		case sofab.TypeFixlen:
-			s, err := d.String()
-			if err != nil {
-				t.Fatalf("String at id %d: %v", f.ID, err)
-			}
-			out = append(out, fmt.Sprintf("%d str %d %q", depth, f.ID, s))
-		case sofab.TypeVarintUnsigned:
-			v, err := d.Unsigned()
-			if err != nil {
-				t.Fatalf("Unsigned at id %d: %v", f.ID, err)
-			}
-			out = append(out, fmt.Sprintf("%d u %d %d", depth, f.ID, v))
-		case sofab.TypeVarintSigned:
-			v, err := d.Signed()
-			if err != nil {
-				t.Fatalf("Signed at id %d: %v", f.ID, err)
-			}
-			out = append(out, fmt.Sprintf("%d s %d %d", depth, f.ID, v))
-		default:
-			t.Fatalf("unexpected wire type %d at id %d", f.Type, f.ID)
-		}
+	if err := sofab.AcceptBytes(buf, &compositeWalk{t: t, out: &out}); err != nil {
+		t.Fatalf("AcceptBytes: %v", err)
 	}
 	return out
 }
+
+type compositeWalk struct {
+	t     *testing.T
+	out   *[]string
+	depth int
+}
+
+func (w *compositeWalk) add(format string, args ...any) error {
+	*w.out = append(*w.out, fmt.Sprintf("%d "+format, append([]any{w.depth}, args...)...))
+	return nil
+}
+
+func (w *compositeWalk) String(id sofab.ID, s string) error   { return w.add("str %d %q", id, s) }
+func (w *compositeWalk) Unsigned(id sofab.ID, v uint64) error { return w.add("u %d %d", id, v) }
+func (w *compositeWalk) Signed(id sofab.ID, v int64) error    { return w.add("s %d %d", id, v) }
+
+func (w *compositeWalk) BeginSequence(id sofab.ID) (sofab.Visitor, error) {
+	w.add("seq{ %d", id)
+	w.depth++
+	return w, nil
+}
+
+func (w *compositeWalk) EndSequence() error {
+	w.depth--
+	return w.add("}")
+}
+
+func (w *compositeWalk) unexpected(kind string, id sofab.ID) error {
+	w.t.Fatalf("unexpected %s field at id %d in the composite message", kind, id)
+	return nil
+}
+
+func (w *compositeWalk) Float32(id sofab.ID, _ float32) error { return w.unexpected("fp32", id) }
+func (w *compositeWalk) Float64(id sofab.ID, _ float64) error { return w.unexpected("fp64", id) }
+func (w *compositeWalk) Bytes(id sofab.ID, _ []byte) error    { return w.unexpected("blob", id) }
+func (w *compositeWalk) UnsignedArray(id sofab.ID, _ []uint64) error {
+	return w.unexpected("unsigned array", id)
+}
+func (w *compositeWalk) SignedArray(id sofab.ID, _ []int64) error {
+	return w.unexpected("signed array", id)
+}
+func (w *compositeWalk) Float32Array(id sofab.ID, _ []float32) error {
+	return w.unexpected("fp32 array", id)
+}
+func (w *compositeWalk) Float64Array(id sofab.ID, _ []float64) error {
+	return w.unexpected("fp64 array", id)
+}
+
+// u64ArrayCapture takes the one unsigned array the u64 workload writes.
+type u64ArrayCapture struct {
+	baseVisitor
+	id     sofab.ID
+	got    []uint64
+	fields int
+}
+
+func (c *u64ArrayCapture) UnsignedArray(id sofab.ID, v []uint64) error {
+	c.id, c.got, c.fields = id, append([]uint64(nil), v...), c.fields+1
+	return nil
+}
+
+func (c *u64ArrayCapture) Unsigned(sofab.ID, uint64) error { c.fields++; return nil }
+func (c *u64ArrayCapture) Signed(sofab.ID, int64) error    { c.fields++; return nil }
+func (c *u64ArrayCapture) String(sofab.ID, string) error   { c.fields++; return nil }
+func (c *u64ArrayCapture) Bytes(sofab.ID, []byte) error    { c.fields++; return nil }
 
 // The composite message is the only workload exercising the wrapper-array form,
 // multi-byte UTF-8, depth-3 nesting, an omitted all-default field and a two-byte
@@ -444,27 +440,35 @@ func TestBlobEncodedSizeIsTheParityCheck(t *testing.T) {
 	if len(encOut) != blobEncoded {
 		t.Errorf("one-shot caller buffer is %d bytes, want exactly %d", len(encOut), blobEncoded)
 	}
-	d := sofab.NewDecoder(bytes.NewReader(encOut[:used]))
-	f, err := d.Next()
-	if err != nil {
-		t.Fatalf("Next: %v", err)
+	c := &blobCapture{}
+	if err := sofab.AcceptBytes(encOut[:used], c); err != nil {
+		t.Fatalf("AcceptBytes: %v", err)
 	}
-	if f.ID != 1 || f.Type != sofab.TypeFixlen {
-		t.Fatalf("header = id %d type %d, want id 1 blob", f.ID, f.Type)
+	if c.id != 1 {
+		t.Fatalf("blob id = %d, want 1", c.id)
 	}
-	b, err := d.Bytes()
-	if err != nil {
-		t.Fatalf("Bytes: %v", err)
-	}
-	if !bytes.Equal(b, blobSrc) {
+	if !bytes.Equal(c.got, blobSrc) {
 		t.Error("the decoded blob payload is not the one that was encoded")
 	}
 }
 
+// blobCapture takes the one blob field the workload writes, copying it out of
+// the callback as §6.7 requires of any caller that keeps a value.
+type blobCapture struct {
+	baseVisitor
+	id  sofab.ID
+	got []byte
+}
+
+func (c *blobCapture) Bytes(id sofab.ID, b []byte) error {
+	c.id, c.got = id, append([]byte(nil), b...)
+	return nil
+}
+
 // capturingSink is the test's stand-in for discardSink: it keeps what it is
 // handed so the streaming rows can be checked to produce the same wire bytes as
-// the one-shot row, and records the largest single hand-over (which is how
-// pass-through shows itself).
+// the one-shot row, and records the largest single hand-over — which is what
+// proves no byte outside the installed buffer ever reaches it (§5.1.6).
 type capturingSink struct {
 	got     []byte
 	calls   int
@@ -662,7 +666,7 @@ func TestRunEncodeTypicalProducesOneMessage(t *testing.T) {
 	if used == 0 {
 		t.Fatal("no bytes produced")
 	}
-	wantFields(t, pullAll(t, encOut[:used], typicalFix), pullAll(t, encodeToBytes(t, encodeTypical), typicalFix))
+	wantFields(t, walkAll(t, encOut[:used], typicalFix), walkAll(t, encodeToBytes(t, encodeTypical), typicalFix))
 }
 
 // foldVisitor is the destination for the perf, composite and blob decodes, whose

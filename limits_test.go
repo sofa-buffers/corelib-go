@@ -39,64 +39,31 @@ func TestPartA_NoEagerAllocFromWireCount(t *testing.T) {
 	cases := []struct {
 		name string
 		in   []byte
-		// pull reads the first field's value with its matching typed reader, so the
-		// allocation path under test (not Skip, which discards without buffering) is
-		// exercised on the pull parser.
-		pull func(*sofab.Decoder) error
 	}{
-		{
-			name: "varint unsigned array",
-			in: append(vhdr(0, sofab.TypeVarintArrayUnsigned),
-				append(vbytes(arrayMaxCount), 0x00, 0x00)...),
-			pull: func(d *sofab.Decoder) error { _, err := sofab.ReadUnsignedArray[uint64](d); return err },
-		},
-		{
-			name: "varint signed array",
-			in: append(vhdr(0, sofab.TypeVarintArraySigned),
-				append(vbytes(arrayMaxCount), 0x00, 0x00)...),
-			pull: func(d *sofab.Decoder) error { _, err := sofab.ReadSignedArray[int64](d); return err },
-		},
-		{
-			name: "fixlen blob length",
-			in: append(vhdr(0, sofab.TypeFixlen),
-				append(vbytes((arrayMaxCount<<3)|subBlob), 0x01, 0x02)...),
-			pull: func(d *sofab.Decoder) error { _, err := d.Bytes(); return err },
-		},
-		{
-			name: "fixlen string length",
-			in: append(vhdr(0, sofab.TypeFixlen),
-				append(vbytes((arrayMaxCount<<3)|subStr), 'h', 'i')...),
-			pull: func(d *sofab.Decoder) error { _, err := d.String(); return err },
-		},
+		{"varint unsigned array", append(vhdr(0, sofab.TypeVarintArrayUnsigned),
+			append(vbytes(arrayMaxCount), 0x00, 0x00)...)},
+		{"varint signed array", append(vhdr(0, sofab.TypeVarintArraySigned),
+			append(vbytes(arrayMaxCount), 0x00, 0x00)...)},
+		{"fixlen blob length", append(vhdr(0, sofab.TypeFixlen),
+			append(vbytes((arrayMaxCount<<3)|subBlob), 0x01, 0x02)...)},
+		{"fixlen string length", append(vhdr(0, sofab.TypeFixlen),
+			append(vbytes((arrayMaxCount<<3)|subStr), 'h', 'i')...)},
 	}
 
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			// Visitor path (what a generated Decode<Name> uses).
-			var verr error
-			got := bytesAllocated(func() { verr = sofab.AcceptBytes(c.in, baseV{}) })
-			if !errors.Is(verr, sofab.ErrIncomplete) {
-				t.Fatalf("AcceptBytes = %v, want ErrIncomplete", verr)
-			}
-			if got > allocBudget {
-				t.Fatalf("AcceptBytes allocated %d bytes, want <= %d (eager alloc from wire count?)", got, allocBudget)
-			}
-
-			// Pull path: drive Next then the matching typed reader.
-			var perr error
-			pot := bytesAllocated(func() {
-				d := sofab.NewDecoder(bytes.NewReader(c.in))
-				if _, err := d.Next(); err != nil {
-					perr = err
-					return
+			// A materializing destination on every entry point: recorder binds
+			// every value, so the allocation path under test is the one exercised.
+			for _, surface := range surfaces {
+				var err error
+				got := bytesAllocated(func() { _, err = decodeAll(t, surface, c.in) })
+				if !errors.Is(err, sofab.ErrIncomplete) {
+					t.Fatalf("%s = %v, want ErrIncomplete", surface, err)
 				}
-				perr = c.pull(d)
-			})
-			if !errors.Is(perr, sofab.ErrIncomplete) {
-				t.Fatalf("pull = %v, want ErrIncomplete", perr)
-			}
-			if pot > allocBudget {
-				t.Fatalf("pull allocated %d bytes, want <= %d (eager alloc from wire count?)", pot, allocBudget)
+				if got > allocBudget {
+					t.Fatalf("%s allocated %d bytes, want <= %d (eager alloc from wire count?)",
+						surface, got, allocBudget)
+				}
 			}
 		})
 	}
@@ -123,13 +90,14 @@ func TestPartB_ArrayCountLimit(t *testing.T) {
 	if err := sofab.AcceptBytes(at, baseV{}, sofab.WithMaxArrayCount(limit)); err != nil {
 		t.Fatalf("at-limit visitor = %v, want nil", err)
 	}
-	// Pull path enforces the same limit.
-	d := sofab.NewDecoder(bytes.NewReader(over), sofab.WithMaxArrayCount(limit))
-	if _, err := d.Next(); err != nil {
-		t.Fatalf("pull Next = %v", err)
+	// The reader-driven surfaces enforce the same limit on the same bytes.
+	if err := sofab.NewDecoder(bytes.NewReader(over), sofab.WithMaxArrayCount(limit)).
+		Accept(baseV{}); !errors.Is(err, sofab.ErrLimitExceeded) {
+		t.Fatalf("over-limit Accept = %v, want ErrLimitExceeded", err)
 	}
-	if _, err := sofab.ReadUnsignedArray[uint64](d); !errors.Is(err, sofab.ErrLimitExceeded) {
-		t.Fatalf("over-limit pull = %v, want ErrLimitExceeded", err)
+	if err := sofab.NewDecoder(bytes.NewReader(over), sofab.WithMaxArrayCount(limit)).
+		AcceptStream(baseV{}); !errors.Is(err, sofab.ErrLimitExceeded) {
+		t.Fatalf("over-limit AcceptStream = %v, want ErrLimitExceeded", err)
 	}
 }
 
@@ -165,13 +133,10 @@ func TestPartB_StringAndBlobLimit(t *testing.T) {
 		t.Fatalf("at-limit blob = %v, want nil", err)
 	}
 
-	// Pull path, blob.
-	d := sofab.NewDecoder(bytes.NewReader(blobOver), sofab.WithMaxBlobLen(limit))
-	if _, err := d.Next(); err != nil {
-		t.Fatalf("pull Next = %v", err)
-	}
-	if _, err := d.Bytes(); !errors.Is(err, sofab.ErrLimitExceeded) {
-		t.Fatalf("over-limit blob pull = %v, want ErrLimitExceeded", err)
+	// The reader-driven surfaces, blob.
+	if err := sofab.NewDecoder(bytes.NewReader(blobOver), sofab.WithMaxBlobLen(limit)).
+		AcceptStream(baseV{}); !errors.Is(err, sofab.ErrLimitExceeded) {
+		t.Fatalf("over-limit blob AcceptStream = %v, want ErrLimitExceeded", err)
 	}
 }
 

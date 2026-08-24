@@ -3,7 +3,7 @@ package sofab_test
 import (
 	"bytes"
 	"fmt"
-	"io"
+	"math"
 
 	sofab "github.com/sofa-buffers/corelib-go"
 )
@@ -76,57 +76,89 @@ func (c *Calibration) serialize(e *sofab.Encoder) {
 	}
 }
 
-func (m *SensorReading) Decode(d *sofab.Decoder) error {
-	for {
-		f, err := d.Next()
-		if err == io.EOF {
-			return nil
-		}
-		if err != nil {
-			return err
-		}
-		switch {
-		case f.ID == fieldID && f.Type == sofab.TypeVarintUnsigned:
-			v, _ := d.Unsigned()
-			m.ID = uint32(v)
-		case f.ID == fieldTemperature && f.Type == sofab.TypeVarintSigned:
-			v, _ := d.Signed()
-			m.Temperature = int32(v)
-		case f.ID == fieldName && f.Type == sofab.TypeFixlen:
-			m.Name, _ = d.String()
-		case f.ID == fieldSamples && f.Type == sofab.TypeVarintArrayUnsigned:
-			m.Samples, _ = sofab.ReadUnsignedArray[uint16](d)
-		case f.ID == fieldCalibration && f.Type == sofab.TypeSequenceStart:
-			if err := m.Calibration.decode(d); err != nil {
-				return err
-			}
-		default:
-			if err := d.Skip(); err != nil {
-				return err
-			}
-		}
+// SensorReading implements sofab.Visitor: the decode half of what the generator
+// emits. Each callback binds the ids this schema declares and ignores the rest —
+// an unknown id, and a field whose wire type contradicts the declared one
+// (MESSAGE_SPEC §7.3), simply land in no arm and are skipped.
+//
+// Whatever a callback is handed is valid only until it returns (§6.7). Go's
+// string conversion has already copied the payload, and Samples is built into
+// storage this object owns, so nothing here outlives the call.
+
+func (m *SensorReading) Unsigned(id sofab.ID, v uint64) error {
+	if id == fieldID {
+		m.ID = uint32(v)
 	}
+	return nil
 }
 
-func (c *Calibration) decode(d *sofab.Decoder) error {
-	for {
-		f, err := d.Next()
-		if err != nil {
-			return err
-		}
-		switch {
-		case f.Type == sofab.TypeSequenceEnd:
-			return nil
-		case f.ID == calOffset:
-			c.Offset, _ = d.Float32()
-		case f.ID == calGain:
-			c.Gain, _ = d.Float32()
-		default:
-			if err := d.Skip(); err != nil {
-				return err
-			}
-		}
+func (m *SensorReading) Signed(id sofab.ID, v int64) error {
+	if id == fieldTemperature {
+		m.Temperature = int32(v)
 	}
+	return nil
+}
+
+func (m *SensorReading) String(id sofab.ID, v string) error {
+	if id == fieldName {
+		m.Name = v
+	}
+	return nil
+}
+
+func (m *SensorReading) UnsignedArray(id sofab.ID, v []uint64) error {
+	if id != fieldSamples {
+		return nil
+	}
+	m.Samples = make([]uint16, len(v))
+	for i, x := range v {
+		if x > math.MaxUint16 {
+			return sofab.ErrInvalidMsg // the schema's declared width (MESSAGE_SPEC §7.1)
+		}
+		m.Samples[i] = uint16(x)
+	}
+	return nil
+}
+
+// BeginSequence hands the nested scope to the nested object. Returning nil
+// instead would decline the whole sub-tree.
+func (m *SensorReading) BeginSequence(id sofab.ID) (sofab.Visitor, error) {
+	if id == fieldCalibration {
+		return &m.Calibration, nil
+	}
+	return nil, nil
+}
+
+func (*SensorReading) Float32(sofab.ID, float32) error        { return nil }
+func (*SensorReading) Float64(sofab.ID, float64) error        { return nil }
+func (*SensorReading) Bytes(sofab.ID, []byte) error           { return nil }
+func (*SensorReading) SignedArray(sofab.ID, []int64) error    { return nil }
+func (*SensorReading) Float32Array(sofab.ID, []float32) error { return nil }
+func (*SensorReading) Float64Array(sofab.ID, []float64) error { return nil }
+func (*SensorReading) EndSequence() error                     { return nil }
+
+func (c *Calibration) Float32(id sofab.ID, v float32) error {
+	switch id {
+	case calOffset:
+		c.Offset = v
+	case calGain:
+		c.Gain = v
+	}
+	return nil
+}
+
+func (*Calibration) Unsigned(sofab.ID, uint64) error        { return nil }
+func (*Calibration) Signed(sofab.ID, int64) error           { return nil }
+func (*Calibration) Float64(sofab.ID, float64) error        { return nil }
+func (*Calibration) String(sofab.ID, string) error          { return nil }
+func (*Calibration) Bytes(sofab.ID, []byte) error           { return nil }
+func (*Calibration) UnsignedArray(sofab.ID, []uint64) error { return nil }
+func (*Calibration) SignedArray(sofab.ID, []int64) error    { return nil }
+func (*Calibration) Float32Array(sofab.ID, []float32) error { return nil }
+func (*Calibration) Float64Array(sofab.ID, []float64) error { return nil }
+func (*Calibration) EndSequence() error                     { return nil }
+func (c *Calibration) BeginSequence(sofab.ID) (sofab.Visitor, error) {
+	return nil, nil
 }
 
 // Example shows how generator-emitted objects use the corelib to serialize and
@@ -148,7 +180,7 @@ func Example() {
 	}
 
 	var out SensorReading
-	if err := out.Decode(sofab.NewDecoder(&buf)); err != nil {
+	if err := sofab.AcceptBytes(buf.Bytes(), &out); err != nil {
 		panic(err)
 	}
 
@@ -167,7 +199,7 @@ func Example() {
 		panic(err)
 	}
 	var back SensorReading
-	if err := back.Decode(sofab.NewDecoder(&empty)); err != nil {
+	if err := sofab.AcceptBytes(empty.Bytes(), &back); err != nil {
 		panic(err)
 	}
 	fmt.Printf("all-default: %d bytes, decodes back to id=%d gain=%.1f\n",

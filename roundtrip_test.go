@@ -1,127 +1,85 @@
 package sofab_test
 
+// §7.2 item 3: encode → decode → compare, for representative messages, on every
+// visitor entry point.
+
 import (
-	"bytes"
-	"io"
 	"math"
-	"reflect"
+	"strings"
 	"testing"
 
 	sofab "github.com/sofa-buffers/corelib-go"
 )
 
 func TestRoundTripScalars(t *testing.T) {
-	var buf bytes.Buffer
-	e := sofab.NewEncoder(&buf)
-	e.WriteUnsigned(1, math.MaxUint64)
-	e.WriteSigned(2, math.MinInt64)
-	e.WriteBool(3, true)
-	e.WriteFloat32(4, math.Pi)
-	e.WriteFloat64(5, math.E)
-	e.WriteString(6, "SofaBuffers")
-	e.WriteBytes(7, []byte{0xDE, 0xAD, 0xBE, 0xEF})
-	if err := e.Flush(); err != nil {
-		t.Fatal(err)
+	in := encode(t, func(e *sofab.Encoder) {
+		e.WriteUnsigned(1, math.MaxUint64)
+		e.WriteSigned(2, math.MinInt64)
+		e.WriteBool(3, true)
+		e.WriteFloat32(4, math.Pi)
+		e.WriteFloat64(5, math.E)
+		e.WriteString(6, "SofaBuffers")
+		e.WriteBytes(7, []byte{0xDE, 0xAD, 0xBE, 0xEF})
+	})
+	want := []string{
+		evU(1, math.MaxUint64),
+		evS(2, math.MinInt64),
+		evU(3, 1), // a bool is an unsigned 0/1 on the wire (§4.4)
+		evF32(4, math.Pi),
+		evF64(5, math.E),
+		evStr(6, "SofaBuffers"),
+		evBlob(7, []byte{0xDE, 0xAD, 0xBE, 0xEF}),
 	}
-
-	d := sofab.NewDecoder(&buf)
-	expect := func(id sofab.ID, typ sofab.WireType) {
-		f, err := d.Next()
-		if err != nil || f.ID != id || f.Type != typ {
-			t.Fatalf("next want id=%d type=%d, got %+v %v", id, typ, f, err)
-		}
-	}
-	expect(1, sofab.TypeVarintUnsigned)
-	if v, _ := d.Unsigned(); v != math.MaxUint64 {
-		t.Fatal("u64")
-	}
-	expect(2, sofab.TypeVarintSigned)
-	if v, _ := d.Signed(); v != math.MinInt64 {
-		t.Fatal("i64")
-	}
-	expect(3, sofab.TypeVarintUnsigned)
-	if v, _ := d.Bool(); !v {
-		t.Fatal("bool")
-	}
-	expect(4, sofab.TypeFixlen)
-	if v, _ := d.Float32(); v != math.Pi {
-		t.Fatal("f32")
-	}
-	expect(5, sofab.TypeFixlen)
-	if v, _ := d.Float64(); v != math.E {
-		t.Fatal("f64")
-	}
-	expect(6, sofab.TypeFixlen)
-	if v, _ := d.String(); v != "SofaBuffers" {
-		t.Fatal("str")
-	}
-	expect(7, sofab.TypeFixlen)
-	if v, _ := d.Bytes(); !bytes.Equal(v, []byte{0xDE, 0xAD, 0xBE, 0xEF}) {
-		t.Fatal("blob")
-	}
+	assertRoundTrip(t, in, want)
 }
 
 func TestRoundTripArrays(t *testing.T) {
-	var buf bytes.Buffer
-	e := sofab.NewEncoder(&buf)
-	sofab.WriteUnsignedArray(e, 1, []uint16{10, 20, 30})
-	sofab.WriteSignedArray(e, 2, []int64{-5, 5})
-	e.WriteFloat64Array(3, []float64{1.5, -2.5})
-	if err := e.Flush(); err != nil {
-		t.Fatal(err)
+	in := encode(t, func(e *sofab.Encoder) {
+		sofab.WriteUnsignedArray(e, 1, []uint16{1, 2, 3, 65535})
+		sofab.WriteSignedArray(e, 2, []int32{-1, 0, 1, math.MaxInt32})
+		e.WriteFloat32Array(3, []float32{1.5, -2.5})
+		e.WriteFloat64Array(4, []float64{math.SmallestNonzeroFloat64, math.MaxFloat64})
+	})
+	want := []string{
+		evAU(1, []uint64{1, 2, 3, 65535}),
+		evAS(2, []int64{-1, 0, 1, math.MaxInt32}),
+		evAF32(3, []float32{1.5, -2.5}),
+		evAF64(4, []float64{math.SmallestNonzeroFloat64, math.MaxFloat64}),
 	}
-
-	d := sofab.NewDecoder(&buf)
-	d.Next()
-	if u, _ := sofab.ReadUnsignedArray[uint16](d); !reflect.DeepEqual(u, []uint16{10, 20, 30}) {
-		t.Fatalf("u16 array %v", u)
-	}
-	d.Next()
-	if s, _ := sofab.ReadSignedArray[int64](d); !reflect.DeepEqual(s, []int64{-5, 5}) {
-		t.Fatalf("i64 array %v", s)
-	}
-	d.Next()
-	if f, _ := d.ReadFloat64Array(); !reflect.DeepEqual(f, []float64{1.5, -2.5}) {
-		t.Fatalf("f64 array %v", f)
-	}
+	assertRoundTrip(t, in, want)
 }
 
 func TestRoundTripNestedSequences(t *testing.T) {
-	var buf bytes.Buffer
-	e := sofab.NewEncoder(&buf)
-	e.WriteUnsigned(0, 1)
-	for i := 0; i < 5; i++ {
-		e.WriteSequenceBeginLazy(1)
-		e.WriteUnsigned(0, 42)
-	}
-	for i := 0; i < 5; i++ {
+	in := encode(t, func(e *sofab.Encoder) {
+		e.WriteUnsigned(1, 1)
+		e.WriteSequenceBeginLazy(2)
+		e.WriteUnsigned(1, 2)
+		e.WriteSequenceBeginLazy(3)
+		e.WriteString(1, "deep")
 		e.WriteSequenceEnd()
+		e.WriteSequenceEnd()
+		e.WriteSigned(4, -9)
+	})
+	want := []string{
+		evU(1, 1),
+		"seqbegin/2", evU(1, 2),
+		"seqbegin/3", evStr(1, "deep"), "seqend",
+		"seqend",
+		evS(4, -9),
 	}
-	if err := e.Flush(); err != nil {
-		t.Fatal(err)
-	}
+	assertRoundTrip(t, in, want)
+}
 
-	d := sofab.NewDecoder(&buf)
-	var starts, ends, scalars int
-	for {
-		f, err := d.Next()
-		if err == io.EOF {
-			break
-		}
+// assertRoundTrip decodes in on all three entry points and compares the events.
+func assertRoundTrip(t *testing.T, in []byte, want []string) {
+	t.Helper()
+	for _, s := range surfaces {
+		log, err := decodeAll(t, s, in)
 		if err != nil {
-			t.Fatal(err)
+			t.Fatalf("%s = %v, want COMPLETE", s, err)
 		}
-		switch f.Type {
-		case sofab.TypeSequenceStart:
-			starts++
-		case sofab.TypeSequenceEnd:
-			ends++
-		case sofab.TypeVarintUnsigned:
-			d.Unsigned()
-			scalars++
+		if strings.Join(log, "|") != strings.Join(want, "|") {
+			t.Fatalf("%s events =\n %v\nwant\n %v", s, log, want)
 		}
-	}
-	if starts != 5 || ends != 5 || scalars != 6 {
-		t.Fatalf("starts=%d ends=%d scalars=%d", starts, ends, scalars)
 	}
 }

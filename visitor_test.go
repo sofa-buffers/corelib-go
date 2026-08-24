@@ -307,9 +307,9 @@ func TestVisitorMalformed(t *testing.T) {
 // sequence-end header (§4.9, §6.2). The bound is on the id's value, not its
 // spelling: an id at or below ID_MAX — even a non-zero one, or a non-minimally
 // spelled zero — is discarded and the marker closes the open sequence (§4.1
-// untouched); only ID_MAX+1 is INVALID. Both decode surfaces must agree, so the
-// pull Decoder is checked alongside the visitor path. Mirrors the accepting
-// controls and the one moving point in the finding (F-0054).
+// untouched); only ID_MAX+1 is INVALID. All three entry points must agree.
+// Mirrors the accepting controls and the one moving point in the finding
+// (F-0054).
 func TestSequenceEndIDCeilingAndTolerance(t *testing.T) {
 	// A sequence-end header carrying the given id bytes, wrapped in a sequence
 	// start (id 14) so the end sits in a valid position and only its id is at
@@ -325,42 +325,29 @@ func TestSequenceEndIDCeilingAndTolerance(t *testing.T) {
 	}
 	for name, endHeader := range tolerated {
 		t.Run("accept/"+name, func(t *testing.T) {
-			// Visitor path: accepted, and the id is discarded — the recorder
-			// sees a bare seqend, never the id it was spelled with.
-			var log []string
-			if err := newDec(wrap(endHeader)).Accept(recorder{&log}); err != nil {
-				t.Fatalf("Accept = %v, want nil", err)
-			}
-			if want := []string{"seqbegin/14", "seqend"}; !reflect.DeepEqual(log, want) {
-				t.Fatalf("log = %v, want %v", log, want)
-			}
-			// Pull path: the same bytes read as start then an ordinary end.
-			d := newDec(wrap(endHeader))
-			if f := mustNext(t, d); f.Type != sofab.TypeSequenceStart {
-				t.Fatalf("first = %v, want SequenceStart", f.Type)
-			}
-			if f := mustNext(t, d); f.Type != sofab.TypeSequenceEnd {
-				t.Fatalf("second = %v, want SequenceEnd", f.Type)
+			// Accepted, and the id is discarded — the recorder sees a bare
+			// seqend, never the id it was spelled with.
+			want := []string{"seqbegin/14", "seqend"}
+			for _, surface := range surfaces {
+				log, err := decodeAll(t, surface, wrap(endHeader))
+				if err != nil {
+					t.Fatalf("%s = %v, want nil", surface, err)
+				}
+				if !reflect.DeepEqual(log, want) {
+					t.Fatalf("%s log = %v, want %v", surface, log, want)
+				}
 			}
 		})
 	}
-	// ID_MAX+1 is the one point that moves to INVALID, on both surfaces.
+	// ID_MAX+1 is the one point that moves to INVALID, on every entry point.
 	over := wrap(vhdr(sofab.IDMax+1, sofab.TypeSequenceEnd))
-	t.Run("reject/id above ID_MAX/visitor", func(t *testing.T) {
-		var log []string
-		if err := newDec(over).Accept(recorder{&log}); !errors.Is(err, sofab.ErrInvalidMsg) {
-			t.Fatalf("Accept = %v, want ErrInvalidMsg", err)
-		}
-	})
-	t.Run("reject/id above ID_MAX/pull", func(t *testing.T) {
-		d := newDec(over)
-		if f := mustNext(t, d); f.Type != sofab.TypeSequenceStart {
-			t.Fatalf("first = %v, want SequenceStart", f.Type)
-		}
-		if _, err := d.Next(); !errors.Is(err, sofab.ErrInvalidMsg) {
-			t.Fatalf("Next = %v, want ErrInvalidMsg", err)
-		}
-	})
+	for _, surface := range surfaces {
+		t.Run("reject/id above ID_MAX/"+surface, func(t *testing.T) {
+			if _, err := decodeAll(t, surface, over); !errors.Is(err, sofab.ErrInvalidMsg) {
+				t.Fatalf("%s = %v, want ErrInvalidMsg", surface, err)
+			}
+		})
+	}
 }
 
 // TestVisitorEmptyArrays confirms the visitor path delivers zero-count arrays as
@@ -404,12 +391,13 @@ func TestDeepNestingRejected(t *testing.T) {
 	if err := sofab.AcceptBytes(deep, baseV{}); !errors.Is(err, sofab.ErrInvalidMsg) {
 		t.Fatalf("AcceptBytes deep = %v, want ErrInvalidMsg", err)
 	}
-	d := newDec(deep)
-	if _, err := d.Next(); err != nil {
-		t.Fatalf("first Next = %v", err)
+	// The same holds where the visitor declines every scope, so the deep run is
+	// walked rather than descended into: MaxDepth is a property of the wire.
+	if err := sofab.AcceptBytes(deep, &countingSkipV{}); !errors.Is(err, sofab.ErrInvalidMsg) {
+		t.Fatalf("AcceptBytes deep, declining = %v, want ErrInvalidMsg", err)
 	}
-	if err := d.Skip(); !errors.Is(err, sofab.ErrInvalidMsg) {
-		t.Fatalf("pull Skip deep = %v, want ErrInvalidMsg", err)
+	if err := sofab.NewDecoder(bytes.NewReader(deep)).AcceptStream(baseV{}); !errors.Is(err, sofab.ErrInvalidMsg) {
+		t.Fatalf("AcceptStream deep = %v, want ErrInvalidMsg", err)
 	}
 }
 
@@ -425,48 +413,39 @@ func TestMaxDepthRoundTrip(t *testing.T) {
 			e.WriteSequenceEnd()
 		}
 	})
-	if err := sofab.AcceptBytes(got, baseV{}); err != nil {
-		t.Fatalf("AcceptBytes 255-deep = %v", err)
-	}
-	d := newDec(got)
-	depth := 0
-	for {
-		f, err := d.Next()
-		if err == io.EOF {
-			break
-		}
+	for _, surface := range surfaces {
+		log, err := decodeAll(t, surface, got)
 		if err != nil {
-			t.Fatalf("Next = %v", err)
+			t.Fatalf("%s 255-deep = %v", surface, err)
 		}
-		switch f.Type {
-		case sofab.TypeSequenceStart:
-			depth++
-		case sofab.TypeSequenceEnd:
-			depth--
-		case sofab.TypeVarintUnsigned:
-			if v, _ := d.Unsigned(); v != 7 {
-				t.Fatalf("inner unsigned = %d, want 7", v)
+		depth, sawValue := 0, false
+		for _, ev := range log {
+			switch {
+			case strings.HasPrefix(ev, "seqbegin/"):
+				depth++
+			case ev == "seqend":
+				depth--
+			case ev == evU(2, 7):
+				sawValue = true
 			}
 		}
-	}
-	if depth != 0 {
-		t.Fatalf("unbalanced sequence depth = %d", depth)
+		if depth != 0 {
+			t.Fatalf("%s: unbalanced sequence depth = %d", surface, depth)
+		}
+		if !sawValue {
+			t.Fatalf("%s: the innermost value never arrived", surface)
+		}
 	}
 }
 
 // TestInvalidUTF8Rejected covers §6.4: a string field whose payload is not valid
-// UTF-8 is rejected as ErrInvalidMsg where it is materialized. Decoder.String is
-// a materializing read and rejects it itself; on the visitor path the bytes are
-// handed through verbatim (the cursor cannot know whether the visitor has a
-// destination for the id) and the destination rejects them with UTF8Valid.
-// Blobs stay unchecked on every path.
+// UTF-8 is rejected as ErrInvalidMsg where it is materialized. The bytes are
+// handed through verbatim (the codec cannot know whether the visitor has a
+// destination for the id, and §6.4.5 forbids validating a skip), and the
+// destination rejects them with UTF8Valid. Blobs stay unchecked everywhere.
 func TestInvalidUTF8Rejected(t *testing.T) {
 	// fixlen string, length 1, payload 0xFF (an invalid UTF-8 byte).
 	in := append(vhdr(1, sofab.TypeFixlen), append(vbytes((1<<3)|subStr), 0xFF)...)
-	d := newDec(in)
-	mustNext(t, d)
-	_, err := d.String()
-	checkUTF8Decode(t, "pull String invalid utf8", err)
 	// A visitor with no destination for the id ignores the payload: accepted.
 	if err := sofab.AcceptBytes(in, baseV{}); err != nil {
 		t.Fatalf("visitor with no destination = %v, want nil (skips are never validated)", err)
@@ -521,17 +500,17 @@ func TestVisitorSlurpShortRead(t *testing.T) {
 	}
 }
 
-func TestVisitorAcceptAfterPullParser(t *testing.T) {
-	// Touch the reader through the pull parser first (sets up its buffer), then
-	// decode the remainder via the visitor: Accept must slurp from the already
+func TestVisitorAcceptAfterAcceptStream(t *testing.T) {
+	// Touch the reader through AcceptStream first (which creates the Decoder's
+	// buffered window), then decode via Accept: it must slurp from the already
 	// in-use reader rather than the raw source. An empty stream is the clean,
-	// well-defined case (Next reports EOF, Accept then sees nothing).
+	// well-defined case — both report COMPLETE and see nothing.
 	d := sofab.NewDecoder(bytes.NewReader(nil))
-	if _, err := d.Next(); err == nil {
-		t.Fatal("Next on empty = nil, want io.EOF")
+	if err := d.AcceptStream(recorder{new([]string)}); err != nil {
+		t.Fatalf("AcceptStream on empty = %v, want nil", err)
 	}
 	if err := d.Accept(recorder{new([]string)}); err != nil {
-		t.Fatalf("Accept after pull parser = %v, want nil", err)
+		t.Fatalf("Accept after AcceptStream = %v, want nil", err)
 	}
 }
 

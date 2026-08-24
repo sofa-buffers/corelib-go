@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 	"testing"
 
 	sofab "github.com/sofa-buffers/corelib-go"
@@ -224,56 +225,40 @@ func (s *blobSink) Bytes(_ sofab.ID, b []byte) error {
 
 func (s *blobSink) BeginSequence(sofab.ID) (sofab.Visitor, error) { return s, nil }
 
-// ---- pull-surface array truncation (§7) ------------------------------------
+// ---- array truncation at every offset (§7) ---------------------------------
 
-// The generic array readers must report a count that outruns the bytes as
-// INCOMPLETE at EVERY truncation point, including the ones inside the batch
-// decoder's fast path, and must not narrow silently.
-func TestPullArrayTruncationAtEveryOffset(t *testing.T) {
-	var buf bytes.Buffer
-	e := sofab.NewEncoder(&buf)
-	if err := sofab.WriteUnsignedArray(e, 1, []uint64{1, 2, 300, 40000, 5, 6, 7, 8}); err != nil {
-		t.Fatalf("WriteUnsignedArray: %v", err)
-	}
-	if err := e.Flush(); err != nil {
-		t.Fatalf("Flush: %v", err)
-	}
-	full := buf.Bytes()
-
-	for cut := 1; cut < len(full); cut++ {
-		d := sofab.NewDecoder(bytes.NewReader(full[:cut]))
-		if _, err := d.Next(); err != nil {
-			// The header itself was cut: INCOMPLETE is the only acceptable verdict.
-			if !errors.Is(err, sofab.ErrIncomplete) {
-				t.Errorf("cut=%d Next = %v, want ErrIncomplete", cut, err)
+// A count that outruns the bytes must be INCOMPLETE at EVERY truncation point,
+// including the ones inside the batch decoder's fast path, on every entry point.
+func TestArrayTruncationAtEveryOffset(t *testing.T) {
+	for _, c := range []struct {
+		name  string
+		write func(*sofab.Encoder) error
+	}{
+		{"unsigned", func(e *sofab.Encoder) error {
+			return sofab.WriteUnsignedArray(e, 1, []uint64{1, 2, 300, 40000, 5, 6, 7, 8})
+		}},
+		{"signed", func(e *sofab.Encoder) error {
+			return sofab.WriteSignedArray(e, 1, []int64{-1, 2, -300, 40000, -5, 6, -7, 8})
+		}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			e := sofab.NewEncoder(&buf)
+			if err := c.write(e); err != nil {
+				t.Fatalf("write: %v", err)
 			}
-			continue
-		}
-		if _, err := sofab.ReadUnsignedArray[uint64](d); !errors.Is(err, sofab.ErrIncomplete) {
-			t.Errorf("cut=%d ReadUnsignedArray = %v, want ErrIncomplete", cut, err)
-		}
-	}
-
-	buf.Reset()
-	e = sofab.NewEncoder(&buf)
-	if err := sofab.WriteSignedArray(e, 1, []int64{-1, 2, -300, 40000, -5, 6, -7, 8}); err != nil {
-		t.Fatalf("WriteSignedArray: %v", err)
-	}
-	if err := e.Flush(); err != nil {
-		t.Fatalf("Flush: %v", err)
-	}
-	full = buf.Bytes()
-	for cut := 1; cut < len(full); cut++ {
-		d := sofab.NewDecoder(bytes.NewReader(full[:cut]))
-		if _, err := d.Next(); err != nil {
-			if !errors.Is(err, sofab.ErrIncomplete) {
-				t.Errorf("cut=%d Next = %v, want ErrIncomplete", cut, err)
+			if err := e.Flush(); err != nil {
+				t.Fatalf("Flush: %v", err)
 			}
-			continue
-		}
-		if _, err := sofab.ReadSignedArray[int64](d); !errors.Is(err, sofab.ErrIncomplete) {
-			t.Errorf("cut=%d ReadSignedArray = %v, want ErrIncomplete", cut, err)
-		}
+			full := buf.Bytes()
+			for cut := 1; cut < len(full); cut++ {
+				for _, surface := range surfaces {
+					if _, err := decodeAll(t, surface, full[:cut]); !errors.Is(err, sofab.ErrIncomplete) {
+						t.Errorf("%s cut=%d = %v, want ErrIncomplete", surface, cut, err)
+					}
+				}
+			}
+		})
 	}
 }
 
@@ -367,38 +352,26 @@ func TestInWidthElementInATruncatedArrayStaysIncomplete(t *testing.T) {
 	}
 }
 
-// The pull array readers must surface a transport failure verbatim too — a
+// The reader-driven array path must surface a transport failure verbatim — a
 // reader that dies mid-array is neither INCOMPLETE (there is nothing to wait
-// for) nor INVALID (nothing said the bytes were wrong).
-func TestPullArrayReadersSurfaceReaderFailures(t *testing.T) {
+// for) nor INVALID (nothing said the bytes were wrong). It must agree whether
+// the visitor materializes the array or declines everything and merely walks it.
+func TestArrayReadersSurfaceReaderFailures(t *testing.T) {
 	boom := errors.New("transport died")
 
-	r := &prefixErrReader{b: []byte(hdr(1, sofab.TypeVarintArrayUnsigned) + "\x20\x01\x02\x03"), err: boom}
-	d := sofab.NewDecoder(r)
-	if _, err := d.Next(); err != nil {
-		t.Fatalf("Next: %v", err)
-	}
-	if _, err := sofab.ReadUnsignedArray[uint64](d); !errors.Is(err, boom) {
-		t.Errorf("ReadUnsignedArray = %v, want the reader's error", err)
-	}
+	for _, wt := range []sofab.WireType{sofab.TypeVarintArrayUnsigned, sofab.TypeVarintArraySigned} {
+		wire := []byte(hdr(1, wt) + "\x20\x01\x02\x03")
 
-	r = &prefixErrReader{b: []byte(hdr(1, sofab.TypeVarintArraySigned) + "\x20\x01\x02\x03"), err: boom}
-	d = sofab.NewDecoder(r)
-	if _, err := d.Next(); err != nil {
-		t.Fatalf("Next: %v", err)
-	}
-	if _, err := sofab.ReadSignedArray[int64](d); !errors.Is(err, boom) {
-		t.Errorf("ReadSignedArray = %v, want the reader's error", err)
-	}
+		r := &prefixErrReader{b: wire, err: boom}
+		if err := sofab.NewDecoder(r).AcceptStream(recorder{new([]string)}); !errors.Is(err, boom) {
+			t.Errorf("wire type %d, materializing = %v, want the reader's error", wt, err)
+		}
 
-	// Skip walks the same elements, and must agree.
-	r = &prefixErrReader{b: []byte(hdr(1, sofab.TypeVarintArrayUnsigned) + "\x20\x01\x02\x03"), err: boom}
-	d = sofab.NewDecoder(r)
-	if _, err := d.Next(); err != nil {
-		t.Fatalf("Next: %v", err)
-	}
-	if err := d.Skip(); !errors.Is(err, boom) {
-		t.Errorf("Skip = %v, want the reader's error", err)
+		// A visitor that takes nothing walks the same elements, and must agree.
+		r = &prefixErrReader{b: wire, err: boom}
+		if err := sofab.NewDecoder(r).AcceptStream(&countingSkipV{}); !errors.Is(err, boom) {
+			t.Errorf("wire type %d, skipping = %v, want the reader's error", wt, err)
+		}
 	}
 }
 
@@ -494,36 +467,26 @@ func TestSharedBufioReaderResumesAtTheNextMessage(t *testing.T) {
 		t.Fatal("the second message wrote nothing")
 	}
 
+	// A length-framed transport: each Decoder is handed exactly its own message
+	// off the shared buffered reader.
 	br := bufio.NewReader(bytes.NewReader(buf.Bytes()))
 
-	d1 := sofab.NewDecoder(br)
-	if _, err := d1.Next(); err != nil {
-		t.Fatalf("d1.Next: %v", err)
+	var first []string
+	if err := sofab.NewDecoder(io.LimitReader(br, int64(firstLen))).AcceptStream(recorder{&first}); err != nil {
+		t.Fatalf("first message: %v", err)
 	}
-	if v, err := d1.Unsigned(); err != nil || v != 42 {
-		t.Fatalf("d1.Unsigned = %d, %v", v, err)
-	}
-	if _, err := d1.Next(); err != nil {
-		t.Fatalf("d1.Next: %v", err)
-	}
-	if v, err := d1.Signed(); err != nil || v != -7 {
-		t.Fatalf("d1.Signed = %d, %v", v, err)
+	if got, want := strings.Join(first, "|"), evU(1, 42)+"|"+evS(2, -7); got != want {
+		t.Fatalf("first message events = %s, want %s", got, want)
 	}
 
-	// A second Decoder over the SAME buffered reader picks up the next message.
-	d2 := sofab.NewDecoder(br)
-	f, err := d2.Next()
-	if err != nil {
-		t.Fatalf("d2.Next: %v (the first decoder over-read the shared reader)", err)
+	// A second Decoder over the SAME buffered reader picks up the next message:
+	// the first must not have drained past its own bytes.
+	var second []string
+	if err := sofab.NewDecoder(br).AcceptStream(recorder{&second}); err != nil {
+		t.Fatalf("second message: %v (the first decoder over-read the shared reader)", err)
 	}
-	if f.ID != 3 {
-		t.Fatalf("d2 read id %d, want 3", f.ID)
-	}
-	if s, err := d2.String(); err != nil || s != "second" {
-		t.Fatalf("d2.String = %q, %v", s, err)
-	}
-	if _, err := d2.Next(); err != io.EOF {
-		t.Errorf("d2.Next after the last field = %v, want io.EOF", err)
+	if got, want := strings.Join(second, "|"), evStr(3, "second"); got != want {
+		t.Fatalf("second message events = %s, want %s", got, want)
 	}
 }
 

@@ -69,12 +69,9 @@ type SchemaBoundVisitor interface {
 	SchemaBound(id ID, what BoundKind) bool
 }
 
-// schemaBound is where one decode surface gets the §6.2.1 answer from. The two
-// visitor surfaces (cursor.accept, Decoder.acceptStream) carry the scope's
-// visitor and ask it; the pull parser has no visitor, so the caller declares the
-// current field itself with Decoder.SchemaBounded and decl carries that. Its zero
-// value — no visitor, nothing declared — is the "unbounded, the cap applies"
-// answer every other caller wants.
+// schemaBound is where a decode gets the §6.2.1 answer from: it carries the
+// scope's visitor and asks it. Its zero value — no visitor — is the "unbounded,
+// the cap applies" answer.
 //
 // It is a plain two-word value with NO cache pointer, unlike hvCache/ebCache/
 // spCache, and that is deliberate: a per-scope cache would have to be addressed,
@@ -84,8 +81,7 @@ type SchemaBoundVisitor interface {
 // is already being rejected. The type assertion is made there instead, once per
 // over-cap header.
 type schemaBound struct {
-	v    Visitor
-	decl bool
+	v Visitor
 }
 
 // bounds reports whether the schema bounds field id's size of kind what. It is
@@ -93,9 +89,6 @@ type schemaBound struct {
 // and checkFixlen), so neither the assertion nor the call is on the path where
 // the header fits or no cap is set.
 func (s schemaBound) bounds(id ID, what BoundKind) bool {
-	if s.decl {
-		return true
-	}
 	sb, ok := s.v.(SchemaBoundVisitor)
 	return ok && sb.SchemaBound(id, what)
 }
