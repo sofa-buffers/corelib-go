@@ -55,15 +55,6 @@ type Encoder struct {
 	// currently in — i.e. that it took the buffer and replaced it, rather than
 	// copying and returning (§5.1). drain clears it before every sink call.
 	installed bool
-	// staged is the exact-fit tail path of a sink-less caller-supplied buffer (see
-	// stage); staging says whether the encoder has entered it. It is bounded
-	// working state — its scratch is MinOutputBuffer bytes, a constant of the
-	// specification, and no wire number sizes it — so §6.6 requires it to be
-	// sized at construction. It therefore sits IN the Encoder rather than hanging
-	// off a pointer: hanging it off one cost an allocation on a write path, which
-	// is exactly what §6.6 forbids, and saved ~60 bytes per Encoder.
-	staged  stagedTail
-	staging bool
 	// pending holds the ids of the innermost open sequences whose header has not
 	// been written yet (WriteSequenceBeginLazy, MESSAGE_SPEC §2). It is always a
 	// contiguous suffix of the open sequences — writing any field commits the
@@ -71,16 +62,35 @@ type Encoder struct {
 	// last entry. It is truncated, never released, so its backing array is reused
 	// for the encoder's lifetime; MaxDepth bounds it at 255 entries.
 	//
-	// It is backed by pendingInline, which is sized to the FULL MaxDepth at
-	// construction (§6.0.1: "at most MAX_DEPTH ids, sized at construction"), so
-	// append() can never spill it to the heap: WriteSequenceBeginLazy refuses to
-	// open sequence MaxDepth+1, so len(pending) <= MaxDepth always. Growing it on
-	// a write path was the §6.6 violation this replaced. (The self-reference means
-	// an Encoder must be used through the *Encoder that NewEncoder returns, never
-	// copied by value — which is already the API.)
-	pending       []ID
-	pendingInline [MaxDepth]ID
-	lim           limits
+	// The constructor sizes it to the FULL MaxDepth (§6.0.1: "at most MAX_DEPTH
+	// ids, sized at construction"), so append() can never grow it:
+	// WriteSequenceBeginLazy refuses to open sequence MaxDepth+1, so
+	// len(pending) <= MaxDepth always. Growing it on a write path was the §6.6
+	// violation this replaced.
+	//
+	// It is its OWN allocation rather than an array inside the Encoder. Both size
+	// it at construction, so both satisfy §6.0.1, but MaxDepth ids are ~1 KB of
+	// pointer-free data: embedded, it makes every Encoder a 1.3 KB object the GC
+	// must scan for pointers; separate, the Encoder stays a ~260-byte scannable
+	// object beside a 1 KB pointer-free one the collector skips entirely. That is
+	// measurably the cheaper of the two shapes at construction, which is where
+	// this cost now lands.
+	pending []ID
+	lim     limits
+	// staged is the exact-fit tail path of a sink-less caller-supplied buffer (see
+	// stage); staging says whether the encoder has entered it. It is bounded
+	// working state — its scratch is MinOutputBuffer bytes, a constant of the
+	// specification, and no wire number sizes it — so §6.6 requires it to be
+	// sized at construction. It therefore sits IN the Encoder rather than hanging
+	// off a pointer: hanging it off one cost an allocation on a write path, which
+	// is exactly what §6.6 forbids, and saved ~60 bytes per Encoder.
+	//
+	// It sits at the END of the struct on purpose. It is ~64 bytes touched only
+	// by a sink-less buffer that ran out of reserved room; putting it in the
+	// middle pushed `pending` — which every field write reads — out of the first
+	// cache line, and that showed up as ~30% on a reused encoder.
+	staged  stagedTail
+	staging bool
 }
 
 // stagedTail is the sink-less caller-supplied buffer's exact-fit tail: dst is
@@ -154,7 +164,7 @@ type Sink func(e *Encoder, b []byte) error
 // accepted but ignored here.
 func NewEncoder(w io.Writer, opts ...Option) *Encoder {
 	e := &Encoder{w: w, buf: make([]byte, encWindow), lim: newLimits(opts)}
-	e.pending = e.pendingInline[:0]
+	e.pending = make([]ID, 0, MaxDepth)
 	return e
 }
 
@@ -197,7 +207,7 @@ func NewEncoderSink(buf []byte, offset int, sink Sink, opts ...Option) (*Encoder
 // constructors, once their arguments have been checked.
 func newBufferEncoder(buf []byte, offset int, sink Sink, opts []Option) *Encoder {
 	e := &Encoder{sink: sink, buf: buf, n: offset, start: offset, lim: newLimits(opts)}
-	e.pending = e.pendingInline[:0]
+	e.pending = make([]ID, 0, MaxDepth)
 	return e
 }
 
@@ -285,10 +295,18 @@ func (e *Encoder) setErr(err error) {
 //
 // It was 512 growing to 4096 on demand, which allocated on a write path — the
 // grow was one allocation plus a copy of everything written so far, and its size
-// came from the message. Committing the 4096 at construction removes both, at
-// the cost of that much per Encoder whether or not a message needs it. An
-// Encoder is meant to outlive one message; §6.6 puts the cost where it can.
-const encWindow = 4096
+// came from the message. §6.6 forbids both, so the size is committed here.
+//
+// The value is the OLD INITIAL size, not the old cap, and that is deliberate:
+// every Encoder now pays it at construction whether or not a message needs it,
+// and the generated one-shot Encode() constructs one per message. 512 bytes
+// covers a small message end-to-end with no flush at all — exactly what the
+// growable window did before it grew — while a message past it drains to w
+// repeatedly instead of growing, which is what a streaming encoder does anyway.
+// Committing 4096 here instead cost ~4.5x on encoder construction for the sake
+// of fewer Write calls on messages large enough that the caller should be
+// handing in its own buffer (NewEncoderSink) in the first place.
+const encWindow = 512
 
 // room reports whether k bytes can be written at the current position, making
 // space if not: it grows the window while that is still allowed, and otherwise

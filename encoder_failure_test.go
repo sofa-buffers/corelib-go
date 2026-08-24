@@ -105,17 +105,22 @@ func TestArrayRunStopsAtTheFirstWriterFailure(t *testing.T) {
 	}
 }
 
-// A blob or string that fits the window's cap but not the room left in it forces
-// a mid-stream drain; when that drain fails the payload must not be written
-// piecemeal and the error must stick.
+// A blob or string that fits the io.Writer form's scratch window but not the
+// room left in it forces a mid-stream drain; when that drain fails the payload
+// must not be written piecemeal and the error must stick.
+//
+// The sizes are derived from the window rather than hard-coded: encWindowSize
+// reads it off an encoder, so a change to the constant moves this test with it
+// instead of silently making the filler drain on its own.
 func TestPayloadThatNeedsADrainReportsTheWriterFailure(t *testing.T) {
-	filler := bytes.Repeat([]byte{'x'}, 4000)
+	win := encWindowSize(t)
+	filler := bytes.Repeat([]byte{'x'}, win-96)
 	for _, tc := range []struct {
 		name  string
 		write func(*sofab.Encoder) error
 	}{
-		{"blob", func(e *sofab.Encoder) error { return e.WriteBytes(2, bytes.Repeat([]byte{'y'}, 600)) }},
-		{"string", func(e *sofab.Encoder) error { return e.WriteString(2, strings.Repeat("y", 600)) }},
+		{"blob", func(e *sofab.Encoder) error { return e.WriteBytes(2, bytes.Repeat([]byte{'y'}, 128)) }},
+		{"string", func(e *sofab.Encoder) error { return e.WriteString(2, strings.Repeat("y", 128)) }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			w := &refusingWriter{err: errSinkRefused}
@@ -142,7 +147,7 @@ func TestLazySequenceCommitReportsTheWriterFailure(t *testing.T) {
 	e := sofab.NewEncoder(w)
 	// Leaves only a few bytes of the window free, so committing the pending
 	// sequence header has to drain first.
-	if err := e.WriteBytes(1, bytes.Repeat([]byte{'x'}, 4088)); err != nil {
+	if err := e.WriteBytes(1, bytes.Repeat([]byte{'x'}, encWindowSize(t)-8)); err != nil {
 		t.Fatalf("filler write = %v, want nil", err)
 	}
 	if err := e.WriteSequenceBeginLazy(2); err != nil {
@@ -154,6 +159,22 @@ func TestLazySequenceCommitReportsTheWriterFailure(t *testing.T) {
 	if w.written != 0 {
 		t.Errorf("writer accepted %d bytes, want 0", w.written)
 	}
+}
+
+// encWindowSize discovers the io.Writer form's fixed scratch window: it is the
+// largest blob that still encodes into it without any Write reaching the
+// destination. Deriving it keeps the tests below from hard-coding a constant the
+// package is free to change.
+func encWindowSize(t *testing.T) int {
+	t.Helper()
+	for _, n := range []int{1 << 16, 1 << 15, 1 << 14, 1 << 13, 4096, 2048, 1024, 512, 256, 128} {
+		w := &refusingWriter{err: errSinkRefused}
+		if sofab.NewEncoder(w).WriteBytes(1, make([]byte, n-8)) == nil {
+			return n
+		}
+	}
+	t.Fatal("could not determine the encoder's scratch window size")
+	return 0
 }
 
 // stringCollector binds the first string field it is handed, copying it into

@@ -42,20 +42,19 @@ import sofab "github.com/sofa-buffers/corelib-go"
 ### Feature flags
 
 Go always ships the full wire format; there are no build-time toggles for wire
-features. Two policies are configurable, and neither changes a byte on the wire.
+features. One policy is configurable, and it changes no byte on the wire.
 
 | Option | Default | Effect |
 |--------|---------|--------|
 | `WithStrictUTF8(bool)` (`SOFAB_STRICT_UTF8`) | on | Reject an invalid-UTF-8 `string`: `ErrArgument` on encode, `ErrInvalidMsg` where one is read on decode. Off stores and writes the bytes verbatim — never lossy, never replaced. |
-| `WithPassThrough(bool)` | off | Allow a `string`/blob payload larger than the buffer to reach the sink directly instead of being copied through it — see [Memory handling](#memory-handling). |
-| `-tags sofab_no_strict_utf8` | check compiled in | Footprint build: compiles the validator out everywhere — `Decoder.String`, `Encoder.WriteString` and `UTF8Valid` alike — and wins over `WithStrictUTF8`. CI builds and tests this leg; the default build is the one tested against the shared vectors. |
+| `-tags sofab_no_strict_utf8` | check compiled in | Footprint build: compiles the validator out everywhere — `Encoder.WriteString` and `UTF8Valid` alike — and wins over `WithStrictUTF8`. CI builds and tests this leg; the default build is the one tested against the shared vectors. |
 
 Pass the options to `NewEncoder`, `NewDecoder` or `AcceptBytes`.
 
-**A string handed to a visitor is checked at the destination.** `Decoder.String`
-validates internally. `Accept` / `AcceptBytes` / `AcceptStream` pass the wire
-bytes to `Visitor.String` verbatim, because the cursor cannot tell a field the
-visitor binds from one it ignores. Embed `sofab.StringCheck` to receive this
+**A string is checked at the destination.** The decoder passes the wire bytes to
+`Visitor.String` verbatim, because it cannot tell a field the visitor binds from
+one it ignores — and a field that is only skipped must never be validated.
+Embed `sofab.StringCheck` to receive this
 decode's policy, so flipping the option never means regenerating code:
 
 ```go
@@ -354,7 +353,7 @@ You **must call `Flush`** to push the tail and surface a late write error.
 
 | Constructor | Who owns the buffer | When it fills |
 |---|---|---|
-| `NewEncoder(w)` | this package: a fixed 4 KiB scratch window, sized once at construction and never grown | flushed to `w`, then reused |
+| `NewEncoder(w)` | this package: a fixed 512 B scratch window, sized once at construction and never grown | flushed to `w`, then reused |
 | `NewEncoderBuffer(buf, offset)` | you | nothing to flush to — the encode stops with `ErrBufferFull` |
 | `NewEncoderSink(buf, offset, sink)` | you | handed to `sink`, then reused, or replaced via `SetBuffer` |
 
