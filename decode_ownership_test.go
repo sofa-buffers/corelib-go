@@ -1,8 +1,11 @@
 package sofab_test
 
-// What each decode path hands the caller: a fresh copy, or a view into memory
-// the caller still owns. The difference decides whether a visitor may keep a
-// value past the call, so it is pinned here rather than left as a claim.
+// CORELIB_PLAN §6.7 / §6.0's chunk lifetime, as a checked property: whatever a
+// callback receives is valid only until it returns, and a caller that keeps a
+// value copies it. What that buys the caller is that the DECODED MESSAGE is
+// unaffected by the input being reused, overwritten or freed afterwards — on the
+// one-shot path exactly as on the streaming one (§6.7.1). That is what is pinned
+// here, rather than left as a claim in the README.
 
 import (
 	"bytes"
@@ -22,22 +25,38 @@ func readDoc(t *testing.T, path string) string {
 	return string(src)
 }
 
-// keepV retains the string and blob it is handed, the way a visitor that binds
-// them into a struct does.
-type keepV struct {
+// copyingV is the destination CORELIB_PLAN §6.7 describes: the codec "passes
+// the value through the callback ... and the caller copies it where it belongs".
+// Go's string conversion has already copied a string payload; a blob arrives as
+// a []byte, so a destination that keeps it copies it — exactly what generated
+// code emits.
+type copyingV struct {
 	baseV
 	str  string
 	blob []byte
 }
 
-func (k *keepV) String(_ sofab.ID, s string) error { k.str = s; return nil }
-func (k *keepV) Bytes(_ sofab.ID, b []byte) error  { k.blob = b; return nil }
+func (k *copyingV) String(_ sofab.ID, s string) error { k.str = s; return nil }
+func (k *copyingV) Bytes(_ sofab.ID, b []byte) error {
+	k.blob = append([]byte(nil), b...)
+	return nil
+}
 
-// AcceptStream hands over fresh storage — its values survive the source bytes
-// being overwritten — while AcceptBytes hands over views into the caller's
-// slice, which do not. Scribbling over the input after the decode is exactly
-// what a caller that reuses its receive buffer does.
-func TestDecodePathOwnership(t *testing.T) {
+// TestDecodedMessageSurvivesTheInputBeingScrubbed is §7.2 item 4's last two
+// bullets: "Overwrite every chunk after `feed` returns" and "Overwrite the
+// one-shot buffer too — run decode(buffer), scrub the whole buffer, and assert
+// the decoded MESSAGE is unchanged." Scribbling over the input after the decode
+// is exactly what a caller that reuses its receive buffer does.
+//
+// The obligation is on the decoded message, not on the callback argument: §6.7
+// carries a value to the caller either by writing into storage the caller
+// supplied, or by passing it through the callback for the caller to copy — and
+// "the second route is not a view ... validity ends when the callback returns".
+// Every entry point is held to it, because §6.7.1 gives the one-shot path no
+// exemption: "that the caller supplied the whole buffer ... would make a view
+// safe — but it would also make the port's decode behaviour depend on which
+// entry point was used".
+func TestDecodedMessageSurvivesTheInputBeingScrubbed(t *testing.T) {
 	const str = "sofa"
 	blob := []byte{0xDE, 0xAD, 0xBE, 0xEF}
 	msg := mustEncode(func(e *sofab.Encoder) {
@@ -45,37 +64,36 @@ func TestDecodePathOwnership(t *testing.T) {
 		e.WriteBytes(2, blob)
 	})
 
-	t.Run("AcceptStream copies", func(t *testing.T) {
-		src := append([]byte(nil), msg...)
-		var v keepV
-		if err := sofab.NewDecoder(bytes.NewReader(src)).AcceptStream(&v); err != nil {
-			t.Fatalf("AcceptStream: %v", err)
-		}
-		for i := range src {
-			src[i] = 0xFF
-		}
-		if v.str != str {
-			t.Errorf("AcceptStream string = %q after the source was overwritten, want %q", v.str, str)
-		}
-		if !bytes.Equal(v.blob, blob) {
-			t.Errorf("AcceptStream blob = %x after the source was overwritten, want %x", v.blob, blob)
-		}
-	})
-
-	t.Run("AcceptBytes aliases", func(t *testing.T) {
-		src := append([]byte(nil), msg...)
-		var v keepV
-		if err := sofab.AcceptBytes(src, &v); err != nil {
-			t.Fatalf("AcceptBytes: %v", err)
-		}
-		for i := range src {
-			src[i] = 0xFF
-		}
-		if v.str != str {
-			t.Errorf("AcceptBytes string = %q, want %q", v.str, str)
-		}
-		if bytes.Equal(v.blob, blob) {
-			t.Errorf("AcceptBytes blob survived the caller's slice being overwritten; it is a view into that slice")
-		}
-	})
+	for _, s := range []struct {
+		name   string
+		decode func(src []byte, v sofab.Visitor) error
+	}{
+		{"AcceptBytes", func(src []byte, v sofab.Visitor) error { return sofab.AcceptBytes(src, v) }},
+		{"Accept", func(src []byte, v sofab.Visitor) error {
+			return sofab.NewDecoder(bytes.NewReader(src)).Accept(v)
+		}},
+		{"AcceptStream", func(src []byte, v sofab.Visitor) error {
+			return sofab.NewDecoder(bytes.NewReader(src)).AcceptStream(v)
+		}},
+		{"AcceptStream/one-byte chunks", func(src []byte, v sofab.Visitor) error {
+			return sofab.NewDecoder(&chunkReader{b: src, n: 1}).AcceptStream(v)
+		}},
+	} {
+		t.Run(s.name, func(t *testing.T) {
+			src := append([]byte(nil), msg...)
+			var v copyingV
+			if err := s.decode(src, &v); err != nil {
+				t.Fatalf("%s: %v", s.name, err)
+			}
+			for i := range src {
+				src[i] = 0xFF
+			}
+			if v.str != str {
+				t.Errorf("%s: string = %q after the input was scrubbed, want %q", s.name, v.str, str)
+			}
+			if !bytes.Equal(v.blob, blob) {
+				t.Errorf("%s: blob = %x after the input was scrubbed, want %x", s.name, v.blob, blob)
+			}
+		})
+	}
 }
