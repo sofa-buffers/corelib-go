@@ -15,18 +15,17 @@
 // Callgrind harness toggles collection around ("main.run_<workload>").
 //
 // The datasets are BENCH_SPEC's: the 1000-element u64 array, the small "typical"
-// message, the 12-field perf message, the unbounded 1 MB blob (one-shot,
-// streaming and pass-through encode, chunk-fed decode) and the composite message
+// message, the 12-field perf message, the unbounded 1 MB blob (one-shot and
+// streaming encode, chunk-fed decode) and the composite message
 // that reaches the paths the flat ones never do — a wrapper array, multi-byte
 // UTF-8, depth-3 nesting, an omitted all-default field and a two-byte field
 // header.
 //
 // Read the `blob 1MB` rows against each other, not against the others: five
 // bytes of that message are metadata and a million are payload, so its MB/s is
-// the machine's memory bandwidth. The signal is the *differences* — one-shot to
-// streaming is the flush machinery, streaming to pass-through is what the
-// CORELIB_PLAN §5.1 permission buys — and both are best read as Callgrind Ir/op
-// (bench/run_callgrind.sh), where instruction counts do not care about
+// the machine's memory bandwidth. The signal is the *difference* — one-shot to
+// streaming is what the flush machinery costs — and it is best read as Callgrind
+// Ir/op (bench/run_callgrind.sh), where instruction counts do not care about
 // bandwidth.
 package main
 
@@ -455,24 +454,11 @@ func do_encode_blob_oneshot() {
 }
 
 // do_encode_blob_streaming is the same megabyte through a 4096-byte
-// caller-supplied buffer and ~245 flushes, with pass-through NOT granted — so
-// every byte is copied through the buffer. Its distance from the one-shot row is
-// the cost of the divisible-run path (§5.1).
+// caller-supplied buffer and ~245 flushes: every byte is copied through the
+// buffer, because §5.1.6 admits no other route. Its distance from the one-shot
+// row is the cost of the divisible-run path.
 func do_encode_blob_streaming() {
 	e, err := sofab.NewEncoderSink(encScratch, 0, discardSink)
-	must(err)
-	must(e.WriteBytes(1, blobSrc))
-	must(e.Flush())
-	used = blobEncoded
-}
-
-// do_encode_blob_passthrough is BENCH_SPEC's optional row, printed because this
-// port implements the §5.1 permission: driven exactly like the streaming row but
-// with WithPassThrough(true), so the payload reaches the sink directly instead of
-// being copied through the 4096-byte buffer. Its gap to the streaming row is what
-// the permission is worth here.
-func do_encode_blob_passthrough() {
-	e, err := sofab.NewEncoderSink(encScratch, 0, discardSink, sofab.WithPassThrough(true))
 	must(err)
 	must(e.WriteBytes(1, blobSrc))
 	must(e.Flush())
@@ -549,8 +535,6 @@ func run_encode_blob_oneshot() { do_encode_blob_oneshot() }
 func run_encode_blob_streaming() { do_encode_blob_streaming() }
 
 //go:noinline
-func run_encode_blob_passthrough() { do_encode_blob_passthrough() }
-
 //go:noinline
 func run_encode_composite() { do_encode_composite() }
 
@@ -592,7 +576,6 @@ var workloads = []workload{
 	{"encode_typical", "encode: typical message", setupEncodeTypical, do_encode_typical, run_encode_typical},
 	{"encode_blob_oneshot", "encode: blob 1MB one-shot", setupEncodeBlobOneShot, do_encode_blob_oneshot, run_encode_blob_oneshot},
 	{"encode_blob_streaming", "encode: blob 1MB streaming", setupEncodeBlobStreaming, do_encode_blob_streaming, run_encode_blob_streaming},
-	{"encode_blob_passthrough", "encode: blob 1MB passthrough", setupEncodeBlobStreaming, do_encode_blob_passthrough, run_encode_blob_passthrough},
 	{"encode_composite", "encode: composite", setupEncodeComposite, do_encode_composite, run_encode_composite},
 	{"decode_u64_array", "decode: u64 array (1000)", setupDecodeU64, do_decode_u64_array, run_decode_u64_array},
 	{"decode_typical", "decode: typical message", setupDecodeTypical, do_decode_typical, run_decode_typical},

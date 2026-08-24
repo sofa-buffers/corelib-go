@@ -336,16 +336,16 @@ func TestClosingASequenceRestoresDepth(t *testing.T) {
 	}
 }
 
-// TestDeepNestingPastTheInlineRunEmitsNothing is the "no hold-back window" test.
-// The Encoder holds the pending run in a slice backed by a small inline array
-// and lets append spill it to the heap, so there is no bound past which it
-// frames eagerly (CORELIB_PLAN §6, "How deep the hold-back reaches": an
-// implementation that can allocate MUST hold back to the full MAX_DEPTH). This
-// nests far past that inline capacity — and, in the second case, all the way to
-// MaxDepth — closes every level contentless, and demands zero bytes: the eager
-// fallback other profiles are allowed to take is exactly what would show up here
-// as a run of empty frames.
-func TestDeepNestingPastTheInlineRunEmitsNothing(t *testing.T) {
+// TestDeepNestingToMaxDepthEmitsNothing is the "no hold-back window" test. The
+// Encoder holds the pending run in an array sized to the full MaxDepth at
+// construction (CORELIB_PLAN §6.0.1, "How deep the hold-back reaches": the run
+// is fixed-size state, sized at construction, and an implementation MUST hold
+// back to the full MAX_DEPTH), so there is no bound past which it frames
+// eagerly and no growth on a write path. This nests deep — and, in the second
+// case, all the way to MaxDepth — closes every level contentless, and demands
+// zero bytes: the eager fallback other profiles are allowed to take is exactly
+// what would show up here as a run of empty frames.
+func TestDeepNestingToMaxDepthEmitsNothing(t *testing.T) {
 	for _, depth := range []int{40, sofab.MaxDepth} {
 		t.Run(strconv.Itoa(depth), func(t *testing.T) {
 			got := encode(t, func(e *sofab.Encoder) {
@@ -367,12 +367,12 @@ func TestDeepNestingPastTheInlineRunEmitsNothing(t *testing.T) {
 	}
 }
 
-// TestDeepNestingPastTheInlineRunCommitsInOrder is its counterpart: once the
-// spilled run does get content, every held-back header must come back out
-// outermost-first and in one piece. A spill that lost or reordered entries would
-// still produce "zero bytes" above, so the empty case alone does not cover it.
-func TestDeepNestingPastTheInlineRunCommitsInOrder(t *testing.T) {
-	const depth = 40 // past the Encoder's inline pending capacity
+// TestDeepNestingCommitsInOrder is its counterpart: once a deep run does get
+// content, every held-back header must come back out outermost-first and in one
+// piece. A run that lost or reordered entries would still produce "zero bytes"
+// above, so the empty case alone does not cover it.
+func TestDeepNestingCommitsInOrder(t *testing.T) {
+	const depth = 40
 
 	got := encode(t, func(e *sofab.Encoder) {
 		for i := 0; i < depth; i++ {

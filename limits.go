@@ -41,11 +41,6 @@ type limits struct {
 	maxStringLen  uint64 // 0 = unlimited
 	maxBlobLen    uint64 // 0 = unlimited
 	strictUTF8    bool   // SOFAB_STRICT_UTF8 (§6.4); default ON via newLimits
-	// passThrough is the §5.1 pass-through permission. Its zero value is the
-	// default the spec states for every encoder form — OFF, "a sink that was not
-	// told it may receive foreign memory never does" — so only
-	// WithPassThrough(true) ever turns it on.
-	passThrough bool
 }
 
 // WithMaxArrayCount caps the element count of every count-prefixed array — the
@@ -101,32 +96,6 @@ func WithMaxBlobLen(n int) Option {
 // wire-format switch.
 func WithStrictUTF8(enabled bool) Option {
 	return func(l *limits) { l.strictUTF8 = enabled }
-}
-
-// WithPassThrough grants the encoder permission to hand a string/blob payload to
-// its sink directly, instead of copying it through the output buffer
-// (CORELIB_PLAN §5.1). It is an encode-side option; the decoder ignores it.
-//
-// It is OFF by default for every encoder form, io.Writer included: §5.1 makes
-// the permission the caller's to give, and a destination that was not told it
-// may receive foreign memory never does. Without it the bytes are identical —
-// the sink simply only ever sees the output buffer.
-//
-// Pass-through saves a pass over the payload — for a large blob the dominant
-// cost of encoding it — but it means the sink is handed memory that is not the
-// output buffer. Granting it is therefore a promise about what the sink does
-// with what it receives:
-//
-//   - the payload is BORROWED for the duration of the call and must not be
-//     retained (io.Writer's own contract says the same thing);
-//   - such a call is not a buffer handover, so a sink granted pass-through must
-//     never take the buffer — SetBuffer is rejected with ErrArgument while the
-//     permission is granted, since the sink cannot tell the two calls apart.
-//
-// Without a sink (NewEncoderBuffer) there is nothing to hand a payload to and
-// the option has no effect.
-func WithPassThrough(granted bool) Option {
-	return func(l *limits) { l.passThrough = granted }
 }
 
 // clampLimit maps a caller-supplied limit to its internal form: a non-positive

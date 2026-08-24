@@ -156,64 +156,58 @@ func TestLazySequenceCommitReportsTheWriterFailure(t *testing.T) {
 	}
 }
 
-// Pass-through (§5.1) hands an oversized string straight to the writer instead
-// of copying it through the window. The three outcomes that path can have are
-// all contract: the payload arrives intact, a failing drain stops it before the
-// payload is offered, and a failing payload write is recorded.
-func TestPassThroughStringGoesStraightToTheWriter(t *testing.T) {
-	big := strings.Repeat("abcdefgh", 1024) // 8 KiB, past the window cap
+// stringCollector binds the first string field it is handed, copying it into
+// storage of its own as §6.7 requires of any caller that keeps a value.
+type stringCollector struct {
+	baseV
+	s string
+}
 
-	t.Run("delivered through Write when the writer has no WriteString", func(t *testing.T) {
+func (c *stringCollector) String(_ sofab.ID, v string) error { c.s = v; return nil }
+
+// An oversized string through the io.Writer form is a DIVISIBLE run copied
+// through the fixed scratch window, never handed to the writer directly
+// (§5.1.6). It must arrive intact, and a writer that refuses mid-run must leave
+// the encoder holding that error.
+func TestOversizedStringIsCopiedThroughTheWindow(t *testing.T) {
+	big := strings.Repeat("abcdefgh", 1024) // 8 KiB, twice the scratch window
+
+	t.Run("delivered intact through a plain Write", func(t *testing.T) {
 		w := &plainWriter{}
-		e := sofab.NewEncoder(w, sofab.WithPassThrough(true))
+		e := sofab.NewEncoder(w)
 		if err := e.WriteString(1, big); err != nil {
 			t.Fatalf("WriteString = %v, want nil", err)
 		}
 		if err := e.Flush(); err != nil {
 			t.Fatalf("Flush = %v, want nil", err)
 		}
-		d := sofab.NewDecoder(bytes.NewReader(w.buf))
-		if _, err := d.Next(); err != nil {
-			t.Fatalf("Next: %v", err)
+		var got stringCollector
+		if err := sofab.AcceptBytes(w.buf, &got); err != nil {
+			t.Fatalf("AcceptBytes: %v", err)
 		}
-		got, err := d.String()
-		if err != nil {
-			t.Fatalf("String: %v", err)
-		}
-		if got != big {
-			t.Errorf("payload round-trip differs: %d bytes, want %d", len(got), len(big))
+		if got.s != big {
+			t.Errorf("payload round-trip differs: %d bytes, want %d", len(got.s), len(big))
 		}
 	})
 
-	t.Run("a failing drain stops before the payload", func(t *testing.T) {
+	t.Run("a failing write stops the run", func(t *testing.T) {
 		w := &plainWriter{err: errSinkRefused}
-		e := sofab.NewEncoder(w, sofab.WithPassThrough(true))
+		e := sofab.NewEncoder(w)
 		if err := e.WriteString(1, big); !errors.Is(err, errSinkRefused) {
 			t.Fatalf("WriteString = %v, want the writer's error", err)
 		}
 		if len(w.buf) != 0 {
-			t.Errorf("writer received %d bytes despite refusing the drain", len(w.buf))
-		}
-	})
-
-	t.Run("a failing payload write is recorded", func(t *testing.T) {
-		w := &plainWriter{err: errSinkRefused, ok: 1} // the drain succeeds, the payload does not
-		e := sofab.NewEncoder(w, sofab.WithPassThrough(true))
-		if err := e.WriteString(1, big); !errors.Is(err, errSinkRefused) {
-			t.Fatalf("WriteString = %v, want the writer's error", err)
-		}
-		if w.calls < 2 {
-			t.Errorf("writer saw %d calls, want the drain and then the payload", w.calls)
+			t.Errorf("writer kept %d bytes despite refusing the write", len(w.buf))
 		}
 	})
 }
 
-// The blob twin of the above: an oversized blob is offered to the writer whole,
-// and a refusal there is the encoder's error.
-func TestPassThroughBlobWriteErrorIsSticky(t *testing.T) {
+// The blob twin of the above: an oversized blob is split across writes, and a
+// refusal is the encoder's sticky error.
+func TestOversizedBlobWriteErrorIsSticky(t *testing.T) {
 	big := bytes.Repeat([]byte{0xAB}, 8192)
 	w := &plainWriter{err: errSinkRefused, ok: 1}
-	e := sofab.NewEncoder(w, sofab.WithPassThrough(true))
+	e := sofab.NewEncoder(w)
 	if err := e.WriteBytes(1, big); !errors.Is(err, errSinkRefused) {
 		t.Fatalf("WriteBytes = %v, want the writer's error", err)
 	}
@@ -222,10 +216,10 @@ func TestPassThroughBlobWriteErrorIsSticky(t *testing.T) {
 	}
 }
 
-// A string payload is a DIVISIBLE run (§5.1): with a caller-supplied buffer and
-// a sink, a string far larger than the buffer must stream through it in pieces
-// and reassemble byte-for-byte on the far side. Pass-through is OFF here, which
-// is what forces the split rather than a handover.
+// A string payload is a DIVISIBLE run (§5.1.3): with a caller-supplied buffer
+// and a sink, a string far larger than the buffer must stream through it in
+// pieces and reassemble byte-for-byte on the far side. §5.1.6 leaves no other
+// route, so the split is the only path there is.
 func TestStringStreamsThroughASmallSinkBuffer(t *testing.T) {
 	payload := strings.Repeat("sofabuffers-", 40) // ~480 bytes through 32
 	var out []byte

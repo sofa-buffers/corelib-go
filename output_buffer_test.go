@@ -434,10 +434,12 @@ func TestCopyingSink(t *testing.T) {
 	}
 }
 
-// TestNoForeignMemoryWithoutPermission is §7.2 item 4's fourth encode bullet: a
-// sink that was not granted pass-through never receives memory outside the
-// installed buffer, however large the payload.
-func TestNoForeignMemoryWithoutPermission(t *testing.T) {
+// TestNoForeignMemory is §7.2 item 4's fourth encode bullet: a sink NEVER
+// receives memory outside the installed buffer, however large the payload.
+// Pass-through is forbidden (§5.1.6) — "there is no permission flag to set and
+// no exemption to claim" — so this holds unconditionally, on every flush of
+// every message.
+func TestNoForeignMemory(t *testing.T) {
 	blob := bytes.Repeat([]byte{0x31, 0x41, 0x59, 0x26}, 4096) // 16 KiB
 	str := strings.Repeat("pass-through?", 1000)
 
@@ -445,7 +447,7 @@ func TestNoForeignMemoryWithoutPermission(t *testing.T) {
 	var got bytes.Buffer
 	e, err := sofab.NewEncoderSink(buf, 0, func(_ *sofab.Encoder, b []byte) error {
 		if !withinBuffer(buf, b) {
-			t.Fatalf("sink was handed foreign memory without the pass-through permission")
+			t.Fatalf("sink was handed memory outside the installed buffer (§5.1.6)")
 		}
 		got.Write(b)
 		return nil
@@ -471,117 +473,24 @@ func TestNoForeignMemoryWithoutPermission(t *testing.T) {
 	}
 }
 
-// TestPassThroughGranted: with the permission, a payload the caller already
-// holds contiguously may reach the sink directly — after the buffered bytes, so
-// wire order is unchanged.
-func TestPassThroughGranted(t *testing.T) {
-	blob := bytes.Repeat([]byte{0x31, 0x41, 0x59, 0x26}, 4096) // 16 KiB
-
-	buf := make([]byte, 64)
-	var got bytes.Buffer
-	foreign := 0
-	e, err := sofab.NewEncoderSink(buf, 0, func(_ *sofab.Encoder, b []byte) error {
-		if !withinBuffer(buf, b) {
-			foreign++
-		}
-		got.Write(b)
-		return nil
-	}, sofab.WithPassThrough(true))
-	if err != nil {
-		t.Fatalf("NewEncoderSink: %v", err)
-	}
-	e.WriteUnsigned(0, 1)
-	e.WriteBytes(1, blob)
-	if err := e.Flush(); err != nil {
-		t.Fatalf("flush: %v", err)
-	}
-	if foreign == 0 {
-		t.Fatalf("pass-through granted but the payload was still copied through the buffer")
-	}
-
-	var want bytes.Buffer
-	ref := sofab.NewEncoder(&want)
-	ref.WriteUnsigned(0, 1)
-	ref.WriteBytes(1, blob)
-	if err := ref.Flush(); err != nil {
-		t.Fatalf("reference flush: %v", err)
-	}
-	if !bytes.Equal(got.Bytes(), want.Bytes()) {
-		t.Fatalf("pass-through output differs from one-shot")
-	}
-}
-
-// TestPassThroughExcludesBufferSet: pass-through and taking the buffer are
-// mutually exclusive (§5.1), and the port rejects the buffer-set call.
-func TestPassThroughExcludesBufferSet(t *testing.T) {
-	buf := make([]byte, 64)
-	var setErr error
-	e, err := sofab.NewEncoderSink(buf, 0, func(enc *sofab.Encoder, b []byte) error {
-		setErr = enc.SetBuffer(make([]byte, 64), 0)
-		return nil
-	}, sofab.WithPassThrough(true))
-	if err != nil {
-		t.Fatalf("NewEncoderSink: %v", err)
-	}
-	e.WriteBytes(1, bytes.Repeat([]byte{7}, 4096))
-	e.Flush()
-	if !errors.Is(setErr, sofab.ErrArgument) {
-		t.Fatalf("SetBuffer under a pass-through grant = %v, want ErrArgument", setErr)
-	}
-
-	// The io.Writer form has no caller-supplied buffer to install either.
+// TestIOWriterFormRejectsBufferSet: the io.Writer form has no caller-supplied
+// buffer to replace, so installing one is ErrArgument.
+func TestIOWriterFormRejectsBufferSet(t *testing.T) {
 	we := sofab.NewEncoder(&bytes.Buffer{})
 	if err := we.SetBuffer(make([]byte, 64), 0); !errors.Is(err, sofab.ErrArgument) {
 		t.Fatalf("SetBuffer on the io.Writer form = %v, want ErrArgument", err)
 	}
 }
 
-// TestPassThroughStringStillCopied documents this port's choice on the string
-// half of §5.1's pass-through allowance: a Sink takes a []byte, and converting a
-// Go string to one is the very copy pass-through exists to avoid, so a string is
-// written through the buffer even under the permission. Conformant either way —
-// the bytes are identical — but the sink must never see foreign memory it was
-// not told about, so this asserts it does not.
-func TestPassThroughStringStillCopied(t *testing.T) {
-	s := strings.Repeat("sofa", 8192) // 32 KiB, far past the buffer
-
-	buf := make([]byte, 64)
-	var got bytes.Buffer
-	e, err := sofab.NewEncoderSink(buf, 0, func(_ *sofab.Encoder, b []byte) error {
-		if !withinBuffer(buf, b) {
-			t.Fatalf("string payload was handed to the sink as foreign memory")
-		}
-		got.Write(b)
-		return nil
-	}, sofab.WithPassThrough(true))
-	if err != nil {
-		t.Fatalf("NewEncoderSink: %v", err)
-	}
-	e.WriteString(1, s)
-	if err := e.Flush(); err != nil {
-		t.Fatalf("flush: %v", err)
-	}
-
-	var want bytes.Buffer
-	ref := sofab.NewEncoder(&want)
-	ref.WriteString(1, s)
-	if err := ref.Flush(); err != nil {
-		t.Fatalf("reference flush: %v", err)
-	}
-	if !bytes.Equal(got.Bytes(), want.Bytes()) {
-		t.Fatalf("string output differs from one-shot")
-	}
-}
-
-// passThroughWatcher is the io.Writer form's equivalent of withinBuffer: it
+// foreignWatcher is the io.Writer form's equivalent of withinBuffer: it
 // records whether the destination was ever handed the caller's own payload
 // instead of bytes copied through the encoder's window. It implements
-// io.StringWriter, which is the surface a passed-through string arrives on.
+// io.StringWriter, which is the surface a passed-through string would arrive on.
 //
 // A blob is caught by pointer identity. A string that reaches Write instead
 // (after a []byte conversion) is caught by carrying the whole payload in one
 // call, which the copy path — bounded by the window — never does.
-type passThroughWatcher struct {
+type foreignWatcher struct {
 	out         bytes.Buffer
 	blob        []byte
 	str         string
@@ -589,7 +498,7 @@ type passThroughWatcher struct {
 	foreignStr  int
 }
 
-func (w *passThroughWatcher) Write(p []byte) (int, error) {
+func (w *foreignWatcher) Write(p []byte) (int, error) {
 	if len(p) != 0 && len(w.blob) != 0 && withinBuffer(w.blob, p) {
 		w.foreignBlob++
 	}
@@ -599,104 +508,55 @@ func (w *passThroughWatcher) Write(p []byte) (int, error) {
 	return w.out.Write(p)
 }
 
-func (w *passThroughWatcher) WriteString(s string) (int, error) {
+func (w *foreignWatcher) WriteString(s string) (int, error) {
 	if w.str != "" && s == w.str {
 		w.foreignStr++
 	}
 	return w.out.WriteString(s)
 }
 
-// passThroughMessage writes the message the two io.Writer-form pass-through
-// tests compare, and passThroughReference is its expected bytes, produced
+// foreignTestMessage writes the message the io.Writer-form no-foreign-memory
+// test compares, and foreignTestReference is its expected bytes, produced
 // through a sink-less caller-supplied buffer so the reference never travels the
 // path under test.
-func passThroughMessage(e *sofab.Encoder, blob []byte, str string) {
+func foreignTestMessage(e *sofab.Encoder, blob []byte, str string) {
 	e.WriteUnsigned(0, 1)
 	e.WriteBytes(1, blob)
 	e.WriteString(2, str)
 }
 
-func passThroughReference(t *testing.T, blob []byte, str string) []byte {
+func foreignTestReference(t *testing.T, blob []byte, str string) []byte {
 	t.Helper()
 	e, err := sofab.NewEncoderBuffer(make([]byte, len(blob)+len(str)+64), 0)
 	if err != nil {
 		t.Fatalf("NewEncoderBuffer: %v", err)
 	}
-	passThroughMessage(e, blob, str)
+	foreignTestMessage(e, blob, str)
 	if err := e.Flush(); err != nil {
 		t.Fatalf("reference flush: %v", err)
 	}
 	return e.Bytes()
 }
 
-// TestIOWriterNoForeignMemoryWithoutPermission is the §7.2 item 4 "no foreign
-// memory without permission" bullet for the io.Writer form: pass-through is off
-// by default there too (§5.1 — "a sink that was not told it may receive foreign
-// memory never does"), so however large the payload, the destination only ever
-// sees bytes copied through the encoder's own window.
-func TestIOWriterNoForeignMemoryWithoutPermission(t *testing.T) {
+// TestIOWriterNoForeignMemory is §7.2 item 4's "no foreign memory, ever" bullet
+// for the io.Writer form: however large the payload, the destination only ever
+// sees bytes copied through the encoder's own scratch window (§5.1.6).
+func TestIOWriterNoForeignMemory(t *testing.T) {
 	blob := bytes.Repeat([]byte{0x31, 0x41, 0x59, 0x26}, 4096) // 16 KiB
 	str := strings.Repeat("pass-through?", 2000)               // 26 KiB
 
-	w := &passThroughWatcher{blob: blob, str: str}
+	w := &foreignWatcher{blob: blob, str: str}
 	e := sofab.NewEncoder(w)
-	passThroughMessage(e, blob, str)
+	foreignTestMessage(e, blob, str)
 	if err := e.Flush(); err != nil {
 		t.Fatalf("flush: %v", err)
 	}
 	if w.foreignBlob != 0 || w.foreignStr != 0 {
-		t.Fatalf("io.Writer was handed the caller's payload without the pass-through permission (blob %d, string %d)",
+		t.Fatalf("io.Writer was handed the caller's own payload (blob %d, string %d); §5.1.6 forbids it",
 			w.foreignBlob, w.foreignStr)
 	}
-	if !bytes.Equal(w.out.Bytes(), passThroughReference(t, blob, str)) {
+	if !bytes.Equal(w.out.Bytes(), foreignTestReference(t, blob, str)) {
 		t.Fatalf("copied-payload output differs from the reference")
-	}
-}
-
-// TestIOWriterPassThroughGranted: granted explicitly, the io.Writer form hands
-// both payload kinds over directly — a Go string already holds its UTF-8 wire
-// bytes, so §5.1 permits it here where a []byte-taking Sink cannot — and the
-// bytes are unchanged either way.
-func TestIOWriterPassThroughGranted(t *testing.T) {
-	blob := bytes.Repeat([]byte{0x31, 0x41, 0x59, 0x26}, 4096) // 16 KiB
-	str := strings.Repeat("pass-through?", 2000)               // 26 KiB
-
-	w := &passThroughWatcher{blob: blob, str: str}
-	e := sofab.NewEncoder(w, sofab.WithPassThrough(true))
-	passThroughMessage(e, blob, str)
-	if err := e.Flush(); err != nil {
-		t.Fatalf("flush: %v", err)
-	}
-	if w.foreignBlob == 0 {
-		t.Fatalf("pass-through granted but the blob was still copied through the window")
-	}
-	if w.foreignStr == 0 {
-		t.Fatalf("pass-through granted but the string was still copied through the window")
-	}
-	if !bytes.Equal(w.out.Bytes(), passThroughReference(t, blob, str)) {
-		t.Fatalf("pass-through output differs from the reference")
-	}
-}
-
-// TestSinkErrorDuringPassThrough: a sink that fails while being handed a
-// passed-through payload still leaves the encoder with that sticky error.
-func TestSinkErrorDuringPassThrough(t *testing.T) {
-	boom := errors.New("transport gone")
-	calls := 0
-	e, err := sofab.NewEncoderSink(make([]byte, 64), 0, func(_ *sofab.Encoder, b []byte) error {
-		calls++
-		if calls == 1 { // the drain that orders the payload behind the buffered bytes
-			return nil
-		}
-		return boom
-	}, sofab.WithPassThrough(true))
-	if err != nil {
-		t.Fatalf("NewEncoderSink: %v", err)
-	}
-	e.WriteUnsigned(0, 1)
-	e.WriteBytes(1, bytes.Repeat([]byte{9}, 4096))
-	if err := e.Flush(); !errors.Is(err, boom) {
-		t.Fatalf("flush = %v, want the sink error", err)
 	}
 }
 

@@ -20,8 +20,10 @@ import (
 //   - NewEncoderSink — a caller-supplied buffer plus a flush sink, handed the
 //     accumulated bytes whenever the buffer fills. The sink may install a
 //     replacement buffer with SetBuffer (the zero-copy handover).
-//   - NewEncoder — an io.Writer, the idiomatic Go convenience form. It is the
-//     only one that allocates a buffer of its own.
+//   - NewEncoder — an io.Writer, the idiomatic Go convenience form. It is a
+//     helper in the sense of CORELIB_PLAN §6.6.1: it sizes a fixed scratch
+//     window once, at construction, and then drives the codec over it exactly
+//     as an external caller would. The codec never grows or resizes it.
 //
 // An Encoder is not safe for concurrent use, and a sink must not write fields
 // through the Encoder it is called from.
@@ -35,11 +37,11 @@ type Encoder struct {
 	// integer bump, with one capacity test per field rather than per byte, and
 	// never rewrites the slice header (so no write-barrier check either).
 	//
-	// A caller-supplied buffer is never grown or reallocated (§5.1): it drains to
-	// the sink, or reports ErrBufferFull when there is none. The window of the
-	// io.Writer form (owned) grows once, from encBufInit straight to
-	// flushThreshold, and then stops: past that it is drained to w instead, which
-	// is what keeps memory bounded and preserves mid-stream flushing.
+	// No output buffer is ever grown or reallocated (§5.1.2, §6.6): a
+	// caller-supplied buffer drains to its sink or reports ErrBufferFull when
+	// there is none, and the io.Writer form's scratch window is sized once at
+	// construction (encWindow) and drained to w when it fills. No wire number
+	// sizes any of it, on any path, after construction.
 	buf []byte
 	n   int
 	// start is where the bytes accumulated since the current installation begin:
@@ -49,25 +51,19 @@ type Encoder struct {
 	start int
 	err   error
 	depth int
-	// owned marks buf as this package's own window (the io.Writer form), the one
-	// buffer an Encoder may grow. A caller-supplied buffer never is.
-	owned bool
-	// passThrough is the caller's permission to hand a string/blob run to the
-	// sink directly instead of copying it through the output buffer (§5.1). It is
-	// off for every encoder form unless WithPassThrough(true) granted it: a
-	// destination that was not told it may receive foreign memory never does.
-	passThrough bool
 	// installed records that the sink called SetBuffer during the flush it is
 	// currently in — i.e. that it took the buffer and replaced it, rather than
 	// copying and returning (§5.1). drain clears it before every sink call.
 	installed bool
 	// staged is the exact-fit tail path of a sink-less caller-supplied buffer (see
-	// stage), nil unless the encoder has entered it. It hangs off a pointer rather
-	// than sitting in the struct because it is dead weight for every other form:
-	// the io.Writer window and the sink can never enter it, yet its ~60 bytes made
-	// every Encoder that much larger to allocate, zero and GC-scan. Entering it
-	// costs one allocation, on a path that has already run out of caller buffer.
-	staged *stagedTail
+	// stage); staging says whether the encoder has entered it. It is bounded
+	// working state — its scratch is MinOutputBuffer bytes, a constant of the
+	// specification, and no wire number sizes it — so §6.6 requires it to be
+	// sized at construction. It therefore sits IN the Encoder rather than hanging
+	// off a pointer: hanging it off one cost an allocation on a write path, which
+	// is exactly what §6.6 forbids, and saved ~60 bytes per Encoder.
+	staged  stagedTail
+	staging bool
 	// pending holds the ids of the innermost open sequences whose header has not
 	// been written yet (WriteSequenceBeginLazy, MESSAGE_SPEC §2). It is always a
 	// contiguous suffix of the open sequences — writing any field commits the
@@ -75,13 +71,15 @@ type Encoder struct {
 	// last entry. It is truncated, never released, so its backing array is reused
 	// for the encoder's lifetime; MaxDepth bounds it at 255 entries.
 	//
-	// It starts out backed by pendingInline, so the common nesting depth costs no
-	// allocation at all; append() spills it to the heap on its own for a schema
-	// that nests deeper, with no eager-framing fallback to get wrong. (The
-	// self-reference means an Encoder must be used through the *Encoder that
-	// NewEncoder returns, never copied by value — which is already the API.)
+	// It is backed by pendingInline, which is sized to the FULL MaxDepth at
+	// construction (§6.0.1: "at most MAX_DEPTH ids, sized at construction"), so
+	// append() can never spill it to the heap: WriteSequenceBeginLazy refuses to
+	// open sequence MaxDepth+1, so len(pending) <= MaxDepth always. Growing it on
+	// a write path was the §6.6 violation this replaced. (The self-reference means
+	// an Encoder must be used through the *Encoder that NewEncoder returns, never
+	// copied by value — which is already the API.)
 	pending       []ID
-	pendingInline [lazySeqInline]ID
+	pendingInline [MaxDepth]ID
 	lim           limits
 }
 
@@ -94,15 +92,6 @@ type stagedTail struct {
 	start   int
 	scratch [MinOutputBuffer]byte
 }
-
-// lazySeqInline is how many held-back sequence ids fit in the Encoder itself
-// before the pending run has to spill to the heap. Not a wire-format or API
-// limit — nesting deeper still works and still produces canonical bytes, it just
-// allocates once. Sized for the depth real schemas nest to, not for MaxDepth:
-// every Encoder pays this array's bytes on every allocation, so a value that
-// covers the realistic case and lets append() handle the rest is the cheaper
-// trade.
-const lazySeqInline = 8
 
 // MinOutputBuffer is the smallest output buffer this package accepts for
 // streaming (CORELIB_PLAN §5.1): buflen-offset must be at least this many bytes
@@ -141,35 +130,30 @@ const MinOutputBuffer = 2 * maxVarintLen
 // other, which is how a sink re-arms a start offset and gets framing-header room
 // in every flushed unit.
 //
-// With the pass-through permission granted (WithPassThrough) the callback may
-// also be handed a string/blob payload that is not the output buffer at all.
-// That memory is borrowed for the duration of the call and must not be retained;
-// such a call is not a buffer handover, and SetBuffer is rejected under the
-// permission (§5.1).
+// A sink is only ever handed memory inside the installed output buffer. There is
+// no second case to handle: pass-through of a string or blob payload is
+// forbidden (§5.1.6), with no permission that reinstates it.
 type Sink func(e *Encoder, b []byte) error
 
-// NewEncoder returns an Encoder writing to w, allocating a small window of its
-// own. It is the idiomatic Go convenience form, layered on the caller-supplied
-// buffer model below; NewEncoderBuffer / NewEncoderSink are the forms in which
-// the caller owns the storage (§5.1).
+// NewEncoder returns an Encoder writing to w through a scratch window it sizes
+// once, here, at construction. It is the idiomatic Go convenience form, layered
+// on the caller-supplied buffer model below; NewEncoderBuffer / NewEncoderSink
+// are the forms in which the caller hands the storage in.
 //
-// Of the shared Options only WithStrictUTF8 and WithPassThrough affect encoding
-// (the SOFAB_STRICT_UTF8 policy, §6.4, default ON); the receiver-side cap
-// options (WithMaxArrayCount, WithMaxStringLen, WithMaxBlobLen) are decode-only
-// and are accepted but ignored here.
+// The window is encWindow bytes and is NEVER grown or reallocated: a message
+// larger than it drains to w repeatedly, exactly as a caller-supplied buffer
+// drains to its sink. That is what keeps §5.1.2 and §6.6 true of this form —
+// no wire number sizes any storage the encoder holds, and nothing after
+// construction allocates. §6.6.1 names this shape a helper: sizing a scratch
+// once and driving the codec over it is the caller's act, and here the
+// constructor performs it on the caller's behalf.
 //
-// Pass-through of a string/blob payload larger than the window (§5.1) is OFF
-// here as it is everywhere: w is a sink like any other, and §5.1 makes the
-// permission the caller's to give rather than the constructor's to assume — an
-// io.Writer whose Write is handed the caller's own payload is still handed
-// memory it was never told to expect, even though io.Writer's contract forbids
-// retaining it. Pass WithPassThrough(true) to grant it; the bytes are identical
-// either way. This form is the one where granting it costs nothing extra, since
-// the window is this package's and no sink can take it, so the rule that
-// pass-through excludes SetBuffer takes nothing away here.
+// Of the shared Options only WithStrictUTF8 affects encoding (the
+// SOFAB_STRICT_UTF8 policy, §6.4, default ON); the receiver-side cap options
+// (WithMaxArrayCount, WithMaxStringLen, WithMaxBlobLen) are decode-only and are
+// accepted but ignored here.
 func NewEncoder(w io.Writer, opts ...Option) *Encoder {
-	e := &Encoder{w: w, buf: make([]byte, encBufInit), owned: true, lim: newLimits(opts)}
-	e.passThrough = e.lim.passThrough
+	e := &Encoder{w: w, buf: make([]byte, encWindow), lim: newLimits(opts)}
 	e.pending = e.pendingInline[:0]
 	return e
 }
@@ -201,8 +185,7 @@ func NewEncoderBuffer(buf []byte, offset int, opts ...Option) (*Encoder, error) 
 // MinOutputBuffer — a buffer installed with a sink is rejected here, where it is
 // handed over, rather than partway through a message — and sink must be non-nil.
 //
-// Pass-through (WithPassThrough(true)) is OFF by default: without it the sink is
-// only ever handed memory inside the installed buffer.
+// The sink is only ever handed memory inside the installed buffer (§5.1.6).
 func NewEncoderSink(buf []byte, offset int, sink Sink, opts ...Option) (*Encoder, error) {
 	if sink == nil || offset < 0 || offset > len(buf) || len(buf)-offset < MinOutputBuffer {
 		return nil, ErrArgument
@@ -214,7 +197,6 @@ func NewEncoderSink(buf []byte, offset int, sink Sink, opts ...Option) (*Encoder
 // constructors, once their arguments have been checked.
 func newBufferEncoder(buf []byte, offset int, sink Sink, opts []Option) *Encoder {
 	e := &Encoder{sink: sink, buf: buf, n: offset, start: offset, lim: newLimits(opts)}
-	e.passThrough = sink != nil && e.lim.passThrough
 	e.pending = e.pendingInline[:0]
 	return e
 }
@@ -232,11 +214,10 @@ func newBufferEncoder(buf []byte, offset int, sink Sink, opts []Option) *Encoder
 //
 // It is rejected with ErrArgument, without installing anything, when:
 // offset lies outside buf; a sink is installed and len(buf)-offset is below
-// MinOutputBuffer; the encoder is the io.Writer form, whose window is not the
-// caller's to replace; or the pass-through permission is granted, since a sink
-// that may be handed foreign memory must never take a buffer (§5.1).
+// MinOutputBuffer; or the encoder is the io.Writer form, whose scratch window is
+// not the caller's to replace.
 func (e *Encoder) SetBuffer(buf []byte, offset int) error {
-	if e.owned || e.passThrough || offset < 0 || offset > len(buf) ||
+	if e.w != nil || offset < 0 || offset > len(buf) ||
 		(e.sink != nil && len(buf)-offset < MinOutputBuffer) {
 		return e.rejectArgument()
 	}
@@ -244,7 +225,7 @@ func (e *Encoder) SetBuffer(buf []byte, offset int) error {
 		return e.err
 	}
 	e.buf, e.n, e.start = buf, offset, offset
-	e.staged = nil // a fresh buffer ends any staged tail
+	e.staging = false // a fresh buffer ends any staged tail
 	e.installed = true
 	return nil
 }
@@ -258,9 +239,9 @@ func (e *Encoder) SetBuffer(buf []byte, offset int) error {
 // stage), so a message whose tail did not fit sets ErrBufferFull here rather
 // than returning a short result silently. Check Err (or Flush) before using it.
 func (e *Encoder) Bytes() []byte {
-	if s := e.staged; s != nil {
+	if e.staging {
 		e.spill()
-		return s.dst[s.start:s.n]
+		return e.staged.dst[e.staged.start:e.staged.n]
 	}
 	return e.buf[e.start:e.n]
 }
@@ -278,7 +259,7 @@ func (e *Encoder) Flush() error {
 		return e.err
 	}
 	if e.w == nil && e.sink == nil {
-		if e.staged != nil {
+		if e.staging {
 			e.spill()
 		}
 		return e.err
@@ -295,17 +276,19 @@ func (e *Encoder) setErr(err error) {
 	}
 }
 
-// flushThreshold bounds how large the internal buffer grows before it is
-// written out mid-stream. It mirrors bufio's capacity-triggered flush: small
+// encWindow is the size of the scratch window NewEncoder installs for the
+// io.Writer form. It is FIXED — sized once in the constructor and never grown
+// (§5.1.2, §6.6) — and mirrors bufio's default for the same reason: small
 // messages accumulate and go out in a single Write on Flush, while a large
-// message (or a big blob) drives the destination multiple times and surfaces a
-// write error immediately rather than only at Flush.
-const flushThreshold = 4096
-
-// encBufInit is the initial window size. Most messages are small, so the
-// encoder starts here and doubles on demand rather than committing
-// flushThreshold bytes to every Encoder that will never need them.
-const encBufInit = 512
+// message (or a big blob) drives the destination repeatedly and surfaces a write
+// error immediately rather than only at Flush.
+//
+// It was 512 growing to 4096 on demand, which allocated on a write path — the
+// grow was one allocation plus a copy of everything written so far, and its size
+// came from the message. Committing the 4096 at construction removes both, at
+// the cost of that much per Encoder whether or not a message needs it. An
+// Encoder is meant to outlive one message; §6.6 puts the cost where it can.
+const encWindow = 4096
 
 // room reports whether k bytes can be written at the current position, making
 // space if not: it grows the window while that is still allowed, and otherwise
@@ -327,61 +310,31 @@ func (e *Encoder) room(k int) bool {
 // go:noinline is load-bearing, not a hint: inlined, its body pushes room past
 // the inline budget and the fast path becomes a call again.
 //
+// No buffer is ever grown here — not the caller's, and not the io.Writer form's
+// scratch window (§5.1.2, §6.6). Every path is drain-and-write-on, or the
+// exact-fit tail of a sink-less buffer.
+//
 //go:noinline
 func (e *Encoder) makeRoom(k int) bool {
 	if e.err != nil {
 		return false
 	}
-	if !e.owned {
-		// A caller-supplied buffer is never grown or reallocated (§5.1): drain it
-		// and write on into it. MinOutputBuffer is what guarantees the retry
-		// succeeds for a sink-installed buffer, since k never exceeds it.
-		if e.sink == nil {
-			return e.stage(k)
-		}
-		if !e.drain() {
-			return false
-		}
-		if len(e.buf)-e.n >= k {
-			return true
-		}
-		e.err = ErrBufferFull
-		return false
+	// Nowhere to drain to: the sink-less caller-supplied buffer, whose tail is
+	// produced exactly (see stage).
+	if e.w == nil && e.sink == nil {
+		return e.stage(k)
 	}
-	// Grow first while the window is still below the threshold: a small message
-	// then accumulates entirely and leaves in a single Write on Flush, exactly
-	// as the append-based buffer did.
-	//
-	// The growth is ONE STEP to the cap, not a doubling ladder. A message that
-	// outgrows the initial window has already shown it is not a small message, and
-	// each rung of the ladder cost an allocation plus a copy of everything written
-	// so far — encoding a 1000-element u64 array climbed 512→1024→2048→4096 and
-	// paid four of each. The cap is untouched, so the ceiling on memory is
-	// untouched: the window still never exceeds flushThreshold for a message that
-	// fits it, and past that it drains to w rather than growing.
-	if len(e.buf) < flushThreshold && len(e.buf)-e.n < k {
-		grown := make([]byte, flushThreshold)
-		copy(grown, e.buf[:e.n])
-		e.buf = grown
-		if len(e.buf)-e.n >= k {
-			return true
-		}
-	}
-	// At the cap and still too tight: drain, which is the mid-stream flush.
+	// Drain and write on into the same storage. The retry always succeeds: k
+	// never exceeds MinOutputBuffer (see writeHeaderRoom), which a sink-installed
+	// buffer is required to hold and which encWindow far exceeds.
 	if !e.drain() {
 		return false
 	}
-	// A single field wider than the whole window. putRaw routes anything past
-	// flushThreshold straight to the sink, so this only rounds a sub-threshold
-	// window up to the request.
-	if len(e.buf) < k {
-		size := len(e.buf)
-		for size < k {
-			size *= 2
-		}
-		e.buf = make([]byte, size)
+	if len(e.buf)-e.n >= k {
+		return true
 	}
-	return true
+	e.err = ErrBufferFull
+	return false
 }
 
 // drain hands the bytes accumulated since the current installation — buf[start:n]
@@ -446,10 +399,10 @@ func (e *Encoder) drain() bool {
 //
 //go:noinline
 func (e *Encoder) stage(k int) bool {
-	if e.staged == nil {
-		s := &stagedTail{dst: e.buf, n: e.n, start: e.start}
-		e.staged = s
-		e.buf, e.n, e.start = s.scratch[:], 0, 0
+	if !e.staging {
+		e.staged.dst, e.staged.n, e.staged.start = e.buf, e.n, e.start
+		e.staging = true
+		e.buf, e.n, e.start = e.staged.scratch[:], 0, 0
 		return true // k <= MinOutputBuffer == len(scratch), see writeHeaderRoom
 	}
 	return e.spill()
@@ -459,7 +412,7 @@ func (e *Encoder) stage(k int) bool {
 // do not fit. This is where a sink-less encode runs out of room, and it does so
 // on the bytes actually produced rather than on a reservation.
 func (e *Encoder) spill() bool {
-	s := e.staged
+	s := &e.staged
 	if e.n > len(s.dst)-s.n {
 		e.err = ErrBufferFull
 		return false
@@ -514,19 +467,6 @@ func (e *Encoder) putRawSlow(data []byte) {
 	if e.err != nil {
 		return
 	}
-	if e.passThrough && len(data) > e.passThroughFloor() {
-		e.putRawLarge(data)
-		return
-	}
-	if e.owned && len(data) <= flushThreshold {
-		// The window is this package's to grow, and a sub-threshold payload is
-		// what it grows for: one contiguous copy rather than a split run.
-		if !e.room(len(data)) {
-			return
-		}
-		e.n += copy(e.buf[e.n:], data)
-		return
-	}
 	for {
 		c := copy(e.buf[e.n:], data)
 		e.n += c
@@ -537,42 +477,6 @@ func (e *Encoder) putRawSlow(data []byte) {
 		if !e.makeRoom(1) {
 			return
 		}
-	}
-}
-
-// passThroughFloor is the payload size from which handing the run to the sink
-// beats copying it through the buffer: bigger than the buffer it would have to
-// cross. For the owned window that is its cap rather than its current size, so
-// growing the window stays the cheaper answer up to that point.
-func (e *Encoder) passThroughFloor() int {
-	if e.owned {
-		return flushThreshold
-	}
-	return len(e.buf)
-}
-
-// putRawLarge hands a payload to the sink directly instead of copying it through
-// the output buffer — the pass-through of §5.1, permitted here only because the
-// caller granted it. The buffered bytes are drained first, so what the sink
-// receives stays in wire order.
-//
-// The memory is borrowed for the duration of the call: this is not a buffer
-// handover, and SetBuffer is rejected while the permission is granted, so a sink
-// cannot mistake the payload for a buffer it may take.
-//
-//go:noinline
-func (e *Encoder) putRawLarge(data []byte) {
-	if !e.drain() {
-		return
-	}
-	if e.w != nil {
-		if _, err := e.w.Write(data); err != nil {
-			e.err = err
-		}
-		return
-	}
-	if err := e.sink(e, data); err != nil {
-		e.setErr(err)
 	}
 }
 
@@ -835,28 +739,14 @@ func (e *Encoder) putRawString(s string) {
 	e.putRawStringSlow(s)
 }
 
-// putRawStringSlow is the out-of-line half of putRawString. See putRawSlow,
-// whose structure it mirrors, with one difference: pass-through is offered only
-// to the io.Writer form. Go's string already holds the UTF-8 payload, so §5.1
-// permits handing it over — but a Sink takes a []byte, and converting the string
-// to one is the very copy pass-through exists to avoid, so a caller-supplied
-// buffer copies the payload through the buffer instead (§5.1 leaves the port
-// free to: the bytes are identical either way).
+// putRawStringSlow is the out-of-line half of putRawString, mirroring
+// putRawSlow: a string payload is a divisible run and is copied through the
+// output buffer, split across flushes when it does not fit. It is never handed
+// to the sink or the writer directly (§5.1.6).
 //
 //go:noinline
 func (e *Encoder) putRawStringSlow(s string) {
 	if e.err != nil {
-		return
-	}
-	if e.w != nil && e.passThrough && len(s) > flushThreshold {
-		e.putRawStringLarge(s)
-		return
-	}
-	if e.owned && len(s) <= flushThreshold {
-		if !e.room(len(s)) {
-			return
-		}
-		e.n += copy(e.buf[e.n:], s)
 		return
 	}
 	for {
@@ -869,26 +759,6 @@ func (e *Encoder) putRawStringSlow(s string) {
 		if !e.makeRoom(1) {
 			return
 		}
-	}
-}
-
-// putRawStringLarge is putRawLarge for a string. It prefers the writer's
-// WriteString (bytes.Buffer, strings.Builder, bufio.Writer all have one) so an
-// oversized payload still costs no []byte(s) copy.
-//
-//go:noinline
-func (e *Encoder) putRawStringLarge(s string) {
-	if !e.drain() {
-		return
-	}
-	var err error
-	if sw, ok := e.w.(io.StringWriter); ok {
-		_, err = sw.WriteString(s)
-	} else {
-		_, err = e.w.Write([]byte(s))
-	}
-	if err != nil {
-		e.err = err
 	}
 }
 

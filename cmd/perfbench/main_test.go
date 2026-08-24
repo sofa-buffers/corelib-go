@@ -480,7 +480,7 @@ func (c *capturingSink) fn(_ *sofab.Encoder, b []byte) error {
 	return nil
 }
 
-// The three encode: blob rows must all put the SAME message on the wire — the
+// The two encode: blob rows must both put the SAME message on the wire — the
 // rows differ in how the bytes get there, not in what they are.
 func TestBlobStreamingRowsProduceTheOneShotBytes(t *testing.T) {
 	makeBlob()
@@ -501,47 +501,29 @@ func TestBlobStreamingRowsProduceTheOneShotBytes(t *testing.T) {
 		t.Fatalf("one-shot encode is %d bytes, want %d", len(oneShot), blobEncoded)
 	}
 
-	for _, tc := range []struct {
-		name        string
-		opts        []sofab.Option
-		wantHandOff int // the largest single sink hand-over
-	}{
-		// Pass-through NOT granted: every byte is copied through the 4096-byte
-		// buffer, so no hand-over can exceed it. This is the required row.
-		{"streaming", nil, blobChunk},
-		// Granted: the payload reaches the sink directly (§5.1), so one call
-		// carries far more than the buffer holds. This is the optional row, and
-		// this assertion is what stops it from silently measuring the copy path.
-		{"passthrough", []sofab.Option{sofab.WithPassThrough(true)}, blobChunk + 1},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			cap := &capturingSink{}
-			e, err := sofab.NewEncoderSink(make([]byte, blobChunk), 0, cap.fn, tc.opts...)
-			if err != nil {
-				t.Fatalf("NewEncoderSink: %v", err)
-			}
-			if err := e.WriteBytes(1, blobSrc); err != nil {
-				t.Fatalf("WriteBytes: %v", err)
-			}
-			if err := e.Flush(); err != nil {
-				t.Fatalf("Flush: %v", err)
-			}
-			if !bytes.Equal(cap.got, oneShot) {
-				t.Errorf("%s wire bytes differ from the one-shot row (%d vs %d bytes)",
-					tc.name, len(cap.got), len(oneShot))
-			}
-			if tc.name == "streaming" {
-				if cap.largest > tc.wantHandOff {
-					t.Errorf("a hand-over of %d bytes exceeds the %d-byte buffer: "+
-						"the required streaming row must not pass through", cap.largest, tc.wantHandOff)
-				}
-				if cap.calls < 200 {
-					t.Errorf("only %d flushes for a megabyte through a %d-byte buffer", cap.calls, blobChunk)
-				}
-			} else if cap.largest < tc.wantHandOff {
-				t.Errorf("largest hand-over %d bytes: the pass-through row never left the buffer", cap.largest)
-			}
-		})
+	// Every byte is copied through the 4096-byte buffer, so no hand-over can
+	// exceed it: §5.1.6 forbids handing the sink anything outside the installed
+	// buffer, and this assertion is what pins that on the measured row.
+	cap := &capturingSink{}
+	e, err := sofab.NewEncoderSink(make([]byte, blobChunk), 0, cap.fn)
+	if err != nil {
+		t.Fatalf("NewEncoderSink: %v", err)
+	}
+	if err := e.WriteBytes(1, blobSrc); err != nil {
+		t.Fatalf("WriteBytes: %v", err)
+	}
+	if err := e.Flush(); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	if !bytes.Equal(cap.got, oneShot) {
+		t.Errorf("streaming wire bytes differ from the one-shot row (%d vs %d bytes)",
+			len(cap.got), len(oneShot))
+	}
+	if cap.largest > blobChunk {
+		t.Errorf("a hand-over of %d bytes exceeds the %d-byte buffer (§5.1.6)", cap.largest, blobChunk)
+	}
+	if cap.calls < 200 {
+		t.Errorf("only %d flushes for a megabyte through a %d-byte buffer", cap.calls, blobChunk)
 	}
 }
 
@@ -756,13 +738,13 @@ func TestBaseVisitorAcceptsEveryFieldKind(t *testing.T) {
 // contract rather than an editorial choice.
 var benchRowLabel = regexp.MustCompile(
 	`^(encode|decode): (u64 array \(1000\)|typical message|blob 1MB one-shot|` +
-		`blob 1MB streaming|blob 1MB passthrough|blob 1MB|composite skip-all|composite)$`)
+		`blob 1MB streaming|blob 1MB|composite skip-all|composite)$`)
 
 // benchRow is the full grammar the central harness matches each printed row
 // with, value included.
 var benchRow = regexp.MustCompile(
 	`^(encode|decode):\s+(u64 array \(1000\)|typical message|blob 1MB one-shot|` +
-		`blob 1MB streaming|blob 1MB passthrough|blob 1MB|composite skip-all|composite)\s+([\d.]+)$`)
+		`blob 1MB streaming|blob 1MB|composite skip-all|composite)\s+([\d.]+)$`)
 
 func TestWorkloadTableCoversTheSpecifiedDatasets(t *testing.T) {
 	want := []string{
@@ -770,7 +752,6 @@ func TestWorkloadTableCoversTheSpecifiedDatasets(t *testing.T) {
 		"encode: typical message",
 		"encode: blob 1MB one-shot",
 		"encode: blob 1MB streaming",
-		"encode: blob 1MB passthrough",
 		"encode: composite",
 		"decode: u64 array (1000)",
 		"decode: typical message",
