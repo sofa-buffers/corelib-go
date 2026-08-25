@@ -143,7 +143,13 @@ jobs:
         # Every package, not just the library: measuring `.` alone left the
         # perfbench command (the §10 bench/perf harness) out of the profile, so
         # it could rot untested while the badge stayed high.
-        run: go test -covermode=atomic -coverprofile=coverage.out ./...
+        #
+        # -coverpkg=./... attributes coverage to the packages under test, not the
+        # package the test lives in. The black-box suite moved out of the root
+        # into tests/; without this the library's own statements, now exercised
+        # only from a sibling package, would count as uncovered and the badge
+        # would collapse despite unchanged testing.
+        run: go test -covermode=atomic -coverprofile=coverage.out -coverpkg=./... ./...
 
       - name: Compute coverage badge data
         id: cov

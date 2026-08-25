@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -82,7 +83,7 @@ type vectorFile struct {
 // absence cannot be mistaken for coverage that exists.
 func loadVectors(t *testing.T) vectorFile {
 	t.Helper()
-	raw, err := os.ReadFile("assets/test_vectors.json")
+	raw, err := os.ReadFile(filepath.Join(repoRoot(t), "assets", "test_vectors.json"))
 	if err != nil {
 		t.Fatalf("read vectors: %v", err)
 	}

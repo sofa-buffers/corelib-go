@@ -10,6 +10,7 @@ package sofab_test
 import (
 	"bytes"
 	"os"
+	"path/filepath"
 	"testing"
 
 	sofab "github.com/sofa-buffers/corelib-go"
@@ -18,7 +19,7 @@ import (
 // readDoc reads a file the tests inspect as text (a Dockerfile, a script).
 func readDoc(t *testing.T, path string) string {
 	t.Helper()
-	src, err := os.ReadFile(path)
+	src, err := os.ReadFile(filepath.Join(repoRoot(t), path))
 	if err != nil {
 		t.Fatalf("read %s: %v", path, err)
 	}

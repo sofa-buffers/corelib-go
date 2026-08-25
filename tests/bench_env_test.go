@@ -47,7 +47,7 @@ var prereqGuard = regexp.MustCompile(`command -v ([A-Za-z0-9_.+-]+)`)
 func benchScripts(t *testing.T) map[string]string {
 	t.Helper()
 
-	paths, err := filepath.Glob(filepath.Join("bench", "*.sh"))
+	paths, err := filepath.Glob(filepath.Join(repoRoot(t), "bench", "*.sh"))
 	if err != nil {
 		t.Fatalf("glob bench/*.sh: %v", err)
 	}
