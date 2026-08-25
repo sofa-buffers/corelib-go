@@ -107,8 +107,8 @@ func (c *StringCheck) SetStringCheck(policy StringCheck) { *c = policy }
 // normative was reachable only by rebuilding with a different build tag — the
 // regeneration/rebuild the design exists to avoid (issue #82).
 //
-// Delivery mirrors the other optional visitor extension (SchemaBoundVisitor):
-// the type assertion is made at most once per scope, and only
+// Delivery is priced to be free where it is not used: the type assertion is
+// made at most once per scope, and only
 // where it can matter — at the first string field of that scope, so a visitor
 // that never sees a string never pays for the assertion. A nested sequence
 // visitor is its own scope and is handed the same policy when its first string

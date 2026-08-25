@@ -147,9 +147,10 @@ type Visitor interface {
 	// found) but nothing in it is delivered: no piece is reported, no element
 	// announced.
 	//
-	// The receiver caps (WithMaxStringLen and friends) do not fire inside a
-	// skipped scope: they bound what this consumer is handed, and it is handed
-	// nothing. Format ceilings still do, everywhere.
+	// Nothing inside a skipped scope is capped: a receiver cap (§6.2.1) lives in
+	// a destination callback, no callback fires here, and the section says the
+	// same from the other end — a cap bounds what this consumer is handed, and
+	// it is handed nothing. Format ceilings still fire, everywhere.
 	BeginSequence(id ID) (Visitor, error)
 	// EndSequence is called on that nested visitor once its scope closes, so a
 	// generated nested object can finalize itself.

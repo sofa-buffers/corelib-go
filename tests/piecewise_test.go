@@ -402,16 +402,10 @@ func TestDeclinedSubtreeDeliversNothing(t *testing.T) {
 		}
 	}
 
-	// The receiver caps stand down inside a declined scope: they bound what this
-	// consumer is handed, and it is handed nothing (§6.2.1).
-	if err := feedIn(msg, 1, &decliner{&pieceLog{}},
-		sofab.WithMaxStringLen(1), sofab.WithMaxArrayCount(1), sofab.WithMaxBlobLen(1)); err != nil {
-		t.Fatalf("caps fired inside a declined scope: %v", err)
-	}
-	// And they do fire outside one, on the same bytes.
-	if err := feedIn(msg, 1, &pieceLog{}, sofab.WithMaxStringLen(1)); !errors.Is(err, sofab.ErrLimitExceeded) {
-		t.Fatalf("cap outside a declined scope = %v, want ErrLimitExceeded", err)
-	}
+	// Nothing inside a declined scope is capped (§6.2.1: "A skipped field is
+	// never capped"), and it holds structurally rather than by a check: a
+	// receiver cap lives in a destination callback, and the assertion above is
+	// that no callback fires here at all.
 }
 
 // decliner forwards the top level to inner and declines every nested scope.

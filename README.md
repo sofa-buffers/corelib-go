@@ -241,7 +241,7 @@ Three decode behaviours are worth knowing before you write the callbacks:
   Check it in `ArrayUnsigned` / `ArraySigned` as the element goes past — that is
   what keeps a message INVALID rather than INCOMPLETE when the array behind the
   offending element is truncated.
-* **Receiver-side limits stop at a schema bound** (below).
+* **Receiver-side limits are yours to apply** (below).
 
 **A sub-tree you have no destination for is declined whole.** Return `nil` from
 `BeginSequence` and nothing under it is delivered and nothing under it is built,
@@ -259,32 +259,50 @@ func (m *Point) BeginSequence(id sofab.ID) (sofab.Visitor, error) {
 
 #### Receiver-side limits
 
-`WithMaxArrayCount` / `WithMaxStringLen` / `WithMaxBlobLen` cap what a decode
-will materialize from a size the *sender* chose. Exceeding one is
+`max_dyn_array_count` / `max_dyn_string_len` / `max_dyn_blob_len` cap what a
+decode will materialize from a size the *sender* chose. Exceeding one is
 `ErrLimitExceeded` — deployment policy, never `ErrInvalidMsg`, since the same
-bytes decode under a looser cap — and it is enforced at the count or length
-word, before any allocation.
+bytes decode under a looser cap.
 
-They apply to schema-**unbounded** fields only. Where the schema states a
-`count:`/`maxlen:`, that bound governs and its violation is `ErrInvalidMsg`.
-Only the schema knows which fields those are, so the destination says so, and
-saying so is a promise to enforce:
+**The decoder holds no cap and there is no option that gives it one.** The
+numbers belong to the layer that knows the schema and the deployment, so the
+*destination* applies them, at the count or length word, before any allocation.
+Where the schema states a `count:`/`maxlen:` that bound governs instead, and its
+violation is `ErrInvalidMsg`; the two are never both in play on one field.
+
+For a scalar or a native array that is your own callback, one `if` per arm:
 
 ```go
-// Generated code declares the bound ...
-func (m *Msg) SchemaBound(id sofab.ID, what sofab.BoundKind) bool {
-    return id == 4 && what == sofab.BoundArrayCount // schema: count: 10000
-}
-
-// ... and enforces it at the header, which is what replaces the cap.
 func (m *Msg) ArrayBegin(id sofab.ID, kind sofab.ArrayKind, count int) error {
-    if id == 4 && count > 10000 { return sofab.ErrInvalidMsg }
+    switch id {
+    case 4: // schema: count: 10000
+        if count > 10000 { return sofab.ErrInvalidMsg }
+    case 5: // schema declares no count
+        if count > maxDynArrayCount { return sofab.ErrLimitExceeded }
+    }
     return nil
 }
 ```
 
-A 5000-element array on field 4 then decodes even under
-`WithMaxArrayCount(1000)`, while every unbounded field stays capped.
+For a wrapper array the collector owns the whole thing, so the numbers are
+fields on it: `Cap`/`ElemMax` are the schema bounds and `RCap`/`RElemMax` the
+receiver caps beside them, with the matrix collectors adding `RowCount`/`RowCap`
+for a row's own element count. A schema field is non-positive when the schema
+declares none; the R field beside it is then consulted, and a non-positive R
+field falls back to `ARRAY_MAX` — the format ceiling, never "unlimited".
+
+```go
+&sofab.StringSeq{
+    Out: &m.Tags,
+    Cap: -1, ElemMax: -1, // schema declares neither
+    RCap: maxDynArrayCount, RElemMax: maxDynStringLen,
+}
+```
+
+A field the destination never binds — an unknown id, or a wire type that
+contradicts the schema — is capped by nothing, which is the point: it is walked,
+not materialized, so a decode that steps over an over-cap field it was never
+going to read stays complete.
 
 ### Deserialize stream
 
@@ -383,9 +401,10 @@ structs/unions or arrays arrives as a nested sequence whose child ids are the
 element indices, and rebuilding a slice from those events is the same code for
 every schema, so it lives here: `VisitorBase`, `StringSeq` / `BlobSeq` /
 `MessageSeq` / `NestedSeq`, the matrix collectors with `PlaceRow`, and
-`PayloadAcc` for the pieces a payload arrives in. The generator switches over in
-[generator#345](https://github.com/sofa-buffers/generator/issues/345); both
-spellings compile against this package meanwhile.
+`PayloadAcc` for the pieces a payload arrives in. Each takes its bounds as
+fields — the schema's `count:`/`maxlen:` and the receiver caps beside them (see
+[Receiver-side limits](#receiver-side-limits)) — so a corelib that knows no
+schema still applies the schema's numbers.
 
 ## Memory handling
 
@@ -453,7 +472,8 @@ when the array ends, so `StringSeq`/`BlobSeq`/`MessageSeq` grow their container
 as elements arrive — geometrically, via Go's `append`, so a sparse array does
 not cost O(n²) copies (`TestSequenceGrowthIsGeometric`). That is the one
 allocation shape where growth is correct, and it is deliberately outside the
-codec.
+codec. It is also why the receiver caps live on the collectors: a cap bounds an
+allocation, and this is the layer that makes one.
 
 ## Build & test
 

@@ -158,10 +158,8 @@ type Sink func(e *Encoder, b []byte) error
 // once and driving the codec over it is the caller's act, and here the
 // constructor performs it on the caller's behalf.
 //
-// Of the shared Options only WithStrictUTF8 affects encoding (the
-// SOFAB_STRICT_UTF8 policy, §6.4, default ON); the receiver-side cap options
-// (WithMaxArrayCount, WithMaxStringLen, WithMaxBlobLen) are decode-only and are
-// accepted but ignored here.
+// The one Option, WithStrictUTF8, is the SOFAB_STRICT_UTF8 policy (§6.4, default
+// ON) and applies here as on decode.
 func NewEncoder(w io.Writer, opts ...Option) *Encoder {
 	e := &Encoder{w: w, buf: make([]byte, encWindow), lim: newLimits(opts)}
 	e.pending = make([]ID, 0, MaxDepth)
