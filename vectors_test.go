@@ -390,7 +390,7 @@ func (v skipIDsV) Float64Array(id sofab.ID, x []float64) error {
 	return v.rec(id, evAF64(id, x))
 }
 
-func (v skipIDsV) BeginSequence(id sofab.ID) (sofab.Visitor, error) {
+func (v skipIDsV) BeginSequence(id sofab.ID) (any, error) {
 	if v.skip[uint32(id)] {
 		return nil, nil // decline the whole sub-tree
 	}
@@ -448,14 +448,14 @@ func TestVectorSkipIDs(t *testing.T) {
 
 		// All three entry points, plus a one-byte reader, so skipping is proven
 		// to resume across any read boundary.
-		runs := map[string]func(sofab.Visitor) error{
-			"AcceptBytes": func(vis sofab.Visitor) error { return sofab.AcceptBytes(raw, vis) },
-			"Accept":      func(vis sofab.Visitor) error { return newDec(raw).Accept(vis) },
-			"AcceptStream": func(vis sofab.Visitor) error {
-				return sofab.NewDecoder(bytes.NewReader(raw)).AcceptStream(vis)
+		runs := map[string]func(any) error{
+			"AcceptBytes": func(vis any) error { return acceptBytes(raw, vis) },
+			"Feed":        func(vis any) error { return feedIn(raw, 0, vis) },
+			"Feed/1-byte": func(vis any) error {
+				return feedIn(raw, 1, vis)
 			},
-			"AcceptStream/one-byte": func(vis sofab.Visitor) error {
-				return sofab.NewDecoder(iotest.OneByteReader(bytes.NewReader(raw))).AcceptStream(vis)
+			"FeedFrom/one-byte": func(vis any) error {
+				return feedFrom(iotest.OneByteReader(bytes.NewReader(raw)), 1, vis)
 			},
 		}
 		for name, run := range runs {
@@ -649,14 +649,14 @@ func TestVectorInvalidUTF8(t *testing.T) {
 
 			// Decode: the destination is where the check runs (§6.4.3).
 			bind := &bindStrV{id: id}
-			checkUTF8Decode(t, "visitor destination", sofab.AcceptBytes(wire, bind))
+			checkUTF8Decode(t, "visitor destination", acceptBytes(wire, bind))
 			if !utf8CheckCompiled && bind.got != string(payload) {
 				t.Fatalf("destination bound % X, want % X verbatim", bind.got, payload)
 			}
 
 			// A visitor with no destination for the id skips the payload, and a
 			// skip is never validated — in either build (§6.4).
-			if err := sofab.AcceptBytes(wire, &bindStrV{id: id + 1}); err != nil {
+			if err := acceptBytes(wire, &bindStrV{id: id + 1}); err != nil {
 				t.Fatalf("skipped payload = %v, want nil", err)
 			}
 		})

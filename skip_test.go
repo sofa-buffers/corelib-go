@@ -18,12 +18,12 @@ import (
 // what it must not change.
 //
 // Every case runs BOTH surfaces: AcceptBytes over a contiguous buffer and
-// AcceptStream over a reader, because the two have separate parse loops and a
+// Feed over a reader, because the two have separate parse loops and a
 // skip that worked on only one of them would be a divergence, not a feature.
-func bothPaths(t *testing.T, msg []byte, mk func() sofab.Visitor) (bufErr, streamErr error) {
+func bothPaths(t *testing.T, msg []byte, mk func() any) (bufErr, streamErr error) {
 	t.Helper()
-	bufErr = sofab.AcceptBytes(msg, mk())
-	streamErr = sofab.NewDecoder(bytes.NewReader(msg)).AcceptStream(mk())
+	bufErr = acceptBytes(msg, mk())
+	streamErr = feedIn(msg, 1, mk())
 	return
 }
 
@@ -48,7 +48,7 @@ func (d declining) Float32Array(sofab.ID, []float32) error { d.note("f32a"); ret
 func (d declining) Float64Array(sofab.ID, []float64) error { d.note("f64a"); return nil }
 func (d declining) EndSequence() error                     { d.note("end"); return nil }
 
-func (d declining) BeginSequence(id sofab.ID) (sofab.Visitor, error) {
+func (d declining) BeginSequence(id sofab.ID) (any, error) {
 	d.note("begin")
 	if id == d.declineID {
 		return nil, nil // no destination for this subtree
@@ -95,11 +95,11 @@ func TestNilBeginSequenceDeliversNothingFromTheSubtree(t *testing.T) {
 	msg := declinedSubtree(t)
 	for _, tc := range []struct {
 		name string
-		run  func(sofab.Visitor) error
+		run  func(any) error
 	}{
-		{"buffer", func(v sofab.Visitor) error { return sofab.AcceptBytes(msg, v) }},
-		{"stream", func(v sofab.Visitor) error {
-			return sofab.NewDecoder(bytes.NewReader(msg)).AcceptStream(v)
+		{"buffer", func(v any) error { return acceptBytes(msg, v) }},
+		{"stream", func(v any) error {
+			return feedIn(msg, 1, v)
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -123,7 +123,7 @@ func TestDecliningIsNotTheSameAsAcceptingAndIgnoring(t *testing.T) {
 	// declineID 99 matches nothing, so the same subtree IS taken: this is the
 	// control that shows the events above are absent because of the decline and
 	// not because the message lacks them.
-	if err := sofab.AcceptBytes(msg, declining{log: &log, declineID: 99}); err != nil {
+	if err := acceptBytes(msg, declining{log: &log, declineID: 99}); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
 	got := strings.Join(log, ",")
@@ -147,7 +147,7 @@ func (capped) SignedArray(sofab.ID, []int64) error    { return nil }
 func (capped) Float32Array(sofab.ID, []float32) error { return nil }
 func (capped) Float64Array(sofab.ID, []float64) error { return nil }
 func (capped) EndSequence() error                     { return nil }
-func (c capped) BeginSequence(id sofab.ID) (sofab.Visitor, error) {
+func (c capped) BeginSequence(id sofab.ID) (any, error) {
 	if id == c.declineID {
 		return nil, nil
 	}
@@ -168,14 +168,14 @@ func TestReceiverCapsStandDownInsideADeclinedSubtree(t *testing.T) {
 
 	lim := []sofab.Option{sofab.WithMaxStringLen(8)}
 
-	if err := sofab.AcceptBytes(msg, capped{declineID: 2}, lim...); err != nil {
+	if err := acceptBytes(msg, capped{declineID: 2}, lim...); err != nil {
 		t.Fatalf("a cap must not fire on a string inside a declined subtree: %v", err)
 	}
-	if err := sofab.NewDecoder(bytes.NewReader(msg), lim...).AcceptStream(capped{declineID: 2}); err != nil {
+	if err := feedFrom(bytes.NewReader(msg), 1, capped{declineID: 2}); err != nil {
 		t.Fatalf("stream: same, got %v", err)
 	}
 	// ...and the same bytes with the scope TAKEN are over the cap.
-	if err := sofab.AcceptBytes(msg, capped{declineID: 99}, lim...); !errors.Is(err, sofab.ErrLimitExceeded) {
+	if err := acceptBytes(msg, capped{declineID: 99}, lim...); !errors.Is(err, sofab.ErrLimitExceeded) {
 		t.Fatalf("a taken scope must still be capped, got %v", err)
 	}
 }
@@ -187,7 +187,7 @@ func TestFormatCeilingsStillApplyInsideADeclinedSubtree(t *testing.T) {
 	// 02  element id 0, fixlen
 	// 04  fixlen word: length 0, subtype 4 — reserved (§4.6)
 	msg := []byte{0x16, 0x02, 0x04}
-	bufErr, streamErr := bothPaths(t, msg, func() sofab.Visitor { return capped{declineID: 2} })
+	bufErr, streamErr := bothPaths(t, msg, func() any { return capped{declineID: 2} })
 	if !errors.Is(bufErr, sofab.ErrInvalidMsg) {
 		t.Fatalf("buffer: want ErrInvalidMsg, got %v", bufErr)
 	}
@@ -207,7 +207,7 @@ func TestTruncationInsideADeclinedSubtreeIsIncomplete(t *testing.T) {
 	full := out.Bytes()
 	truncated := full[:len(full)-1] // drop the sequence end
 
-	bufErr, streamErr := bothPaths(t, truncated, func() sofab.Visitor { return capped{declineID: 2} })
+	bufErr, streamErr := bothPaths(t, truncated, func() any { return capped{declineID: 2} })
 	if !errors.Is(bufErr, sofab.ErrIncomplete) {
 		t.Fatalf("buffer: want ErrIncomplete, got %v", bufErr)
 	}
@@ -259,21 +259,21 @@ type theOldWay struct{ noop }
 // scope, including nested ones, and drops everything.
 type takeAll struct{ noop }
 
-func (t takeAll) BeginSequence(sofab.ID) (sofab.Visitor, error) { return t, nil }
+func (t takeAll) BeginSequence(sofab.ID) (any, error) { return t, nil }
 
-func (t theOldWay) BeginSequence(sofab.ID) (sofab.Visitor, error) { return takeAll{}, nil }
+func (t theOldWay) BeginSequence(sofab.ID) (any, error) { return takeAll{}, nil }
 
 // theNewWay declines it.
 type theNewWay struct{ noop }
 
-func (theNewWay) BeginSequence(sofab.ID) (sofab.Visitor, error) { return nil, nil }
+func (theNewWay) BeginSequence(sofab.ID) (any, error) { return nil, nil }
 
 func BenchmarkDeclinedSubtreeOldWay(b *testing.B) {
 	msg := benchDeclinedPayload()
 	b.SetBytes(int64(len(msg)))
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		if err := sofab.AcceptBytes(msg, theOldWay{}); err != nil {
+		if err := acceptBytes(msg, theOldWay{}); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -284,7 +284,7 @@ func BenchmarkDeclinedSubtreeNewWay(b *testing.B) {
 	b.SetBytes(int64(len(msg)))
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		if err := sofab.AcceptBytes(msg, theNewWay{}); err != nil {
+		if err := acceptBytes(msg, theNewWay{}); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -295,10 +295,9 @@ func BenchmarkDeclinedSubtreeNewWay(b *testing.B) {
 // rejecting it, and that clause wins against the schema bound — so neither the
 // element's id nor its length may be measured against this array's.
 //
-// It reaches StringSeq.ArrayBegin / BlobSeq.ArrayBegin, which exist because the
-// decoder resolves both header hooks through one v.(HeaderVisitor) assertion:
-// implementing FixlenHeader alone would leave the assertion failing and silently
-// disable it. Nothing is judged in them, and this is what proves it.
+// It reaches StringSeq.ArrayBegin / BlobSeq.ArrayBegin, the arm that fires when
+// the element the wire carries is an ARRAY rather than the fixlen this collector
+// is for. Nothing is judged in them, and this is what proves it.
 func TestWrapperCollectorSkipsAMistypedElement(t *testing.T) {
 	var out bytes.Buffer
 	e := sofab.NewEncoder(&out)
@@ -325,7 +324,7 @@ func TestWrapperCollectorSkipsAMistypedElement(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			var ss []string
 			var bb [][]byte
-			if err := sofab.AcceptBytes(msg, tc.mk(&ss, &bb)); err != nil {
+			if err := acceptBytes(msg, tc.mk(&ss, &bb)); err != nil {
 				t.Fatalf("a mistyped element is skipped, not rejected (§7.3): %v", err)
 			}
 			if len(ss) != 0 || len(bb) != 0 {

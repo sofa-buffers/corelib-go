@@ -42,7 +42,7 @@ func TestUTF8ValidatorIsCompiledIn(t *testing.T) {
 	// The destination is where the check runs on decode (§6.4.3): a visitor
 	// that binds the id and calls the primitive rejects it.
 	in := strField(1, []byte{0xFF})
-	if err := sofab.AcceptBytes(in, &bindStrV{id: 1}); !errors.Is(err, sofab.ErrInvalidMsg) {
+	if err := acceptBytes(in, &bindStrV{id: 1}); !errors.Is(err, sofab.ErrInvalidMsg) {
 		t.Fatalf("bound invalid UTF-8 = %v, want ErrInvalidMsg", err)
 	}
 	var buf bytes.Buffer

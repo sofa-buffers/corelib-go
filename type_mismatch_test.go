@@ -73,11 +73,11 @@ func TestMistypedFieldIsSkippedAndTheDecodeStaysComplete(t *testing.T) {
 			var err error
 			switch s {
 			case "AcceptBytes":
-				err = sofab.AcceptBytes(in, v)
-			case "Accept":
-				err = newDec(in).Accept(v)
-			case "AcceptStream":
-				err = newDec(in).AcceptStream(v)
+				err = acceptBytes(in, v)
+			case "Feed":
+				err = feedIn(in, 0, v)
+			case "Feed/1-byte":
+				err = feedIn(in, 1, v)
 			}
 			if err != nil {
 				t.Fatalf("%s = %v, want COMPLETE (§7.3 is a skip, not a verdict)", s, err)
@@ -108,11 +108,11 @@ func TestMistypedFixlenSubtypeIsSkipped(t *testing.T) {
 			var derr error
 			switch s {
 			case "AcceptBytes":
-				derr = sofab.AcceptBytes(in, v)
-			case "Accept":
-				derr = newDec(in).Accept(v)
-			case "AcceptStream":
-				derr = newDec(in).AcceptStream(v)
+				derr = acceptBytes(in, v)
+			case "Feed":
+				derr = feedIn(in, 0, v)
+			case "Feed/1-byte":
+				derr = feedIn(in, 1, v)
 			}
 			if derr != nil {
 				t.Fatalf("%s = %v, want COMPLETE", s, derr)

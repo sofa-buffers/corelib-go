@@ -24,9 +24,9 @@ type malformedCase struct {
 // "malformed input" and "truncation" obligations of CORELIB_PLAN §7.2 (items 5
 // and 6). Every decode surface reaches the same three-valued verdict on the same
 // bytes (§5.2), so the table is declared once here and driven through each
-// surface by runMalformedCases: the cursor path (Decoder.Accept and the zero-copy
+// surface by runMalformedCases: the cursor path (Decoder.Feed and the zero-copy
 // AcceptBytes) in TestVisitorMalformed, the reader-driven path
-// (Decoder.AcceptStream, byte at a time) in TestAcceptStreamMalformed, and the
+// (Decoder.Feed, byte at a time) in TestFeedMalformed, and the
 // pull API (Next/Skip) in TestPullMalformed. A new case therefore lands on every
 // surface by construction — it cannot be added to one copy and forgotten in
 // another, which is how "overlong element vs truncation" below came to hold only
@@ -80,7 +80,7 @@ var malformedCases = map[string]malformedCase{
 // surface and holds it to the table's verdict. INVALID and INCOMPLETE are
 // mutually exclusive outcomes (§5.2), so the verdict the case is *not* is
 // asserted against as well: a regression that swaps them cannot pass.
-func runMalformedCases(t *testing.T, decode func(in []byte, v sofab.Visitor) error) {
+func runMalformedCases(t *testing.T, decode func(in []byte, v any) error) {
 	t.Helper()
 	for name, c := range malformedCases {
 		c := c
@@ -198,7 +198,7 @@ func TestArrayCountOverRemainingScansElements(t *testing.T) {
 
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			err := sofab.AcceptBytes(c.in, baseV{})
+			err := acceptBytes(c.in, baseV{})
 			if c.want == nil {
 				if err != nil {
 					t.Fatalf("AcceptBytes = %v, want clean decode", err)
@@ -288,7 +288,7 @@ func (v *countingSkipV) UnsignedArray(sofab.ID, []uint64) error { return v.count
 func (v *countingSkipV) SignedArray(sofab.ID, []int64) error    { return v.count() }
 func (v *countingSkipV) Float32Array(sofab.ID, []float32) error { return v.count() }
 func (v *countingSkipV) Float64Array(sofab.ID, []float64) error { return v.count() }
-func (v *countingSkipV) BeginSequence(sofab.ID) (sofab.Visitor, error) {
+func (v *countingSkipV) BeginSequence(sofab.ID) (any, error) {
 	v.n++
 	return nil, nil
 }
@@ -302,11 +302,11 @@ func drainSkipping(surface string, b []byte, opts ...sofab.Option) (int, error) 
 	var err error
 	switch surface {
 	case "AcceptBytes":
-		err = sofab.AcceptBytes(b, v, opts...)
-	case "Accept":
-		err = sofab.NewDecoder(bytes.NewReader(b), opts...).Accept(v)
-	case "AcceptStream":
-		err = sofab.NewDecoder(bytes.NewReader(b), opts...).AcceptStream(v)
+		err = acceptBytes(b, v, opts...)
+	case "Feed":
+		err = feedIn(b, 0, v, opts...)
+	case "Feed/1-byte":
+		err = feedIn(b, 1, v, opts...)
 	}
 	return v.n, err
 }
@@ -432,7 +432,7 @@ func TestSkipFixlenArrayHeaderChecked(t *testing.T) {
 			}
 
 			// The visitor path is the reference: it always checked this header.
-			verr := sofab.AcceptBytes(c.in, baseV{})
+			verr := acceptBytes(c.in, baseV{})
 			if c.want == nil {
 				if verr != nil {
 					t.Fatalf("AcceptBytes = %v, want clean decode", verr)
@@ -456,7 +456,7 @@ func TestSkipFixlenArrayHeaderChecked(t *testing.T) {
 // a message that can never become valid.
 //
 // Both skip entry points are driven (Decoder.Skip and Next's auto-skip), and every
-// case is pinned against AcceptBytes and AcceptStream: the visitor paths always
+// case is pinned against AcceptBytes and Feed: the visitor paths always
 // ran this count through arrayCount, so all three must agree on every input.
 func TestSkipIntegerArrayCountChecked(t *testing.T) {
 	// arr builds a complete integer-array field from a wire type, count and
@@ -553,14 +553,14 @@ func TestSkipIntegerArrayCountChecked(t *testing.T) {
 			}
 
 			// The visitor paths are the reference: both always checked this count.
-			verr := sofab.AcceptBytes(c.in, baseV{})
-			serr := sofab.NewDecoder(bytes.NewReader(c.in)).AcceptStream(baseV{})
+			verr := acceptBytes(c.in, baseV{})
+			serr := feedIn(c.in, 1, baseV{})
 			if c.want == nil {
 				if verr != nil {
 					t.Fatalf("AcceptBytes = %v, want clean decode", verr)
 				}
 				if serr != nil {
-					t.Fatalf("AcceptStream = %v, want clean decode", serr)
+					t.Fatalf("Feed/1-byte = %v, want clean decode", serr)
 				}
 				return
 			}
@@ -568,7 +568,7 @@ func TestSkipIntegerArrayCountChecked(t *testing.T) {
 				t.Fatalf("AcceptBytes = %v, want %v (pull and visitor must agree)", verr, c.want)
 			}
 			if !errors.Is(serr, c.want) {
-				t.Fatalf("AcceptStream = %v, want %v (pull and visitor must agree)", serr, c.want)
+				t.Fatalf("Feed = %v, want %v (pull and visitor must agree)", serr, c.want)
 			}
 		})
 	}
@@ -608,7 +608,7 @@ func TestSkipIntegerArrayHonoursArrayCountLimit(t *testing.T) {
 // reported COMPLETE on bytes both visitor paths reject.
 //
 // Both skip entry points are driven (Decoder.Skip and Next's auto-skip), and
-// every case is pinned against AcceptBytes and AcceptStream: the visitor paths
+// every case is pinned against AcceptBytes and Feed: the visitor paths
 // always validated this word, so all three must agree on every input (§5.2).
 func TestSkipFixlenHeaderChecked(t *testing.T) {
 	hdr := vhdr(0, sofab.TypeFixlen)
@@ -733,14 +733,14 @@ func TestSkipFixlenHeaderChecked(t *testing.T) {
 			}
 
 			// The visitor paths are the reference: both always validated this word.
-			verr := sofab.AcceptBytes(c.in, baseV{})
-			serr := sofab.NewDecoder(bytes.NewReader(c.in)).AcceptStream(baseV{})
+			verr := acceptBytes(c.in, baseV{})
+			serr := feedIn(c.in, 1, baseV{})
 			if c.want == nil {
 				if verr != nil {
 					t.Fatalf("AcceptBytes = %v, want clean decode", verr)
 				}
 				if serr != nil {
-					t.Fatalf("AcceptStream = %v, want clean decode", serr)
+					t.Fatalf("Feed/1-byte = %v, want clean decode", serr)
 				}
 				return
 			}
@@ -748,7 +748,7 @@ func TestSkipFixlenHeaderChecked(t *testing.T) {
 				t.Fatalf("AcceptBytes = %v, want %v (pull and visitor must agree)", verr, c.want)
 			}
 			if !errors.Is(serr, c.want) {
-				t.Fatalf("AcceptStream = %v, want %v (pull and visitor must agree)", serr, c.want)
+				t.Fatalf("Feed = %v, want %v (pull and visitor must agree)", serr, c.want)
 			}
 		})
 	}

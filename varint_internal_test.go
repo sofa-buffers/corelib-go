@@ -97,7 +97,7 @@ func TestVarintWritersAgree(t *testing.T) {
 }
 
 // TestVarintDecodersAgree pins the two decode paths — uvarintFast (bulk, no
-// end-of-buffer test) and uvarintTail (near the buffer end, bounds checked) — to
+// end-of-buffer test) and the resumable decoder Feed uses — to
 // each other and to what the writers produced. The split between them depends on
 // how close the varint sits to the end of the buffer, so each probe is decoded
 // both ways.
@@ -115,85 +115,35 @@ func TestVarintDecodersAgree(t *testing.T) {
 			t.Fatalf("uvarintFast(%d) = (%d, %d), want (%d, %d)", v, gotFast, npFast, v, len(enc))
 		}
 
-		// Exact: nothing after the varint, so the tail path applies.
-		gotTail, npTail, st := uvarintTail(enc, 0)
-		if st != varintOK {
-			t.Fatalf("uvarintTail(%d) status %v", v, st)
+		// Exact: nothing after the varint, so the byte-at-a-time resumable path
+		// applies — the one Feed takes at the tail of a chunk, and at every
+		// chunk boundary a varint straddles. Fed ONE BYTE AT A TIME, which is
+		// the case the spec's "suspends and resumes at any byte boundary" is
+		// about.
+		var d Decoder
+		d.init(VisitorBase{}, newLimits(nil))
+		for k := range enc {
+			np, done := d.varint(enc[k:k+1], 0)
+			if np != 1 {
+				t.Fatalf("resumable(%d): byte %d consumed %d", v, k, np)
+			}
+			if done != (k == len(enc)-1) {
+				t.Fatalf("resumable(%d): byte %d done=%v", v, k, done)
+			}
 		}
-		if gotTail != v || npTail != len(enc) {
-			t.Fatalf("uvarintTail(%d) = (%d, %d), want (%d, %d)", v, gotTail, npTail, v, len(enc))
+		if d.err != nil {
+			t.Fatalf("resumable(%d): %v", v, d.err)
+		}
+		if d.acc != v || d.nb != len(enc) {
+			t.Fatalf("resumable(%d) = (%d, %d bytes), want (%d, %d)", v, d.acc, d.nb, v, len(enc))
 		}
 	}
 }
 
-// TestBulkDecoderMatchesSingle pins decodeUvarintRun — the bulk path both array
-// element types go through — to uvarintFast/uvarintTail on the same bytes. The
-// chunking and the stop-at-tail rule are where a bulk decoder can silently drift
-// from the single-value one, so the run is driven at several chunk sizes and
-// with the values packed right up against the end of the buffer.
-func TestBulkDecoderMatchesSingle(t *testing.T) {
-	probes := varintProbes()
-
-	var stream []byte
-	for _, v := range probes {
-		stream = append(stream, refUvarint(v)...)
-	}
-
-	for _, chunk := range []int{1, 2, 7, varintChunk, len(probes)} {
-		got := make([]uint64, 0, len(probes))
-		p := 0
-		for len(got) < len(probes) {
-			want := min(chunk, len(probes)-len(got))
-			dst := make([]uint64, want)
-			n, np, st := decodeUvarintRun(stream, p, dst)
-			if st != varintOK {
-				t.Fatalf("chunk %d: decodeUvarintRun status %v at %d", chunk, st, p)
-			}
-			got = append(got, dst[:n]...)
-			p = np
-			if n < want {
-				// Tail region: finish with the bounds-checked single decoder,
-				// exactly as fillUnsigned/fillSigned do.
-				for len(got) < len(probes) {
-					v, tp, tst := uvarintTail(stream, p)
-					if tst != varintOK {
-						t.Fatalf("chunk %d: uvarintTail status %v at %d", chunk, tst, p)
-					}
-					got = append(got, v)
-					p = tp
-				}
-			}
-		}
-		if p != len(stream) {
-			t.Fatalf("chunk %d: consumed %d of %d bytes", chunk, p, len(stream))
-		}
-		for i, v := range probes {
-			if got[i] != v {
-				t.Fatalf("chunk %d: element %d = %d, want %d", chunk, i, got[i], v)
-			}
-		}
-	}
-}
-
-// TestBulkDecoderRejectsOverlong pins the >64-bit rule in the bulk path too: it
-// must report overflow rather than truncating the value or the run.
-func TestBulkDecoderRejectsOverlong(t *testing.T) {
-	stream := append(refUvarint(7), 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x02)
-	stream = append(stream, make([]byte, maxVarintLen)...) // keep the run out of the tail region
-	dst := make([]uint64, 2)
-	got, _, st := decodeUvarintRun(stream, 0, dst)
-	if st != varintOverflow {
-		t.Fatalf("decodeUvarintRun status %v, want overflow", st)
-	}
-	if got != 1 || dst[0] != 7 {
-		t.Fatalf("decoded %d elements (first = %d), want 1 element = 7", got, dst[0])
-	}
-}
-
-// TestFillRoundTripsEveryProbe drives the two cursor fill paths over a real
+// TestFillRoundTripsEveryProbe drives the array element paths over a real
 // encoded array, which is what the visitor decode actually calls. It closes the
-// loop: the writers in encoder.go produce the bytes, the bulk decoder reads them
-// back, and the values must survive unchanged.
+// loop: the writers in encoder.go produce the bytes, the decoder reads them
+// back element by element, and the values must survive unchanged.
 func TestFillRoundTripsEveryProbe(t *testing.T) {
 	probes := varintProbes()
 	signed := make([]int64, len(probes))
@@ -217,43 +167,44 @@ func TestFillRoundTripsEveryProbe(t *testing.T) {
 		t.Fatalf("flush: %v", err)
 	}
 
-	c := cursor{buf: buf.Bytes()}
-	// Unsigned array: header, count, then the elements.
-	if _, err := c.uvarint(false); err != nil {
-		t.Fatalf("header: %v", err)
+	var got arrayProbe
+	if err := AcceptBytes(buf.Bytes(), &got); err != nil {
+		t.Fatalf("AcceptBytes: %v", err)
 	}
-	n, err := c.uvarint(false)
-	if err != nil || int(n) != len(probes) {
-		t.Fatalf("count = %d (%v), want %d", n, err, len(probes))
-	}
-	gotU := make([]uint64, n)
-	if got, err := c.fillUnsigned(gotU); err != nil || got != len(gotU) {
-		t.Fatalf("fillUnsigned: %d elements, %v", got, err)
+	if len(got.u) != len(probes) {
+		t.Fatalf("unsigned: %d elements, want %d", len(got.u), len(probes))
 	}
 	for i, v := range probes {
-		if gotU[i] != v {
-			t.Fatalf("unsigned element %d = %d, want %d", i, gotU[i], v)
+		if got.u[i] != v {
+			t.Fatalf("unsigned element %d = %d, want %d", i, got.u[i], v)
 		}
 	}
-
-	if _, err := c.uvarint(false); err != nil {
-		t.Fatalf("signed header: %v", err)
-	}
-	if n, err = c.uvarint(false); err != nil || int(n) != len(signed) {
-		t.Fatalf("signed count = %d (%v), want %d", n, err, len(signed))
-	}
-	gotS := make([]int64, n)
-	if got, err := c.fillSigned(gotS); err != nil || got != len(gotS) {
-		t.Fatalf("fillSigned: %d elements, %v", got, err)
+	if len(got.s) != len(signed) {
+		t.Fatalf("signed: %d elements, want %d", len(got.s), len(signed))
 	}
 	for i, v := range signed {
-		if gotS[i] != v {
-			t.Fatalf("signed element %d = %d, want %d", i, gotS[i], v)
+		if got.s[i] != v {
+			t.Fatalf("signed element %d = %d, want %d", i, got.s[i], v)
 		}
 	}
-	if c.pos != len(c.buf) {
-		t.Fatalf("consumed %d of %d bytes", c.pos, len(c.buf))
-	}
+}
+
+// arrayProbe collects the two arrays element by element, which is how the
+// visitor delivers them (§6.6.3).
+type arrayProbe struct {
+	VisitorBase
+	u []uint64
+	s []int64
+}
+
+func (p *arrayProbe) ArrayUnsigned(_ ID, _ int, v uint64) error {
+	p.u = append(p.u, v)
+	return nil
+}
+
+func (p *arrayProbe) ArraySigned(_ ID, _ int, v int64) error {
+	p.s = append(p.s, v)
+	return nil
 }
 
 // TestVarintDecodersRejectOverlong pins the >64-bit rule (§4.1) in both decode
@@ -273,8 +224,8 @@ func TestVarintDecodersRejectOverlong(t *testing.T) {
 		if _, _, ok := uvarintFast(padded, 0); ok {
 			t.Fatalf("uvarintFast accepted overlong % x", enc)
 		}
-		if _, _, st := uvarintTail(enc, 0); st != varintOverflow {
-			t.Fatalf("uvarintTail(% x) status %v, want overflow", enc, st)
+		if err := feedVarintBytes(enc); err != ErrInvalidMsg {
+			t.Fatalf("resumable(% x) = %v, want ErrInvalidMsg", enc, err)
 		}
 	}
 
@@ -292,11 +243,32 @@ func TestVarintDecodersRejectOverlong(t *testing.T) {
 		if !ok || v != tc.want {
 			t.Fatalf("uvarintFast(% x) = (%d, %v), want (%d, true)", tc.enc, v, ok, tc.want)
 		}
-		v, _, st := uvarintTail(tc.enc, 0)
-		if st != varintOK || v != tc.want {
-			t.Fatalf("uvarintTail(% x) = (%d, %v), want (%d, ok)", tc.enc, v, st, tc.want)
+		got, err := resumeVarint(tc.enc)
+		if err != nil || got != tc.want {
+			t.Fatalf("resumable(% x) = (%d, %v), want (%d, nil)", tc.enc, got, err, tc.want)
 		}
 	}
+}
+
+// resumeVarint feeds enc one byte at a time through the decoder's resumable
+// varint reader and returns the value it decoded.
+func resumeVarint(enc []byte) (uint64, error) {
+	var d Decoder
+	d.init(VisitorBase{}, newLimits(nil))
+	for k := range enc {
+		if _, done := d.varint(enc[k:k+1], 0); d.err != nil {
+			return 0, d.err
+		} else if done {
+			return d.acc, nil
+		}
+	}
+	return 0, ErrIncomplete
+}
+
+// feedVarintBytes is resumeVarint's error half.
+func feedVarintBytes(enc []byte) error {
+	_, err := resumeVarint(enc)
+	return err
 }
 
 // assertSameBytes reports the first differing offset, which is what identifies

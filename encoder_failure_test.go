@@ -203,7 +203,7 @@ func TestOversizedStringIsCopiedThroughTheWindow(t *testing.T) {
 			t.Fatalf("Flush = %v, want nil", err)
 		}
 		var got stringCollector
-		if err := sofab.AcceptBytes(w.buf, &got); err != nil {
+		if err := acceptBytes(w.buf, &got); err != nil {
 			t.Fatalf("AcceptBytes: %v", err)
 		}
 		if got.s != big {
@@ -259,7 +259,7 @@ func TestStringStreamsThroughASmallSinkBuffer(t *testing.T) {
 		t.Fatalf("Flush = %v, want nil", err)
 	}
 	var got stringCollector
-	if err := sofab.AcceptBytes(out, &got); err != nil {
+	if err := acceptBytes(out, &got); err != nil {
 		t.Fatalf("AcceptBytes: %v", err)
 	}
 	if got.s != payload {

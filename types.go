@@ -36,16 +36,29 @@ const (
 	TypeSequenceEnd         WireType = 0x7 // close nested sequence
 )
 
-// fixlen subtypes (3-bit tag inside the fixlen header).
+// FixlenSubtype is the 3-bit subtype tag inside a fixlen field's length word
+// (§4.6), as delivered to Visitor.FixlenBegin. It names what ARRIVED, which is
+// what a destination needs to tell its own field from a MESSAGE_SPEC §7.3 skip.
+// The reserved tags 0x4-0x7 never reach a visitor: they are INVALID at the word.
+type FixlenSubtype uint8
+
 const (
-	fixFp32 uint64 = 0x0
-	fixFp64 uint64 = 0x1
-	fixStr  uint64 = 0x2
-	fixBlob uint64 = 0x3
+	FixlenFp32 FixlenSubtype = 0x0 // 4 raw little-endian bytes
+	FixlenFp64 FixlenSubtype = 0x1 // 8 raw little-endian bytes
+	FixlenStr  FixlenSubtype = 0x2 // UTF-8 payload (§6.4)
+	FixlenBlob FixlenSubtype = 0x3 // opaque payload
+)
+
+// fixlen subtypes as the encoder writes them into the word.
+const (
+	fixFp32 uint64 = uint64(FixlenFp32)
+	fixFp64 uint64 = uint64(FixlenFp64)
+	fixStr  uint64 = uint64(FixlenStr)
+	fixBlob uint64 = uint64(FixlenBlob)
 )
 
 // ArrayKind names the element kind an array header on the wire declares, as
-// delivered to HeaderVisitor.ArrayBegin. It distinguishes the two fixlen
+// delivered to Visitor.ArrayBegin. It distinguishes the two fixlen
 // element subtypes — fp32 and fp64 — rather than collapsing them, because for a
 // fixlen array (§4.8) the element subtype decides whether the field is this
 // array's value at all: a header whose subtype contradicts the declared element

@@ -31,26 +31,41 @@
 // THE VISITOR IS THE ONLY DECODE SURFACE (CORELIB_PLAN §5.3.1): implement
 // Visitor on the target type and let the decoder drive, binding each field
 // straight into a member the caller owns. There is no pull parser, no iterator,
-// no cursor — one surface means one place to be correct. Three entry points
-// drive it, and they reach the same verdict on the same bytes:
+// no cursor — one surface means one place to be correct, and behind the surface
+// there is one implementation of it: a resumable PUSH state machine.
 //
-//   - AcceptBytes — the message is already one contiguous []byte (what a
-//     generated Decode<Name> uses). Nothing is copied before parsing.
-//   - Decoder.Accept — read the rest of an io.Reader into one buffer, then
-//     advance a cursor over it (the protobuf-style decode kernel). Fastest for
-//     an in-memory source, but it does buffer the whole message.
-//   - Decoder.AcceptStream — read and dispatch each field as the io.Reader
-//     delivers it, buffering nothing: peak memory is the largest single field.
-//     This is what a generated Decode<Name>From(io.Reader) uses.
+// Decoder.Feed is that machine (§5.2, §6.0). Hand it bytes in chunks of any
+// size — one byte included — and it returns the outcome for everything consumed
+// so far: Complete, Incomplete or Invalid. A field header, a varint, a payload
+// or an array may be split across any number of calls; the machine suspends and
+// resumes at any byte boundary. There is no finish or finalize step: the value
+// Feed returns is the answer (§5.2.4).
+//
+// Two wrappers sit on it, and neither is a second surface — they hold no state,
+// apply no rule and produce the same events the same Feed calls would:
+//
+//   - AcceptBytes — one Feed of a complete message already in one []byte (what
+//     a generated Decode<Name> uses). §6.7.1 gives the one-shot path no memory
+//     exemption, and it takes none.
+//   - Decoder.FeedFrom — drain an io.Reader, feeding it in chunks of the
+//     CALLER's scratch buffer. This package sizes no buffer from a stream.
+//
+// NOTHING THE DECODER HANDS OVER IS STORAGE (§6.6.3). A string or a blob
+// arrives as FixlenBegin (the total, before any payload byte) and then one or
+// more String / Bytes calls carrying the total, this piece's offset and a window
+// into the caller's own fed bytes. An array arrives as ArrayBegin, one element
+// callback per element, ArrayEnd. Building a value out of that is the
+// destination's business, and its storage is the destination's own — which is
+// what lets the codec allocate nothing at all after construction (§6.6).
 //
 // Whatever a visitor callback receives is valid only until that callback
 // returns; a caller that keeps a value copies it first (§6.7). That holds on the
 // one-shot path exactly as on the streaming one.
 //
-// A visitor may implement the optional extensions HeaderVisitor and
-// ElemBoundVisitor (and SchemaBoundVisitor, StringPolicyVisitor) to have a
-// schema bound reach the decoder; each is consulted on every visitor path, and a
-// visitor that implements none decodes exactly as before.
+// A visitor may implement the optional extensions SchemaBoundVisitor and
+// StringPolicyVisitor, to tell the decoder which fields the schema already
+// bounds and to receive the decode's UTF-8 policy; a visitor that implements
+// neither decodes exactly as before.
 //
 // # Collectors
 //
@@ -61,10 +76,10 @@
 // generated package: StringSeq, BlobSeq, MessageSeq, NestedSeq, the matrix
 // collectors and PlaceRow, all built on the no-op VisitorBase. The schema
 // travels as arguments — Cap is the count bound, ElemMax the element maxlen,
-// Hi/Lo the declared element width — exactly as NarrowUnsigned/NarrowSigned take
-// the element type as a type parameter, and a generated BeginSequence arm is
-// then one line handing back the collector its field is bound to. PayloadAcc is
-// the same idea for a payload that arrives in chunks.
+// Hi/Lo the declared element width — and a generated BeginSequence arm is then
+// one line handing back the collector its field is bound to. PayloadAcc is the
+// same idea one level down: it assembles a string or blob payload out of the
+// pieces the decoder delivers.
 //
 // # Sequence framing (omitting an all-default sequence)
 //

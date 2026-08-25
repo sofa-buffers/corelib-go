@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"testing"
-	"testing/iotest"
 
 	sofab "github.com/sofa-buffers/corelib-go"
 )
@@ -26,13 +25,13 @@ func (v *capV) String(_ sofab.ID, s string) error {
 	v.str, v.strSet = s, true
 	return nil
 }
-func (v *capV) Bytes(_ sofab.ID, b []byte) error              { v.blob = append([]byte(nil), b...); return nil }
-func (v *capV) UnsignedArray(sofab.ID, []uint64) error        { return nil }
-func (v *capV) SignedArray(sofab.ID, []int64) error           { return nil }
-func (v *capV) Float32Array(sofab.ID, []float32) error        { return nil }
-func (v *capV) Float64Array(sofab.ID, []float64) error        { return nil }
-func (v *capV) BeginSequence(sofab.ID) (sofab.Visitor, error) { return v, nil }
-func (v *capV) EndSequence() error                            { return nil }
+func (v *capV) Bytes(_ sofab.ID, b []byte) error       { v.blob = append([]byte(nil), b...); return nil }
+func (v *capV) UnsignedArray(sofab.ID, []uint64) error { return nil }
+func (v *capV) SignedArray(sofab.ID, []int64) error    { return nil }
+func (v *capV) Float32Array(sofab.ID, []float32) error { return nil }
+func (v *capV) Float64Array(sofab.ID, []float64) error { return nil }
+func (v *capV) BeginSequence(sofab.ID) (any, error)    { return v, nil }
+func (v *capV) EndSequence() error                     { return nil }
 
 // strField hand-builds a fixlen string field at id with the given raw payload
 // (which need not be valid UTF-8).
@@ -107,11 +106,11 @@ func TestStrictUTF8DecodeDefaultRejects(t *testing.T) {
 	in := strField(1, []byte{0xFF}) // 0xFF cannot begin any UTF-8 sequence.
 
 	checkUTF8Decode(t, "visitor destination default",
-		sofab.AcceptBytes(in, &bindStrV{id: 1}))
-	checkUTF8Decode(t, "AcceptStream destination default",
-		sofab.NewDecoder(bytes.NewReader(in)).AcceptStream(&bindStrV{id: 1}))
+		acceptBytes(in, &bindStrV{id: 1}))
+	checkUTF8Decode(t, "Feed destination default",
+		feedIn(in, 1, &bindStrV{id: 1}))
 	var v capV
-	if err := sofab.AcceptBytes(in, &v); err != nil {
+	if err := acceptBytes(in, &v); err != nil {
 		t.Fatalf("visitor without destination = %v, want nil", err)
 	}
 	if !v.strSet || v.str != "\xFF" {
@@ -140,9 +139,9 @@ func TestStrictUTF8DecodeRejectsVariants(t *testing.T) {
 		}
 		in := strField(0, payload)
 		checkUTF8Decode(t, name+" visitor destination",
-			sofab.AcceptBytes(in, &bindStrV{id: 0}))
-		checkUTF8Decode(t, name+" AcceptStream destination",
-			sofab.NewDecoder(bytes.NewReader(in)).AcceptStream(&bindStrV{id: 0}))
+			acceptBytes(in, &bindStrV{id: 0}))
+		checkUTF8Decode(t, name+" Feed destination",
+			feedIn(in, 1, &bindStrV{id: 0}))
 	}
 }
 
@@ -199,7 +198,7 @@ func TestStrictUTF8DecodeOffVerbatim(t *testing.T) {
 	in := strField(1, payload)
 
 	var v capV
-	if err := sofab.AcceptBytes(in, &v, sofab.WithStrictUTF8(false)); err != nil {
+	if err := acceptBytes(in, &v, sofab.WithStrictUTF8(false)); err != nil {
 		t.Fatalf("visitor off = %v, want nil", err)
 	}
 	if !v.strSet || v.str != string(payload) {
@@ -222,7 +221,7 @@ func TestStrictUTF8DecodeOffRoundtrips(t *testing.T) {
 	}
 
 	var v capV
-	if err := sofab.AcceptBytes(buf.Bytes(), &v, sofab.WithStrictUTF8(false)); err != nil {
+	if err := acceptBytes(buf.Bytes(), &v, sofab.WithStrictUTF8(false)); err != nil {
 		t.Fatalf("decode off = %v", err)
 	}
 	if v.str != raw {
@@ -305,7 +304,7 @@ func TestStrictUTF8EmbeddedNUL(t *testing.T) {
 	}
 
 	var v capV
-	if err := sofab.AcceptBytes(buf.Bytes(), &v); err != nil { // strict ON
+	if err := acceptBytes(buf.Bytes(), &v); err != nil { // strict ON
 		t.Fatalf("decode NUL = %v, want nil", err)
 	}
 	if v.str != s {
@@ -332,11 +331,11 @@ func TestStrictUTF8SkipNotValidated(t *testing.T) {
 		var err error
 		switch surface {
 		case "AcceptBytes":
-			err = sofab.AcceptBytes(in, v)
-		case "Accept":
-			err = sofab.NewDecoder(bytes.NewReader(in)).Accept(v)
-		case "AcceptStream":
-			err = sofab.NewDecoder(bytes.NewReader(in)).AcceptStream(v)
+			err = acceptBytes(in, v)
+		case "Feed":
+			err = feedIn(in, 0, v)
+		case "Feed/1-byte":
+			err = feedIn(in, 1, v)
 		}
 		if err != nil {
 			t.Fatalf("%s = %v, want nil (skips are never validated)", surface, err)
@@ -378,7 +377,7 @@ func (v *genStrV) String(id sofab.ID, s string) error {
 	return nil
 }
 
-func (v *genStrV) BeginSequence(sofab.ID) (sofab.Visitor, error) {
+func (v *genStrV) BeginSequence(sofab.ID) (any, error) {
 	if v.nested != nil {
 		return v.nested, nil
 	}
@@ -388,15 +387,15 @@ func (v *genStrV) BeginSequence(sofab.ID) (sofab.Visitor, error) {
 // acceptPaths runs one message through every visitor entry point, so a policy
 // that reaches only one of them cannot pass. Each entry takes the decode options
 // the same way the caller would.
-var acceptPaths = map[string]func(in []byte, v sofab.Visitor, opts ...sofab.Option) error{
-	"AcceptBytes": func(in []byte, v sofab.Visitor, opts ...sofab.Option) error {
-		return sofab.AcceptBytes(in, v, opts...)
+var acceptPaths = map[string]func(in []byte, v any, opts ...sofab.Option) error{
+	"AcceptBytes": func(in []byte, v any, opts ...sofab.Option) error {
+		return acceptBytes(in, v, opts...)
 	},
-	"Accept": func(in []byte, v sofab.Visitor, opts ...sofab.Option) error {
-		return sofab.NewDecoder(bytes.NewReader(in), opts...).Accept(v)
+	"Feed": func(in []byte, v any, opts ...sofab.Option) error {
+		return feedIn(in, 0, v, opts...)
 	},
-	"AcceptStream": func(in []byte, v sofab.Visitor, opts ...sofab.Option) error {
-		return sofab.NewDecoder(iotest.OneByteReader(bytes.NewReader(in)), opts...).AcceptStream(v)
+	"Feed/1-byte": func(in []byte, v any, opts ...sofab.Option) error {
+		return feedIn(in, 1, v, opts...)
 	},
 }
 
@@ -520,11 +519,11 @@ func TestStringCheckZeroValueIsStrict(t *testing.T) {
 	// And the delivered OFF policy is not sticky across decodes: a fresh
 	// destination is strict again (in a build that has a check to be strict
 	// with — where it is compiled out, both decodes accept).
-	if err := sofab.AcceptBytes(strField(1, []byte{0xFF}), v, sofab.WithStrictUTF8(false)); err != nil {
+	if err := acceptBytes(strField(1, []byte{0xFF}), v, sofab.WithStrictUTF8(false)); err != nil {
 		t.Fatalf("off decode = %v, want nil", err)
 	}
 	checkUTF8Decode(t, "fresh destination after an off decode",
-		sofab.AcceptBytes(strField(1, []byte{0xFF}), &genStrV{id: 1}))
+		acceptBytes(strField(1, []byte{0xFF}), &genStrV{id: 1}))
 }
 
 // TestUTF8ValidPrimitiveStaysAlwaysStrict pins the compatibility contract the
@@ -537,7 +536,7 @@ func TestStringCheckZeroValueIsStrict(t *testing.T) {
 func TestUTF8ValidPrimitiveStaysAlwaysStrict(t *testing.T) {
 	in := strField(1, []byte{0xFF})
 	checkUTF8Decode(t, "package-level primitive under off",
-		sofab.AcceptBytes(in, &bindStrV{id: 1}, sofab.WithStrictUTF8(false)))
+		acceptBytes(in, &bindStrV{id: 1}, sofab.WithStrictUTF8(false)))
 	if got, want := sofab.UTF8Valid([]byte{0xFF}), !utf8CheckCompiled; got != want {
 		t.Fatalf("UTF8Valid(FF) = %v, want %v", got, want)
 	}

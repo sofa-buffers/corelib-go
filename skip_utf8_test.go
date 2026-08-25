@@ -1,10 +1,8 @@
 package sofab_test
 
 import (
-	"bytes"
 	"errors"
 	"testing"
-	"testing/iotest"
 
 	sofab "github.com/sofa-buffers/corelib-go"
 )
@@ -57,7 +55,7 @@ func (p *probeV) Unsigned(id sofab.ID, v uint64) error {
 // reaching it is skipped: no maxlen check, no transcode, no validation.
 func (p *probeV) String(sofab.ID, string) error { return nil }
 
-func (p *probeV) BeginSequence(id sofab.ID) (sofab.Visitor, error) {
+func (p *probeV) BeginSequence(id sofab.ID) (any, error) {
 	switch id {
 	case 10:
 		return &p.nested, nil
@@ -89,7 +87,7 @@ func (n *probeNestedV) String(id sofab.ID, v string) error {
 	return nil
 }
 
-func (n *probeNestedV) BeginSequence(sofab.ID) (sofab.Visitor, error) { return baseV{}, nil }
+func (n *probeNestedV) BeginSequence(sofab.ID) (any, error) { return baseV{}, nil }
 
 type probeStrArrayV struct {
 	baseV
@@ -120,7 +118,7 @@ type probeStructArrayV struct {
 // be skipped, not validated.
 func (s *probeStructArrayV) String(sofab.ID, string) error { return nil }
 
-func (s *probeStructArrayV) BeginSequence(sofab.ID) (sofab.Visitor, error) {
+func (s *probeStructArrayV) BeginSequence(sofab.ID) (any, error) {
 	return &probeStructElemV{p: s.p}, nil
 }
 
@@ -143,7 +141,7 @@ func (e *probeStructElemV) String(id sofab.ID, v string) error {
 	return nil
 }
 
-func (e *probeStructElemV) BeginSequence(sofab.ID) (sofab.Visitor, error) { return baseV{}, nil }
+func (e *probeStructElemV) BeginSequence(sofab.ID) (any, error) { return baseV{}, nil }
 
 // materializedStrings returns every string this probe bound into a destination.
 // It is what lets the isolates below assert the OTHER half of §6.4: where the
@@ -294,7 +292,7 @@ func TestF0038SkippedStringNotValidated(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			var p probeV
-			err := sofab.AcceptBytes(tc.in, &p)
+			err := acceptBytes(tc.in, &p)
 
 			// A materialized invalid-UTF-8 payload is INVALID only where the
 			// validator is compiled in; otherwise it is accepted verbatim.
@@ -332,7 +330,7 @@ func TestF0038SkipAdvancesExactly(t *testing.T) {
 	// 4a 0a 8a = the skipped string; 00 = id 0, unsigned varint; 2a = 42.
 	in := []byte{0x4a, 0x0a, 0x8a, 0x00, 0x2a}
 	var p probeV
-	if err := sofab.AcceptBytes(in, &p); err != nil {
+	if err := acceptBytes(in, &p); err != nil {
 		t.Fatalf("AcceptBytes = %v, want nil", err)
 	}
 	if !p.u8Set || p.u8 != 42 {
@@ -348,7 +346,7 @@ func TestF0038MaterializedStillBinds(t *testing.T) {
 	// 56 = id 10 seq; 12 = id 2 FIXLEN; 12 = len 2 STRING; 61 00 = "a\x00"; 07.
 	in := []byte{0x56, 0x12, 0x12, 0x61, 0x00, 0x07}
 	var p probeV
-	if err := sofab.AcceptBytes(in, &p); err != nil {
+	if err := acceptBytes(in, &p); err != nil {
 		t.Fatalf("AcceptBytes = %v, want nil (embedded NUL is valid UTF-8)", err)
 	}
 	if !p.nested.strSet || p.nested.str != "a\x00" {
@@ -358,7 +356,7 @@ func TestF0038MaterializedStillBinds(t *testing.T) {
 
 // TestF0038ChunkBoundaryDeterminism covers the §6.4 normative rule that a chunk
 // boundary MUST NOT change any verdict: the same isolates fed one byte at a time
-// through Decoder.Accept produce the same outcomes as the one-shot AcceptBytes.
+// through Decoder.Feed produce the same outcomes as the one-shot AcceptBytes.
 // The two materialized rows take their expectation from utf8Invalid(), so the
 // rule is asserted in whichever build is running — a chunk boundary must not
 // change the verdict in the footprint build either (issue #88).
@@ -380,16 +378,15 @@ func TestF0038ChunkBoundaryDeterminism(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			var p probeV
-			d := sofab.NewDecoder(iotest.OneByteReader(bytes.NewReader(tc.in)))
-			err := d.Accept(&p)
+			err := feedIn(tc.in, 1, &p)
 			if tc.want == nil {
 				if err != nil {
-					t.Fatalf("chunked Accept = %v, want nil", err)
+					t.Fatalf("chunked Feed = %v, want nil", err)
 				}
 				return
 			}
 			if !errors.Is(err, tc.want) {
-				t.Fatalf("chunked Accept = %v, want %v", err, tc.want)
+				t.Fatalf("chunked Feed = %v, want %v", err, tc.want)
 			}
 		})
 	}
@@ -403,7 +400,7 @@ func TestF0038BoundVsSkipped(t *testing.T) {
 	in := []byte{0x4a, 0x0a, 0x8a, 0x00, 0x2a} // id 9: string 8A, then id 0: unsigned 42
 
 	// Bound: the destination validates.
-	checkUTF8Decode(t, "bound string", sofab.AcceptBytes(in, &bindStrV{id: 9}))
+	checkUTF8Decode(t, "bound string", acceptBytes(in, &bindStrV{id: 9}))
 
 	// Not bound: no validation, and the decode reaches the following field.
 	log, err := decodeAll(t, "AcceptBytes", in)
@@ -415,7 +412,7 @@ func TestF0038BoundVsSkipped(t *testing.T) {
 	}
 }
 
-// probeHookV is probeNestedV plus the HeaderVisitor hook, i.e. the schema maxlen
+// probeHookV is probeNestedV plus the FixlenBegin arm, i.e. the schema maxlen
 // enforced at the LENGTH WORD. It exists to pin the ordering the fix must not
 // disturb: for an over-maxlen field that is ALSO truncated, INVALID dominates
 // INCOMPLETE (§5.2), so the bound is checked before any payload byte is taken —
@@ -437,7 +434,8 @@ func (probeHookV) String(id sofab.ID, v string) error {
 	return nil
 }
 
-// NB: the 3-arg form (F-0042). HeaderVisitor is an OPTIONAL interface, so a
+// NB: the 3-arg form (F-0042). The test-side aggHeader is an OPTIONAL
+// interface, so a
 // stale signature does not fail to compile -- it silently stops satisfying the
 // interface, FixlenHeader is never called, and the maxlen reject below vanishes.
 func (probeHookV) ArrayBegin(sofab.ID, sofab.ArrayKind, int) error { return nil }
@@ -449,18 +447,18 @@ func (probeHookV) FixlenHeader(id sofab.ID, subtype, length int) error {
 	return nil
 }
 
-func (v probeHookV) BeginSequence(sofab.ID) (sofab.Visitor, error) { return v, nil }
+func (v probeHookV) BeginSequence(sofab.ID) (any, error) { return v, nil }
 
 func TestF0038MaxlenStillDominatesIncomplete(t *testing.T) {
 	// id 2, FIXLEN, fixlen_word (6<<3)|2 = 0x32 -> length 6 (over the bound of
 	// 4) with only 2 of the 6 payload bytes present. INVALID, not INCOMPLETE.
 	in := []byte{0x12, 0x32, 'a', 'b'}
-	if err := sofab.AcceptBytes(in, probeHookV{}); !errors.Is(err, sofab.ErrInvalidMsg) {
+	if err := acceptBytes(in, probeHookV{}); !errors.Is(err, sofab.ErrInvalidMsg) {
 		t.Fatalf("over-maxlen + truncated = %v, want ErrInvalidMsg (§5.2 anti-folding)", err)
 	}
 	// A skipped field is still framing-checked but its content is not: the same
 	// truncation at an undeclared id is plain INCOMPLETE.
-	if err := sofab.AcceptBytes([]byte{0x4a, 0x32, 'a', 'b'}, probeHookV{}); !errors.Is(err, sofab.ErrIncomplete) {
+	if err := acceptBytes([]byte{0x4a, 0x32, 'a', 'b'}, probeHookV{}); !errors.Is(err, sofab.ErrIncomplete) {
 		t.Fatalf("truncated skipped string = %v, want ErrIncomplete", err)
 	}
 }

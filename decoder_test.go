@@ -5,8 +5,8 @@ package sofab_test
 //
 // CORELIB_PLAN §5.3.1 makes the visitor the only decode surface — "every
 // additional surface is a second implementation of every rule in this document"
-// — so these cases used to run on the pull parser and are now run on all three
-// entry points at once. That is the point of the clause: a guard added to one
+// — so these cases used to run on the pull parser and are now run at every
+// entry point and every chunking at once. That is the point of the clause: a guard added to one
 // path and not another is the recurring defect, and this table is where it would
 // show up as a disagreement rather than as a passing test on the surface the
 // author happened to pick.
@@ -21,8 +21,6 @@ import (
 	sofab "github.com/sofa-buffers/corelib-go"
 )
 
-func newDec(b []byte) *sofab.Decoder { return sofab.NewDecoder(bytes.NewReader(b)) }
-
 // decodeAll drives one entry point by name and returns the recorded events.
 func decodeAll(t *testing.T, surface string, in []byte) ([]string, error) {
 	t.Helper()
@@ -31,18 +29,18 @@ func decodeAll(t *testing.T, surface string, in []byte) ([]string, error) {
 	var err error
 	switch surface {
 	case "AcceptBytes":
-		err = sofab.AcceptBytes(in, r)
-	case "Accept":
-		err = newDec(in).Accept(r)
-	case "AcceptStream":
-		err = newDec(in).AcceptStream(r)
+		err = acceptBytes(in, r)
+	case "Feed":
+		err = feedIn(in, 0, r)
+	case "Feed/1-byte":
+		err = feedIn(in, 1, r)
 	default:
 		t.Fatalf("unknown surface %q", surface)
 	}
 	return log, err
 }
 
-var surfaces = []string{"AcceptBytes", "Accept", "AcceptStream"}
+var surfaces = []string{"AcceptBytes", "Feed", "Feed/1-byte"}
 
 // TestDecodeEveryValueKind is the value table: each row is a complete message,
 // and every surface must produce exactly the listed events and reach COMPLETE.
@@ -182,11 +180,11 @@ func TestDecodeSkipsWhatTheVisitorDeclines(t *testing.T) {
 			v := &declineSeqV{log: &log}
 			switch s {
 			case "AcceptBytes":
-				err = sofab.AcceptBytes(in, v)
-			case "Accept":
-				err = newDec(in).Accept(v)
-			case "AcceptStream":
-				err = newDec(in).AcceptStream(v)
+				err = acceptBytes(in, v)
+			case "Feed":
+				err = feedIn(in, 0, v)
+			case "Feed/1-byte":
+				err = feedIn(in, 1, v)
 			}
 			if err != nil {
 				t.Fatalf("%s = %v, want COMPLETE", s, err)
@@ -218,7 +216,7 @@ func (v *declineSeqV) String(id sofab.ID, s string) error {
 	*v.log = append(*v.log, evStr(id, s))
 	return nil
 }
-func (v *declineSeqV) BeginSequence(sofab.ID) (sofab.Visitor, error) { return nil, nil }
+func (v *declineSeqV) BeginSequence(sofab.ID) (any, error) { return nil, nil }
 
 // TestNoPartialEvaluationOfATruncatedFixlenWord is §7.2 item 6's dedicated
 // case: a `fixlen_word` cut after its first byte, with that byte carrying a

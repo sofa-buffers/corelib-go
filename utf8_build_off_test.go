@@ -100,7 +100,7 @@ func TestNoStrictBuildNeverSubstitutes(t *testing.T) {
 		}
 
 		var v capV
-		if err := sofab.AcceptBytes(buf.Bytes(), &v); err != nil {
+		if err := acceptBytes(buf.Bytes(), &v); err != nil {
 			t.Fatalf("%s decode = %v, want nil", name, err)
 		}
 		if !v.strSet || v.str != string(payload) {

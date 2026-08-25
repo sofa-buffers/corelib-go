@@ -9,9 +9,8 @@ package sofab
 // indices. Turning that event stream back into a slice is the same code for
 // every schema: place at the id, fill the gap the omitted interior elements
 // left, refuse an id past the declared capacity. Only the bounds differ, and a
-// bound is an argument — so these belong here, exactly as arrays.go argues for
-// NarrowUnsigned/NarrowSigned, rather than being emitted into every generated
-// package (generator#345).
+// bound is an argument — so these belong here rather than being emitted into
+// every generated package (generator#345).
 //
 // Two conventions run through the whole file:
 //
@@ -49,132 +48,142 @@ package sofab
 // scope.
 type VisitorBase struct{}
 
-func (VisitorBase) Unsigned(ID, uint64) error         { return nil }
-func (VisitorBase) Signed(ID, int64) error            { return nil }
-func (VisitorBase) Float32(ID, float32) error         { return nil }
-func (VisitorBase) Float64(ID, float64) error         { return nil }
-func (VisitorBase) String(ID, string) error           { return nil }
-func (VisitorBase) Bytes(ID, []byte) error            { return nil }
-func (VisitorBase) UnsignedArray(ID, []uint64) error  { return nil }
-func (VisitorBase) SignedArray(ID, []int64) error     { return nil }
-func (VisitorBase) Float32Array(ID, []float32) error  { return nil }
-func (VisitorBase) Float64Array(ID, []float64) error  { return nil }
-func (VisitorBase) BeginSequence(ID) (Visitor, error) { return VisitorBase{}, nil }
-func (VisitorBase) EndSequence() error                { return nil }
+func (VisitorBase) Unsigned(ID, uint64) error                { return nil }
+func (VisitorBase) Signed(ID, int64) error                   { return nil }
+func (VisitorBase) Float32(ID, float32) error                { return nil }
+func (VisitorBase) Float64(ID, float64) error                { return nil }
+func (VisitorBase) FixlenBegin(ID, FixlenSubtype, int) error { return nil }
+func (VisitorBase) String(ID, int, int, []byte) error        { return nil }
+func (VisitorBase) Bytes(ID, int, int, []byte) error         { return nil }
+func (VisitorBase) ArrayBegin(ID, ArrayKind, int) error      { return nil }
+func (VisitorBase) ArrayUnsigned(ID, int, uint64) error      { return nil }
+func (VisitorBase) ArraySigned(ID, int, int64) error         { return nil }
+func (VisitorBase) ArrayFloat32(ID, int, float32) error      { return nil }
+func (VisitorBase) ArrayFloat64(ID, int, float64) error      { return nil }
+func (VisitorBase) ArrayEnd(ID) error                        { return nil }
+func (VisitorBase) BeginSequence(ID) (Visitor, error)        { return VisitorBase{}, nil }
+func (VisitorBase) EndSequence() error                       { return nil }
 
 // StringSeq collects the elements of a string array into Out.
 //
 // Cap is the array's schema count bound (negative: none) and ElemMax the
 // element maxlen bound (negative: none); a breach of either is INVALID, never a
-// truncation, and both are latched at the length word — see FixlenHeader.
+// truncation, and both are latched at the length word — see FixlenBegin.
 //
 // It embeds StringCheck, so the decode's SOFAB_STRICT_UTF8 policy (§6.4) is
 // delivered to it before the scope's first element and WithStrictUTF8(false)
 // reaches the element check. The zero value of that policy is STRICT, so a
 // collector built by hand and never handed a policy validates.
+//
+// The element's payload arrives IN PIECES (§6.6.3) and is assembled HERE, in a
+// PayloadAcc of its own. That is the whole point of the split: the codec never
+// sizes storage from the wire, and this collector — the static helper layer of
+// §6.6.1, reached only from inside a callback the codec made — does, on the
+// caller's behalf.
 type StringSeq struct {
 	VisitorBase
 	StringCheck
 	Out     *[]string
 	Cap     int
 	ElemMax int
+	acc     PayloadAcc
 }
 
-// ArrayBegin is present only so that one type assertion succeeds. HeaderVisitor
-// declares ArrayBegin and FixlenHeader together and the decoder reaches both
-// through a single v.(HeaderVisitor) — implementing one alone leaves the
-// assertion failing and silently disables the other hook. A string array's
-// elements are fixlen fields, so nothing is judged here.
-func (s *StringSeq) ArrayBegin(ID, ArrayKind, int) error { return nil }
-
-// FixlenHeader applies both schema bounds at the element's LENGTH WORD, before
-// a byte of payload is taken. §5.2 makes INVALID dominate INCOMPLETE, so a
-// message truncated right after the word carrying the violating number must
-// still be INVALID; judging it in String, which never runs for such a message,
-// would report INCOMPLETE instead.
+// FixlenBegin applies both schema bounds at the element's LENGTH WORD, before a
+// byte of payload is taken. §5.2 makes INVALID dominate INCOMPLETE, so a message
+// truncated right after the word carrying the violating number must still be
+// INVALID; judging it in String, which never completes for such a message, would
+// report INCOMPLETE instead.
 //
-// Both bounds sit inside the declared-subtype test: FixlenHeader fires for ANY
+// Both bounds sit inside the declared-subtype test: FixlenBegin fires for ANY
 // fixlen subtype at this id, and an element whose subtype contradicts the
 // declaration was never this array's value (§7.3), so neither its id nor its
 // length may be measured against this array's bounds.
-func (s *StringSeq) FixlenHeader(id ID, subtype, length int) error {
-	if subtype != int(fixStr) {
+func (s *StringSeq) FixlenBegin(id ID, subtype FixlenSubtype, total int) error {
+	if subtype != FixlenStr {
 		return nil
 	}
 	if s.Cap >= 0 && int(id) >= s.Cap {
 		return ErrInvalidMsg
 	}
-	if s.ElemMax >= 0 && length > s.ElemMax {
+	if s.ElemMax >= 0 && total > s.ElemMax {
 		return ErrInvalidMsg
 	}
 	return nil
 }
 
-// String places one element at the index its id names, growing Out with empty
-// strings across any gap. The bounds are applied here as well as at the header:
-// the header hook fires only on the paths that read a length word, and a
-// collector driven without it must still refuse an out-of-range id or an
-// over-long element.
-func (s *StringSeq) String(id ID, v string) error {
+// String accumulates one element's pieces and, once the last of them lands,
+// places the element at the index its id names, growing Out with empty strings
+// across any gap. The bounds are applied here as well as at the header: a
+// collector driven by hand, without the header call, must still refuse an
+// out-of-range id or an over-long element.
+func (s *StringSeq) String(id ID, total, offset int, chunk []byte) error {
 	if s.Cap >= 0 && int(id) >= s.Cap {
 		return ErrInvalidMsg
 	}
-	if s.ElemMax >= 0 && len(v) > s.ElemMax {
+	if s.ElemMax >= 0 && total > s.ElemMax {
 		return ErrInvalidMsg
 	}
-	if !s.UTF8Valid([]byte(v)) {
+	b, done := s.acc.Take(total, offset, chunk)
+	if !done {
+		return nil
+	}
+	if !s.UTF8Valid(b) {
 		return ErrInvalidMsg
 	}
 	for len(*s.Out) <= int(id) {
 		*s.Out = append(*s.Out, "")
 	}
-	(*s.Out)[id] = v
+	(*s.Out)[id] = string(b)
 	return nil
 }
 
 // BlobSeq is the blob twin of StringSeq: same bounds, same gap-filled
-// placement, no UTF-8 check (a blob is bytes). Elements are COPIED, because the
-// slice a blob callback delivers may alias the decode buffer (AcceptBytes) and
-// the collector keeps it past the call.
+// placement, same piecewise assembly, no UTF-8 check (a blob is bytes).
+// Elements are COPIED out of the accumulator, because a payload that arrived in
+// one piece is a window into the caller's fed bytes and this collector keeps it
+// past the call (§6.7).
 type BlobSeq struct {
 	VisitorBase
 	Out     *[][]byte
 	Cap     int
 	ElemMax int
+	acc     PayloadAcc
 }
 
-// ArrayBegin exists for the single type assertion, as StringSeq.ArrayBegin
-// explains.
-func (s *BlobSeq) ArrayBegin(ID, ArrayKind, int) error { return nil }
-
-// FixlenHeader latches both bounds at the length word, gated on the declared
-// subtype; see StringSeq.FixlenHeader for why both properties matter.
-func (s *BlobSeq) FixlenHeader(id ID, subtype, length int) error {
-	if subtype != int(fixBlob) {
+// FixlenBegin latches both bounds at the length word, gated on the declared
+// subtype; see StringSeq.FixlenBegin for why both properties matter.
+func (s *BlobSeq) FixlenBegin(id ID, subtype FixlenSubtype, total int) error {
+	if subtype != FixlenBlob {
 		return nil
 	}
 	if s.Cap >= 0 && int(id) >= s.Cap {
 		return ErrInvalidMsg
 	}
-	if s.ElemMax >= 0 && length > s.ElemMax {
+	if s.ElemMax >= 0 && total > s.ElemMax {
 		return ErrInvalidMsg
 	}
 	return nil
 }
 
-// Bytes places a copy of one element at the index its id names, growing Out
-// with nil elements across any gap.
-func (s *BlobSeq) Bytes(id ID, v []byte) error {
+// Bytes accumulates one element's pieces and places a copy of the finished
+// element at the index its id names, growing Out with nil elements across any
+// gap.
+func (s *BlobSeq) Bytes(id ID, total, offset int, chunk []byte) error {
 	if s.Cap >= 0 && int(id) >= s.Cap {
 		return ErrInvalidMsg
 	}
-	if s.ElemMax >= 0 && len(v) > s.ElemMax {
+	if s.ElemMax >= 0 && total > s.ElemMax {
 		return ErrInvalidMsg
+	}
+	b, done := s.acc.Take(total, offset, chunk)
+	if !done {
+		return nil
 	}
 	for len(*s.Out) <= int(id) {
 		*s.Out = append(*s.Out, nil)
 	}
-	(*s.Out)[id] = append([]byte(nil), v...)
+	(*s.Out)[id] = append([]byte(nil), b...)
 	return nil
 }
 
@@ -263,39 +272,72 @@ func PlaceRow[T any](out *[][]T, capacity int, id ID, row []T) error {
 	return nil
 }
 
+// The matrix collectors: an array whose elements are themselves NATIVE arrays.
+//
+// Each row arrives as ArrayBegin, one element callback per element, ArrayEnd —
+// the piecewise shape §6.6.3 requires of the codec — and is assembled here, in
+// the helper layer that is allowed to allocate (§6.6.1). The row grows as
+// elements ACTUALLY ARRIVE rather than being sized from the announced count, so
+// a hostile count costs a comparison and not an allocation; §6.6.1 names exactly
+// this shape ("an id-keyed wrapper-array collector, growing the container as
+// elements arrive") as the helper case.
+//
+// The finished row is handed to PlaceRow at ArrayEnd and the collector drops it,
+// so the next row starts from a fresh slice and no placed row is written over.
+// An array the message truncates never reaches ArrayEnd, so no partial row is
+// ever placed.
+
 // UnsignedMatrixSeq collects the rows of an unsigned integer matrix into Out.
-// Rows arrive widened to []uint64 (one callback for every element width), so
-// each is scanned against Hi and then narrowed to T.
+// Elements arrive widened to the 64-bit value domain (one callback for every
+// declared width), so each is checked against Hi and then narrowed to T.
 //
 // Hi is the largest value T's DECLARED width allows. The narrowing conversion
-// only masks, so an element above Hi has to be rejected here or it would be
-// stored as a different value than the wire carried (§7.1). Hi == 0 means the
-// declared width spans the whole range this callback can deliver — u64, or a
-// bitfield — and switches the scan off rather than running one that can never
-// fire.
+// only masks, so an element above Hi has to be rejected as it goes past or it
+// would be stored as a different value than the wire carried (§7.1) — and
+// rejecting it AT THE ELEMENT is what keeps it INVALID rather than INCOMPLETE
+// when the row is then truncated (§5.2). Hi == 0 means the declared width spans
+// the whole range this callback can deliver — u64, or a bitfield — and switches
+// the check off rather than running one that can never fire.
 type UnsignedMatrixSeq[T Unsigned] struct {
 	VisitorBase
 	Out *[][]T
 	Cap int
 	Hi  uint64
+	row []T
 }
 
-// UnsignedArray narrows one row and places it at its element id.
-func (s *UnsignedMatrixSeq[T]) UnsignedArray(id ID, v []uint64) error {
-	if s.Hi != 0 {
-		for _, x := range v {
-			if x > s.Hi {
-				return ErrInvalidMsg
-			}
-		}
+// ArrayBegin bounds the row id and opens a fresh row.
+func (s *UnsignedMatrixSeq[T]) ArrayBegin(id ID, kind ArrayKind, _ int) error {
+	if kind != ArrayUnsigned {
+		return nil
 	}
-	return PlaceRow(s.Out, s.Cap, id, NarrowUnsigned[T](v))
+	if s.Cap >= 0 && int(id) >= s.Cap {
+		return ErrInvalidMsg
+	}
+	s.row = nil
+	return nil
 }
 
-// SignedMatrixSeq is UnsignedMatrixSeq for signed element widths: rows arrive
-// as []int64 and are scanned against [Lo, Hi] before being narrowed to T.
+// ArrayUnsigned checks one element against the declared width and appends it.
+func (s *UnsignedMatrixSeq[T]) ArrayUnsigned(_ ID, _ int, v uint64) error {
+	if s.Hi != 0 && v > s.Hi {
+		return ErrInvalidMsg
+	}
+	s.row = append(s.row, T(v))
+	return nil
+}
+
+// ArrayEnd places the finished row at its element id.
+func (s *UnsignedMatrixSeq[T]) ArrayEnd(id ID) error {
+	row := s.row
+	s.row = nil
+	return PlaceRow(s.Out, s.Cap, id, row)
+}
+
+// SignedMatrixSeq is UnsignedMatrixSeq for signed element widths: elements
+// arrive as int64 and are checked against [Lo, Hi] before being narrowed to T.
 //
-// Lo == 0 switches the scan off, for the same reason Hi == 0 does above: every
+// Lo == 0 switches the check off, for the same reason Hi == 0 does above: every
 // signed width that narrows anything has a negative Lo, so a zero Lo means i64
 // (or an enum), whose range is the callback parameter's own.
 type SignedMatrixSeq[T Signed] struct {
@@ -304,31 +346,69 @@ type SignedMatrixSeq[T Signed] struct {
 	Cap int
 	Lo  int64
 	Hi  int64
+	row []T
 }
 
-// SignedArray narrows one row and places it at its element id.
-func (s *SignedMatrixSeq[T]) SignedArray(id ID, v []int64) error {
-	if s.Lo != 0 {
-		for _, x := range v {
-			if x < s.Lo || x > s.Hi {
-				return ErrInvalidMsg
-			}
-		}
+// ArrayBegin bounds the row id and opens a fresh row.
+func (s *SignedMatrixSeq[T]) ArrayBegin(id ID, kind ArrayKind, _ int) error {
+	if kind != ArraySigned {
+		return nil
 	}
-	return PlaceRow(s.Out, s.Cap, id, NarrowSigned[T](v))
+	if s.Cap >= 0 && int(id) >= s.Cap {
+		return ErrInvalidMsg
+	}
+	s.row = nil
+	return nil
 }
 
-// Float32MatrixSeq collects the rows of an fp32 matrix. No width scan: the
+// ArraySigned checks one element against the declared width and appends it.
+func (s *SignedMatrixSeq[T]) ArraySigned(_ ID, _ int, v int64) error {
+	if s.Lo != 0 && (v < s.Lo || v > s.Hi) {
+		return ErrInvalidMsg
+	}
+	s.row = append(s.row, T(v))
+	return nil
+}
+
+// ArrayEnd places the finished row at its element id.
+func (s *SignedMatrixSeq[T]) ArrayEnd(id ID) error {
+	row := s.row
+	s.row = nil
+	return PlaceRow(s.Out, s.Cap, id, row)
+}
+
+// Float32MatrixSeq collects the rows of an fp32 matrix. No width check: the
 // callback already delivers the declared element type.
 type Float32MatrixSeq struct {
 	VisitorBase
 	Out *[][]float32
 	Cap int
+	row []float32
 }
 
-// Float32Array places one row at its element id.
-func (s *Float32MatrixSeq) Float32Array(id ID, v []float32) error {
-	return PlaceRow(s.Out, s.Cap, id, v)
+// ArrayBegin bounds the row id and opens a fresh row.
+func (s *Float32MatrixSeq) ArrayBegin(id ID, kind ArrayKind, _ int) error {
+	if kind != ArrayFp32 {
+		return nil
+	}
+	if s.Cap >= 0 && int(id) >= s.Cap {
+		return ErrInvalidMsg
+	}
+	s.row = nil
+	return nil
+}
+
+// ArrayFloat32 appends one element to the row being built.
+func (s *Float32MatrixSeq) ArrayFloat32(_ ID, _ int, v float32) error {
+	s.row = append(s.row, v)
+	return nil
+}
+
+// ArrayEnd places the finished row at its element id.
+func (s *Float32MatrixSeq) ArrayEnd(id ID) error {
+	row := s.row
+	s.row = nil
+	return PlaceRow(s.Out, s.Cap, id, row)
 }
 
 // Float64MatrixSeq is Float32MatrixSeq for fp64 rows.
@@ -336,27 +416,66 @@ type Float64MatrixSeq struct {
 	VisitorBase
 	Out *[][]float64
 	Cap int
+	row []float64
 }
 
-// Float64Array places one row at its element id.
-func (s *Float64MatrixSeq) Float64Array(id ID, v []float64) error {
-	return PlaceRow(s.Out, s.Cap, id, v)
+// ArrayBegin bounds the row id and opens a fresh row.
+func (s *Float64MatrixSeq) ArrayBegin(id ID, kind ArrayKind, _ int) error {
+	if kind != ArrayFp64 {
+		return nil
+	}
+	if s.Cap >= 0 && int(id) >= s.Cap {
+		return ErrInvalidMsg
+	}
+	s.row = nil
+	return nil
+}
+
+// ArrayFloat64 appends one element to the row being built.
+func (s *Float64MatrixSeq) ArrayFloat64(_ ID, _ int, v float64) error {
+	s.row = append(s.row, v)
+	return nil
+}
+
+// ArrayEnd places the finished row at its element id.
+func (s *Float64MatrixSeq) ArrayEnd(id ID) error {
+	row := s.row
+	s.row = nil
+	return PlaceRow(s.Out, s.Cap, id, row)
 }
 
 // BoolMatrixSeq collects the rows of a bool matrix. Bools travel as an unsigned
-// array (§4.6), so a row arrives as []uint64 and every nonzero element is true;
-// no width scan applies, because no unsigned value is out of range for a bool.
+// array (§4.6), so elements arrive through ArrayUnsigned and every nonzero one
+// is true; no width check applies, because no unsigned value is out of range for
+// a bool.
 type BoolMatrixSeq struct {
 	VisitorBase
 	Out *[][]bool
 	Cap int
+	row []bool
 }
 
-// UnsignedArray maps one row to bools and places it at its element id.
-func (s *BoolMatrixSeq) UnsignedArray(id ID, v []uint64) error {
-	row := make([]bool, len(v))
-	for i, x := range v {
-		row[i] = x != 0
+// ArrayBegin bounds the row id and opens a fresh row.
+func (s *BoolMatrixSeq) ArrayBegin(id ID, kind ArrayKind, _ int) error {
+	if kind != ArrayUnsigned {
+		return nil
 	}
+	if s.Cap >= 0 && int(id) >= s.Cap {
+		return ErrInvalidMsg
+	}
+	s.row = nil
+	return nil
+}
+
+// ArrayUnsigned appends one element to the row being built.
+func (s *BoolMatrixSeq) ArrayUnsigned(_ ID, _ int, v uint64) error {
+	s.row = append(s.row, v != 0)
+	return nil
+}
+
+// ArrayEnd places the finished row at its element id.
+func (s *BoolMatrixSeq) ArrayEnd(id ID) error {
+	row := s.row
+	s.row = nil
 	return PlaceRow(s.Out, s.Cap, id, row)
 }

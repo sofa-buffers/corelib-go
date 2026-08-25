@@ -89,8 +89,8 @@ func TestChunkedDecodeAtEveryBoundary(t *testing.T) {
 	for name, mk := range readers {
 		t.Run(name, func(t *testing.T) {
 			var log []string
-			if err := sofab.NewDecoder(mk()).AcceptStream(recorder{&log}); err != nil {
-				t.Fatalf("AcceptStream: %v", err)
+			if err := feedFrom(mk(), 1, recorder{&log}); err != nil {
+				t.Fatalf("Feed: %v", err)
 			}
 			if got := strings.Join(log, "|"); got != want {
 				t.Fatalf("events =\n %s\nwant\n %s", got, want)

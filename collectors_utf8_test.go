@@ -56,7 +56,7 @@ func TestStringSeqHonorsWithStrictUTF8False(t *testing.T) {
 func TestStringSeqWithoutAPolicyValidates(t *testing.T) {
 	var out []string
 	s := &sofab.StringSeq{Out: &out, Cap: -1, ElemMax: -1}
-	if err := s.String(0, "\xFF"); !errors.Is(err, sofab.ErrInvalidMsg) {
+	if err := putString(s, 0, "\xFF"); !errors.Is(err, sofab.ErrInvalidMsg) {
 		t.Fatalf("String = %v, want ErrInvalidMsg", err)
 	}
 }

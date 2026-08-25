@@ -177,7 +177,7 @@ func TestBalancedSequenceFramingStillEncodes(t *testing.T) {
 		0x16, 0x1E, 0x20, 0x07, 0x07, 0x07,
 	}
 	wantBytes(t, got, want)
-	if err := sofab.AcceptBytes(got, baseV{}); err != nil {
+	if err := acceptBytes(got, baseV{}); err != nil {
 		t.Fatalf("balanced framing does not decode: %v", err)
 	}
 }

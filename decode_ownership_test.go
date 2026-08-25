@@ -26,19 +26,30 @@ func readDoc(t *testing.T, path string) string {
 }
 
 // copyingV is the destination CORELIB_PLAN §6.7 describes: the codec "passes
-// the value through the callback ... and the caller copies it where it belongs".
-// Go's string conversion has already copied a string payload; a blob arrives as
-// a []byte, so a destination that keeps it copies it — exactly what generated
-// code emits.
+// the value through the callback — the payload's total, this piece's offset, and
+// the bytes themselves — and the caller copies it where it belongs". Both
+// payloads arrive as windows into the fed chunk, so a destination that keeps one
+// copies it; that is exactly what generated code emits, and PayloadAcc is the
+// helper the corelib ships for it.
 type copyingV struct {
-	baseV
-	str  string
-	blob []byte
+	sofab.VisitorBase
+	strAcc  sofab.PayloadAcc
+	blobAcc sofab.PayloadAcc
+	str     string
+	blob    []byte
 }
 
-func (k *copyingV) String(_ sofab.ID, s string) error { k.str = s; return nil }
-func (k *copyingV) Bytes(_ sofab.ID, b []byte) error {
-	k.blob = append([]byte(nil), b...)
+func (k *copyingV) String(_ sofab.ID, total, offset int, chunk []byte) error {
+	if b, done := k.strAcc.Take(total, offset, chunk); done {
+		k.str = string(b)
+	}
+	return nil
+}
+
+func (k *copyingV) Bytes(_ sofab.ID, total, offset int, chunk []byte) error {
+	if b, done := k.blobAcc.Take(total, offset, chunk); done {
+		k.blob = append([]byte(nil), b...)
+	}
 	return nil
 }
 
@@ -68,15 +79,15 @@ func TestDecodedMessageSurvivesTheInputBeingScrubbed(t *testing.T) {
 		name   string
 		decode func(src []byte, v sofab.Visitor) error
 	}{
-		{"AcceptBytes", func(src []byte, v sofab.Visitor) error { return sofab.AcceptBytes(src, v) }},
-		{"Accept", func(src []byte, v sofab.Visitor) error {
-			return sofab.NewDecoder(bytes.NewReader(src)).Accept(v)
+		{"AcceptBytes", func(src []byte, v sofab.Visitor) error { return acceptBytes(src, v) }},
+		{"Feed", func(src []byte, v sofab.Visitor) error {
+			return feedIn(src, 0, v)
 		}},
-		{"AcceptStream", func(src []byte, v sofab.Visitor) error {
-			return sofab.NewDecoder(bytes.NewReader(src)).AcceptStream(v)
+		{"Feed/1-byte", func(src []byte, v sofab.Visitor) error {
+			return feedIn(src, 1, v)
 		}},
-		{"AcceptStream/one-byte chunks", func(src []byte, v sofab.Visitor) error {
-			return sofab.NewDecoder(&chunkReader{b: src, n: 1}).AcceptStream(v)
+		{"FeedFrom/one-byte chunks", func(src []byte, v sofab.Visitor) error {
+			return feedFrom(&chunkReader{b: src, n: 1}, 1, v)
 		}},
 	} {
 		t.Run(s.name, func(t *testing.T) {

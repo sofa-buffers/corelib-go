@@ -11,14 +11,9 @@ package sofab_test
 // boxed-runtime allowance §6.6.4 grants Kotlin/JS and CPython, and this file
 // carries no itemised §6.6.2 handles: the codec allocates none.
 //
-// The encode half asserts zero on every encoder form. The decode half is
-// currently NOT zero, and the numbers are pinned rather than asserted away: the
-// Visitor interface delivers materialized aggregates (whole strings, whole
-// element slices), which §6.6.3 says obliges the codec to build them from the
-// wire's size. Removing that is a breaking change to the Visitor interface that
-// has to land together with the generator's golang backend (corelib-go#127), so
-// until it does, this test is the artefact §6.6.4 asks for: the count is
-// visible, it is bounded, and it CANNOT GROW WITHOUT THIS TEST FAILING.
+// Both halves assert ZERO. The encode half has for some time; the decode half
+// does since the Visitor stopped delivering materialized aggregates (§6.6.3) —
+// see TestDecodeAllocatesNothingAfterConstruction below.
 
 import (
 	"bytes"
@@ -136,18 +131,24 @@ func mustNotAllocate(t *testing.T, fn func()) {
 	}
 }
 
-// TestDecodeAllocationsArePinned is the decode half of §6.6.4. It is a PINNED
-// COUNT, not a conformance pass: the numbers below are the aggregates the
-// Visitor interface obliges the codec to materialize (§6.6.3), and corelib-go#127
-// is the change that removes them. Two properties are asserted meanwhile:
+// TestDecodeAllocatesNothingAfterConstruction is the decode half of §6.6.4, and
+// it is now a CONFORMANCE PASS rather than a pinned count: after the decoder's
+// one-time construction, a complete decode allocates NOTHING — for a small
+// message and for a 12 KB one, at any chunking, with any field shape.
 //
-//   - the count does not grow — a new allocation on a decode path fails here;
-//   - the count does not depend on the MESSAGE, only on its field shape. §6.6.4
-//     names that as the fallback claim for a runtime that cannot reach zero, and
-//     it is the property the prohibition exists for: a sender must not be able to
-//     drive the receiver's allocation COUNT (the sizes still move, which is
-//     exactly why #127 has to land).
-func TestDecodeAllocationsArePinned(t *testing.T) {
+// What made that reachable is the callback surface (§6.6.3). The Visitor used to
+// deliver materialized aggregates — a whole string, a whole element slice — and
+// §6.6.3 says plainly that such a callback "obliges the codec to build that
+// value, and the only size available to build it from is the wire's". Delivering
+// a payload in pieces and an array element by element removes the obligation:
+// the codec sizes nothing from the wire, and the destination's storage is the
+// destination's own.
+//
+// The destination here therefore keeps nothing — it is the null consumer, which
+// is what isolates the CODEC's allocations from its caller's. A destination that
+// does keep values allocates for them; that is the generated layer, and §6.6.1
+// is explicit that the generated layer allocates and the codec does not.
+func TestDecodeAllocatesNothingAfterConstruction(t *testing.T) {
 	build := func(blobLen, strLen int) []byte {
 		buf := make([]byte, blobLen+strLen+256)
 		e, err := sofab.NewEncoderBuffer(buf, 0)
@@ -155,9 +156,17 @@ func TestDecodeAllocationsArePinned(t *testing.T) {
 			t.Fatalf("NewEncoderBuffer: %v", err)
 		}
 		e.WriteUnsigned(1, 7)
-		e.WriteString(2, string(bytes.Repeat([]byte{'x'}, strLen)))
-		e.WriteBytes(3, bytes.Repeat([]byte{0x5A}, blobLen))
-		sofab.WriteUnsignedArray(e, 4, []uint64{1, 2, 3, 4})
+		e.WriteSigned(2, -7)
+		e.WriteFloat32(3, 1.5)
+		e.WriteFloat64(4, 2.5)
+		e.WriteString(5, string(bytes.Repeat([]byte{'x'}, strLen)))
+		e.WriteBytes(6, bytes.Repeat([]byte{0x5A}, blobLen))
+		sofab.WriteUnsignedArray(e, 7, []uint64{1, 2, 3, 4})
+		sofab.WriteSignedArray(e, 8, []int64{-1, -2, -3})
+		e.WriteFloat64Array(9, []float64{1.5, 2.5})
+		e.WriteSequenceBeginLazy(10)
+		e.WriteUnsigned(1, 99)
+		e.WriteSequenceEnd()
 		if err := e.Flush(); err != nil {
 			t.Fatalf("flush: %v", err)
 		}
@@ -166,49 +175,81 @@ func TestDecodeAllocationsArePinned(t *testing.T) {
 
 	small, big := build(8, 4), build(8000, 4000)
 
+	// ONE decoder, constructed outside the measured region and Reset per
+	// message: that is the shape §6.6 describes, and Reset is what makes it
+	// possible without a second construction.
+	d := sofab.NewDecoder(sofab.VisitorBase{})
+
+	feed := func(msg []byte, chunk int) func() {
+		return func() {
+			d.Reset(sofab.VisitorBase{})
+			for i := 0; i < len(msg); i += chunk {
+				end := i + chunk
+				if end > len(msg) {
+					end = len(msg)
+				}
+				if _, err := d.Feed(msg[i:end]); err != nil {
+					t.Fatalf("Feed: %v", err)
+				}
+			}
+			if d.Status() != sofab.Complete {
+				t.Fatalf("Status = %v, want COMPLETE", d.Status())
+			}
+		}
+	}
+
 	for _, tc := range []struct {
 		name string
-		want float64
-		run  func(msg []byte)
+		run  func()
 	}{
-		// AcceptBytes: the string (Go's string(b) copies) and the u64 slice.
-		// The blob is passed through the callback as a slice of the caller's own
-		// bytes, which §6.7 permits and does not allocate.
-		{"AcceptBytes", 2, func(msg []byte) {
-			if err := sofab.AcceptBytes(msg, baseV{}); err != nil {
-				t.Fatalf("AcceptBytes: %v", err)
-			}
-		}},
-		// Decoder.Accept adds the slurp buffer, which is sized from the stream,
-		// plus the per-message Decoder the API forces (the reader is bound at
-		// construction, so there is no reusable codec to hoist out of the loop —
-		// itself part of what corelib-go#127 has to answer).
-		{"Accept", 4, func(msg []byte) {
-			if err := sofab.NewDecoder(bytes.NewReader(msg)).Accept(baseV{}); err != nil {
-				t.Fatalf("Accept: %v", err)
-			}
-		}},
-		// AcceptStream never slurps; it materializes each field as it arrives,
-		// and adds a bufio.Reader over the source. Same per-message construction
-		// caveat as Accept.
-		{"AcceptStream", 7, func(msg []byte) {
-			if err := sofab.NewDecoder(bytes.NewReader(msg)).AcceptStream(baseV{}); err != nil {
-				t.Fatalf("AcceptStream: %v", err)
-			}
-		}},
+		{"whole message, small", feed(small, len(small))},
+		{"whole message, 12 KB", feed(big, len(big))},
+		{"64-byte chunks, 12 KB", feed(big, 64)},
+		{"one byte at a time, small", feed(small, 1)},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			tc.run(small)
-			a := testing.AllocsPerRun(200, func() { tc.run(small) })
-			b := testing.AllocsPerRun(200, func() { tc.run(big) })
-			if a != tc.want {
-				t.Errorf("%s allocates %.0f per message, pinned at %.0f "+
-					"(corelib-go#127 is the change that takes it to 0)", tc.name, a, tc.want)
-			}
-			if a != b {
-				t.Errorf("%s allocation COUNT moved with the message: %.0f for a small one, "+
-					"%.0f for a 12 KB one; the sender must not drive it", tc.name, a, b)
-			}
+			mustNotAllocate(t, tc.run)
 		})
+	}
+}
+
+// TestAcceptBytesAllocatesOnlyItsDecoder pins the one-shot path's single
+// allocation and says what it is: AcceptBytes CONSTRUCTS a decoder, which §6.6
+// permits ("constructing the encoder or decoder ... MAY allocate"), and then
+// allocates nothing at all for the message. The count therefore does not move
+// with the message, which is the property the prohibition exists for — a sender
+// cannot drive a receiver's memory.
+func TestAcceptBytesAllocatesOnlyItsDecoder(t *testing.T) {
+	build := func(n int) []byte {
+		buf := make([]byte, n+256)
+		e, err := sofab.NewEncoderBuffer(buf, 0)
+		if err != nil {
+			t.Fatalf("NewEncoderBuffer: %v", err)
+		}
+		e.WriteString(1, string(bytes.Repeat([]byte{'x'}, n)))
+		sofab.WriteUnsignedArray(e, 2, []uint64{1, 2, 3, 4})
+		if err := e.Flush(); err != nil {
+			t.Fatalf("flush: %v", err)
+		}
+		return append([]byte(nil), e.Bytes()...)
+	}
+	small, big := build(8), build(12000)
+
+	run := func(msg []byte) func() {
+		return func() {
+			if err := sofab.AcceptBytes(msg, sofab.VisitorBase{}); err != nil {
+				t.Fatalf("AcceptBytes: %v", err)
+			}
+		}
+	}
+	a := testing.AllocsPerRun(200, run(small))
+	b := testing.AllocsPerRun(200, run(big))
+	if a > 1 {
+		t.Errorf("AcceptBytes allocates %.0f per message; only the decoder's own "+
+			"construction may allocate (§6.6)", a)
+	}
+	if a != b {
+		t.Errorf("AcceptBytes allocation count moved with the message: %.0f for a "+
+			"small one, %.0f for a 12 KB one; the sender must not drive it", a, b)
 	}
 }

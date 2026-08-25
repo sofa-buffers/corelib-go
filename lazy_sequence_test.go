@@ -275,7 +275,7 @@ func TestEveryWriterCommitsPendingRun(t *testing.T) {
 				t.Fatalf("got % X, want a 0x0E ... 0x07 frame around the field", got)
 			}
 			// And the frame must round-trip: one sequence start, one end.
-			if err := sofab.AcceptBytes(got, baseV{}); err != nil {
+			if err := acceptBytes(got, baseV{}); err != nil {
 				t.Fatalf("decode %v: % X", err, got)
 			}
 		})
@@ -401,7 +401,7 @@ func TestDeepNestingCommitsInOrder(t *testing.T) {
 		want = append(want, 0x07)
 	}
 	wantBytes(t, got, want)
-	if err := sofab.AcceptBytes(got, baseV{}); err != nil {
+	if err := acceptBytes(got, baseV{}); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
 }

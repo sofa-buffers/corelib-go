@@ -54,9 +54,9 @@ func TestDecodeOutcome(t *testing.T) {
 			// The visitor is the only decode surface (§5.3.1), so the outcome is
 			// checked on all three of its entry points: they must agree byte for
 			// byte, which is the divergence class §5.3.1 exists to prevent.
-			check(t, "AcceptBytes", sofab.AcceptBytes(c.in, baseV{}), c.want)
-			check(t, "Accept", newDec(c.in).Accept(baseV{}), c.want)
-			check(t, "AcceptStream", newDec(c.in).AcceptStream(baseV{}), c.want)
+			check(t, "AcceptBytes", acceptBytes(c.in, baseV{}), c.want)
+			check(t, "Feed", feedIn(c.in, 0, baseV{}), c.want)
+			check(t, "Feed/1-byte", feedIn(c.in, 1, baseV{}), c.want)
 		})
 	}
 }

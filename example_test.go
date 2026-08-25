@@ -122,7 +122,7 @@ func (m *SensorReading) UnsignedArray(id sofab.ID, v []uint64) error {
 
 // BeginSequence hands the nested scope to the nested object. Returning nil
 // instead would decline the whole sub-tree.
-func (m *SensorReading) BeginSequence(id sofab.ID) (sofab.Visitor, error) {
+func (m *SensorReading) BeginSequence(id sofab.ID) (any, error) {
 	if id == fieldCalibration {
 		return &m.Calibration, nil
 	}
@@ -157,7 +157,7 @@ func (*Calibration) SignedArray(sofab.ID, []int64) error    { return nil }
 func (*Calibration) Float32Array(sofab.ID, []float32) error { return nil }
 func (*Calibration) Float64Array(sofab.ID, []float64) error { return nil }
 func (*Calibration) EndSequence() error                     { return nil }
-func (c *Calibration) BeginSequence(sofab.ID) (sofab.Visitor, error) {
+func (c *Calibration) BeginSequence(sofab.ID) (any, error) {
 	return nil, nil
 }
 
@@ -180,7 +180,7 @@ func Example() {
 	}
 
 	var out SensorReading
-	if err := sofab.AcceptBytes(buf.Bytes(), &out); err != nil {
+	if err := acceptBytes(buf.Bytes(), &out); err != nil {
 		panic(err)
 	}
 
@@ -199,7 +199,7 @@ func Example() {
 		panic(err)
 	}
 	var back SensorReading
-	if err := sofab.AcceptBytes(empty.Bytes(), &back); err != nil {
+	if err := acceptBytes(empty.Bytes(), &back); err != nil {
 		panic(err)
 	}
 	fmt.Printf("all-default: %d bytes, decodes back to id=%d gain=%.1f\n",

@@ -28,7 +28,8 @@ const (
 )
 
 // schemaBoundV is a generated-style destination for that schema: it declares
-// the bound (SchemaBoundVisitor) and enforces it at the header (HeaderVisitor),
+// the bound (SchemaBoundVisitor) and enforces it at the header (ArrayBegin /
+// FixlenBegin),
 // which is the pairing generated code emits — the declaration is what stops the
 // cap, the enforcement is what replaces it.
 type schemaBoundV struct {
@@ -41,7 +42,7 @@ type schemaBoundV struct {
 }
 
 var (
-	_ sofab.HeaderVisitor      = (*schemaBoundV)(nil)
+	_ aggHeader                = (*schemaBoundV)(nil)
 	_ sofab.SchemaBoundVisitor = (*schemaBoundV)(nil)
 )
 
@@ -92,12 +93,12 @@ func (countOnlyV) SchemaBound(id sofab.ID, what sofab.BoundKind) bool {
 // acceptAll runs a message through every visitor surface, so a fix that lands on
 // one kernel and not the other cannot pass. f builds a fresh destination per
 // surface (the visitor is stateful).
-func acceptAll(t *testing.T, msg []byte, opts []sofab.Option, f func() sofab.Visitor) map[string]error {
+func acceptAll(t *testing.T, msg []byte, opts []sofab.Option, f func() any) map[string]error {
 	t.Helper()
 	out := map[string]error{}
-	out["AcceptBytes"] = sofab.AcceptBytes(msg, f(), opts...)
-	out["Accept"] = sofab.NewDecoder(bytes.NewReader(msg), opts...).Accept(f())
-	out["AcceptStream"] = sofab.NewDecoder(bytes.NewReader(msg), opts...).AcceptStream(f())
+	out["AcceptBytes"] = acceptBytes(msg, f(), opts...)
+	out["Feed"] = feedIn(msg, 0, f(), opts...)
+	out["Feed/1-byte"] = feedIn(msg, 1, f(), opts...)
 	return out
 }
 
@@ -121,13 +122,13 @@ func TestSchemaBoundGovernsArrayCount(t *testing.T) {
 	opts := []sofab.Option{sofab.WithMaxArrayCount(2)}
 
 	var v schemaBoundV
-	if err := sofab.AcceptBytes(msg, &v, opts...); err != nil {
+	if err := acceptBytes(msg, &v, opts...); err != nil {
 		t.Fatalf("AcceptBytes = %v, want nil (the schema bound governs)", err)
 	}
 	if len(v.arr) != 5 {
 		t.Fatalf("delivered %d elements, want 5", len(v.arr))
 	}
-	wantAll(t, acceptAll(t, msg, opts, func() sofab.Visitor { return &schemaBoundV{} }), nil)
+	wantAll(t, acceptAll(t, msg, opts, func() any { return &schemaBoundV{} }), nil)
 }
 
 // TestSchemaBoundGovernsFixlenArrayCount is the same for a fixlen (fp32) array,
@@ -144,14 +145,14 @@ func TestSchemaBoundGovernsFixlenArrayCount(t *testing.T) {
 	msg := buf.Bytes()
 
 	var v schemaBoundV
-	if err := sofab.AcceptBytes(msg, &v, sofab.WithMaxArrayCount(2)); err != nil {
+	if err := acceptBytes(msg, &v, sofab.WithMaxArrayCount(2)); err != nil {
 		t.Fatalf("AcceptBytes = %v, want nil", err)
 	}
 	if len(v.f32) != 5 {
 		t.Fatalf("delivered %d elements, want 5", len(v.f32))
 	}
 	wantAll(t, acceptAll(t, msg, []sofab.Option{sofab.WithMaxArrayCount(2)},
-		func() sofab.Visitor { return &schemaBoundV{} }), nil)
+		func() any { return &schemaBoundV{} }), nil)
 }
 
 // TestSchemaBoundGovernsStringAndBlobLen covers the maxlen half: a 5-byte
@@ -161,14 +162,14 @@ func TestSchemaBoundGovernsStringAndBlobLen(t *testing.T) {
 	blob := encodeBlob(t, boundedID, []byte{1, 2, 3, 4, 5})
 
 	var sv schemaBoundV
-	if err := sofab.AcceptBytes(str, &sv, sofab.WithMaxStringLen(2)); err != nil {
+	if err := acceptBytes(str, &sv, sofab.WithMaxStringLen(2)); err != nil {
 		t.Fatalf("string AcceptBytes = %v, want nil", err)
 	}
 	if sv.str != "hello" {
 		t.Fatalf("string = %q, want %q", sv.str, "hello")
 	}
 	var bv schemaBoundV
-	if err := sofab.AcceptBytes(blob, &bv, sofab.WithMaxBlobLen(2)); err != nil {
+	if err := acceptBytes(blob, &bv, sofab.WithMaxBlobLen(2)); err != nil {
 		t.Fatalf("blob AcceptBytes = %v, want nil", err)
 	}
 	if len(bv.blob) != 5 {
@@ -176,9 +177,9 @@ func TestSchemaBoundGovernsStringAndBlobLen(t *testing.T) {
 	}
 
 	wantAll(t, acceptAll(t, str, []sofab.Option{sofab.WithMaxStringLen(2)},
-		func() sofab.Visitor { return &schemaBoundV{} }), nil)
+		func() any { return &schemaBoundV{} }), nil)
 	wantAll(t, acceptAll(t, blob, []sofab.Option{sofab.WithMaxBlobLen(2)},
-		func() sofab.Visitor { return &schemaBoundV{} }), nil)
+		func() any { return &schemaBoundV{} }), nil)
 }
 
 // TestReceiverLimitCapsUnboundedField is the other half of §6.2.1: on a field
@@ -202,10 +203,10 @@ func TestReceiverLimitCapsUnboundedField(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			opts := []sofab.Option{tc.opt}
-			wantAll(t, acceptAll(t, tc.msg, opts, func() sofab.Visitor { return &schemaBoundV{} }),
+			wantAll(t, acceptAll(t, tc.msg, opts, func() any { return &schemaBoundV{} }),
 				sofab.ErrLimitExceeded)
 			// A visitor with no extension at all is unchanged by this fix.
-			wantAll(t, acceptAll(t, tc.msg, opts, func() sofab.Visitor { return baseV{} }),
+			wantAll(t, acceptAll(t, tc.msg, opts, func() any { return baseV{} }),
 				sofab.ErrLimitExceeded)
 		})
 	}
@@ -221,9 +222,9 @@ func TestSchemaBoundKindSelectivity(t *testing.T) {
 	str := encodeString(t, boundedID, "hello")
 
 	wantAll(t, acceptAll(t, arr, []sofab.Option{sofab.WithMaxArrayCount(2)},
-		func() sofab.Visitor { return countOnlyV{} }), nil)
+		func() any { return countOnlyV{} }), nil)
 	wantAll(t, acceptAll(t, str, []sofab.Option{sofab.WithMaxStringLen(2)},
-		func() sofab.Visitor { return countOnlyV{} }), sofab.ErrLimitExceeded)
+		func() any { return countOnlyV{} }), sofab.ErrLimitExceeded)
 }
 
 // TestSchemaBoundOverBoundIsInvalidNotLimit is the reverse error the issue
@@ -248,7 +249,7 @@ func TestSchemaBoundOverBoundIsInvalidNotLimit(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got := acceptAll(t, tc.msg, []sofab.Option{tc.opt},
-				func() sofab.Visitor { return &schemaBoundV{} })
+				func() any { return &schemaBoundV{} })
 			wantAll(t, got, sofab.ErrInvalidMsg)
 			for surface, err := range got {
 				if errors.Is(err, sofab.ErrLimitExceeded) {
@@ -267,7 +268,7 @@ func TestSchemaBoundAskedOnlyWhenCapWouldFire(t *testing.T) {
 	msg := encodeUnsignedArray(t, boundedID, []uint64{1, 2, 3, 4, 5})
 
 	var none schemaBoundV
-	if err := sofab.AcceptBytes(msg, &none); err != nil {
+	if err := acceptBytes(msg, &none); err != nil {
 		t.Fatalf("no-limit decode = %v", err)
 	}
 	if none.asked != 0 {
@@ -275,7 +276,7 @@ func TestSchemaBoundAskedOnlyWhenCapWouldFire(t *testing.T) {
 	}
 
 	var within schemaBoundV
-	if err := sofab.AcceptBytes(msg, &within, sofab.WithMaxArrayCount(100)); err != nil {
+	if err := acceptBytes(msg, &within, sofab.WithMaxArrayCount(100)); err != nil {
 		t.Fatalf("within-limit decode = %v", err)
 	}
 	if within.asked != 0 {
@@ -283,7 +284,7 @@ func TestSchemaBoundAskedOnlyWhenCapWouldFire(t *testing.T) {
 	}
 
 	var over schemaBoundV
-	if err := sofab.AcceptBytes(msg, &over, sofab.WithMaxArrayCount(2)); err != nil {
+	if err := acceptBytes(msg, &over, sofab.WithMaxArrayCount(2)); err != nil {
 		t.Fatalf("over-limit decode = %v", err)
 	}
 	if over.asked != 1 {
@@ -301,12 +302,12 @@ func TestSchemaBoundCostsNoAllocation(t *testing.T) {
 	msg := encodeUnsignedArray(t, boundedID, []uint64{1, 2, 3, 4, 5})
 
 	plain := testing.AllocsPerRun(200, func() {
-		if err := sofab.AcceptBytes(msg, baseV{}); err != nil {
+		if err := acceptBytes(msg, baseV{}); err != nil {
 			t.Fatal(err)
 		}
 	})
 	bound := testing.AllocsPerRun(200, func() {
-		if err := sofab.AcceptBytes(msg, &schemaBoundV{}); err != nil {
+		if err := acceptBytes(msg, &schemaBoundV{}); err != nil {
 			t.Fatal(err)
 		}
 	})
@@ -338,7 +339,7 @@ func TestSchemaBoundInNestedSequence(t *testing.T) {
 	msg := buf.Bytes()
 
 	wantAll(t, acceptAll(t, msg, []sofab.Option{sofab.WithMaxArrayCount(2)},
-		func() sofab.Visitor { return &nestingV{} }), nil)
+		func() any { return &nestingV{} }), nil)
 	// The same nested array on the schema-unbounded id is still capped.
 	buf.Reset()
 	e = sofab.NewEncoder(&buf)
@@ -355,7 +356,7 @@ func TestSchemaBoundInNestedSequence(t *testing.T) {
 		t.Fatal(err)
 	}
 	wantAll(t, acceptAll(t, buf.Bytes(), []sofab.Option{sofab.WithMaxArrayCount(2)},
-		func() sofab.Visitor { return &nestingV{} }), sofab.ErrLimitExceeded)
+		func() any { return &nestingV{} }), sofab.ErrLimitExceeded)
 }
 
 // nestingV is a top-level destination with no bounds of its own that descends
@@ -363,4 +364,4 @@ func TestSchemaBoundInNestedSequence(t *testing.T) {
 // field whose message type declares the bound.
 type nestingV struct{ baseV }
 
-func (nestingV) BeginSequence(sofab.ID) (sofab.Visitor, error) { return &schemaBoundV{}, nil }
+func (nestingV) BeginSequence(sofab.ID) (any, error) { return &schemaBoundV{}, nil }

@@ -185,11 +185,11 @@ func TestSkipEveryValueKind(t *testing.T) {
 			var err error
 			switch s {
 			case "AcceptBytes":
-				err = sofab.AcceptBytes(msg, v)
-			case "Accept":
-				err = newDec(msg).Accept(v)
-			case "AcceptStream":
-				err = newDec(msg).AcceptStream(v)
+				err = acceptBytes(msg, v)
+			case "Feed":
+				err = feedIn(msg, 0, v)
+			case "Feed/1-byte":
+				err = feedIn(msg, 1, v)
 			}
 			if err != nil {
 				t.Fatalf("%s = %v, want COMPLETE", s, err)
@@ -225,11 +225,11 @@ func TestSkipSequenceErrors(t *testing.T) {
 				v := &declineSeqV{log: new([]string)}
 				switch s {
 				case "AcceptBytes":
-					err = sofab.AcceptBytes(c.in, v)
-				case "Accept":
-					err = newDec(c.in).Accept(v)
-				case "AcceptStream":
-					err = newDec(c.in).AcceptStream(v)
+					err = acceptBytes(c.in, v)
+				case "Feed":
+					err = feedIn(c.in, 0, v)
+				case "Feed/1-byte":
+					err = feedIn(c.in, 1, v)
 				}
 				if !errors.Is(err, c.want) {
 					t.Fatalf("%s = %v, want %v", s, err, c.want)
@@ -239,14 +239,12 @@ func TestSkipSequenceErrors(t *testing.T) {
 	}
 }
 
-// TestAcceptNonEOFReaderError: a real reader failure surfaces verbatim, not as
+// TestFeedFromNonEOFReaderError: a real reader failure surfaces verbatim, not as
 // a decode outcome.
-func TestAcceptNonEOFReaderError(t *testing.T) {
+func TestFeedFromNonEOFReaderError(t *testing.T) {
 	sentinel := errors.New("boom")
-	if err := sofab.NewDecoder(errReader{sentinel}).Accept(baseV{}); !errors.Is(err, sentinel) {
-		t.Fatalf("Accept = %v, want the reader error", err)
-	}
-	if err := sofab.NewDecoder(errReader{sentinel}).AcceptStream(baseV{}); !errors.Is(err, sentinel) {
-		t.Fatalf("AcceptStream = %v, want the reader error", err)
+	d := sofab.NewDecoder(baseVisitor())
+	if _, err := d.FeedFrom(errReader{sentinel}, make([]byte, 16)); !errors.Is(err, sentinel) {
+		t.Fatalf("FeedFrom = %v, want the reader error", err)
 	}
 }

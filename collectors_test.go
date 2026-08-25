@@ -55,7 +55,7 @@ func ExampleStringSeq() {
 	}
 
 	var m tagHolder
-	if err := sofab.AcceptBytes(buf.Bytes(), &m); err != nil {
+	if err := acceptBytes(buf.Bytes(), &m); err != nil {
 		fmt.Println(err)
 		return
 	}
@@ -98,7 +98,7 @@ func wrapperSeq(t testing.TB, write func(*sofab.Encoder)) []byte {
 
 // collect decodes raw into the collector, returning the decode's outcome.
 func collect(raw []byte, child sofab.Visitor, opts ...sofab.Option) error {
-	return sofab.AcceptBytes(raw, &seqRoot{child: child}, opts...)
+	return acceptBytes(raw, &seqRoot{child: child}, opts...)
 }
 
 // mustCollect decodes raw into the collector and fails on anything but a clean
@@ -146,7 +146,7 @@ func TestVisitorBaseAcceptsEveryEvent(t *testing.T) {
 		t.Fatalf("Flush: %v", err)
 	}
 
-	if err := sofab.AcceptBytes(buf.Bytes(), sofab.VisitorBase{}); err != nil {
+	if err := acceptBytes(buf.Bytes(), sofab.VisitorBase{}); err != nil {
 		t.Fatalf("decode into VisitorBase: %v", err)
 	}
 
@@ -206,7 +206,7 @@ func TestStringSeqCapacityEdges(t *testing.T) {
 	t.Run("last legal index", func(t *testing.T) {
 		var out []string
 		s := &sofab.StringSeq{Out: &out, Cap: 2, ElemMax: -1}
-		if err := s.String(1, "x"); err != nil {
+		if err := putString(s, 1, "x"); err != nil {
 			t.Fatalf("id cap-1: %v", err)
 		}
 		if len(out) != 2 || out[0] != "" || out[1] != "x" {
@@ -217,7 +217,7 @@ func TestStringSeqCapacityEdges(t *testing.T) {
 	t.Run("first illegal index", func(t *testing.T) {
 		var out []string
 		s := &sofab.StringSeq{Out: &out, Cap: 2, ElemMax: -1}
-		if err := s.String(2, "x"); !errors.Is(err, sofab.ErrInvalidMsg) {
+		if err := putString(s, 2, "x"); !errors.Is(err, sofab.ErrInvalidMsg) {
 			t.Fatalf("id cap: %v, want ErrInvalidMsg", err)
 		}
 		if len(out) != 0 {
@@ -228,7 +228,7 @@ func TestStringSeqCapacityEdges(t *testing.T) {
 	t.Run("unbounded accepts any index", func(t *testing.T) {
 		var out []string
 		s := &sofab.StringSeq{Out: &out, Cap: -1, ElemMax: -1}
-		if err := s.String(4, "x"); err != nil {
+		if err := putString(s, 4, "x"); err != nil {
 			t.Fatalf("unbounded: %v", err)
 		}
 		if len(out) != 5 {
@@ -243,9 +243,10 @@ func TestStringSeqCapacityEdges(t *testing.T) {
 func TestStringSeqOverIndexAllocatesNothing(t *testing.T) {
 	var out []string
 	s := &sofab.StringSeq{Out: &out, Cap: 4, ElemMax: -1}
+	payload := []byte("x")
 
 	allocs := testing.AllocsPerRun(100, func() {
-		if err := s.String(1<<30, "x"); !errors.Is(err, sofab.ErrInvalidMsg) {
+		if err := putPayload(s, 1<<30, payload); !errors.Is(err, sofab.ErrInvalidMsg) {
 			t.Fatalf("id 2^30: %v, want ErrInvalidMsg", err)
 		}
 	})
@@ -353,7 +354,7 @@ func TestBlobSeqBounds(t *testing.T) {
 	t.Run("over maxlen", func(t *testing.T) {
 		var out [][]byte
 		s := &sofab.BlobSeq{Out: &out, Cap: -1, ElemMax: 2}
-		if err := s.Bytes(0, []byte{1, 2, 3}); !errors.Is(err, sofab.ErrInvalidMsg) {
+		if err := putBytes(s, 0, []byte{1, 2, 3}); !errors.Is(err, sofab.ErrInvalidMsg) {
 			t.Fatalf("over maxlen: %v, want ErrInvalidMsg", err)
 		}
 		if len(out) != 0 {
@@ -372,7 +373,7 @@ func TestBlobSeqBounds(t *testing.T) {
 	t.Run("over capacity", func(t *testing.T) {
 		var out [][]byte
 		s := &sofab.BlobSeq{Out: &out, Cap: 2, ElemMax: -1}
-		if err := s.Bytes(2, []byte{1}); !errors.Is(err, sofab.ErrInvalidMsg) {
+		if err := putBytes(s, 2, []byte{1}); !errors.Is(err, sofab.ErrInvalidMsg) {
 			t.Fatalf("id cap: %v, want ErrInvalidMsg", err)
 		}
 	})
@@ -397,12 +398,23 @@ type elemMsg struct {
 	sofab.VisitorBase
 	N     uint64
 	S     string
+	pay   sofab.PayloadAcc
 	ended int
 }
 
 func (m *elemMsg) Unsigned(_ sofab.ID, v uint64) error { m.N = v; return nil }
-func (m *elemMsg) String(_ sofab.ID, v string) error   { m.S = v; return nil }
-func (m *elemMsg) EndSequence() error                  { m.ended++; return nil }
+
+// String assembles the payload out of the pieces the decoder delivers (§6.6.3),
+// through the accumulator the corelib ships for exactly this — which is what a
+// generated string field's arm looks like.
+func (m *elemMsg) String(_ sofab.ID, total, offset int, chunk []byte) error {
+	if b, done := m.pay.Take(total, offset, chunk); done {
+		m.S = string(b)
+	}
+	return nil
+}
+
+func (m *elemMsg) EndSequence() error { m.ended++; return nil }
 
 func TestMessageSeqPlacesElementsByID(t *testing.T) {
 	raw := wrapperSeq(t, func(e *sofab.Encoder) {
@@ -647,7 +659,7 @@ func TestUnsignedMatrixSeqRejectsAnOverWideElement(t *testing.T) {
 func TestUnsignedMatrixSeqZeroBoundSkipsTheScan(t *testing.T) {
 	var out [][]uint64
 	s := &sofab.UnsignedMatrixSeq[uint64]{Out: &out, Cap: -1}
-	if err := s.UnsignedArray(0, []uint64{math.MaxUint64}); err != nil {
+	if err := putUArray(s, 0, []uint64{math.MaxUint64}); err != nil {
 		t.Fatalf("u64 row: %v", err)
 	}
 	if len(out) != 1 || out[0][0] != math.MaxUint64 {
@@ -681,7 +693,7 @@ func TestSignedMatrixSeqNarrowsAndBounds(t *testing.T) {
 func TestSignedMatrixSeqZeroBoundSkipsTheScan(t *testing.T) {
 	var out [][]int64
 	s := &sofab.SignedMatrixSeq[int64]{Out: &out, Cap: -1}
-	if err := s.SignedArray(0, []int64{math.MinInt64}); err != nil {
+	if err := putSArray(s, 0, []int64{math.MinInt64}); err != nil {
 		t.Fatalf("i64 row: %v", err)
 	}
 	if len(out) != 1 || out[0][0] != math.MinInt64 {
@@ -716,7 +728,7 @@ func TestFloatMatrixSeqPlacesRows(t *testing.T) {
 	t.Run("capacity", func(t *testing.T) {
 		var out [][]float32
 		s := &sofab.Float32MatrixSeq{Out: &out, Cap: 1}
-		if err := s.Float32Array(1, []float32{1}); !errors.Is(err, sofab.ErrInvalidMsg) {
+		if err := putF32Array(s, 1, []float32{1}); !errors.Is(err, sofab.ErrInvalidMsg) {
 			t.Fatalf("row id cap: %v, want ErrInvalidMsg", err)
 		}
 	})
@@ -746,7 +758,7 @@ func TestBoolMatrixSeqMapsRows(t *testing.T) {
 func TestBoolMatrixSeqCapacity(t *testing.T) {
 	var out [][]bool
 	s := &sofab.BoolMatrixSeq{Out: &out, Cap: 2}
-	if err := s.UnsignedArray(2, []uint64{1}); !errors.Is(err, sofab.ErrInvalidMsg) {
+	if err := putUArray(s, 2, []uint64{1}); !errors.Is(err, sofab.ErrInvalidMsg) {
 		t.Fatalf("row id cap: %v, want ErrInvalidMsg", err)
 	}
 	if len(out) != 0 {
@@ -775,12 +787,16 @@ func TestBoolMatrixSeqCapacity(t *testing.T) {
 // ends. Everything with a count or length on the wire ahead of its payload
 // checks that word and allocates exactly it, once.
 func TestSequenceGrowthIsGeometric(t *testing.T) {
+	// The payload bytes are built ONCE, outside the measured closure: converting
+	// a string to []byte allocates, and that would be the test's own cost rather
+	// than the container's.
+	payload := []byte("x")
 	place := func(n int) float64 {
 		return testing.AllocsPerRun(20, func() {
 			out := make([]string, 0)
 			s := &sofab.StringSeq{Out: &out, Cap: -1, ElemMax: -1}
 			for i := 0; i < n; i++ {
-				if err := s.String(sofab.ID(i), "x"); err != nil {
+				if err := putPayload(s, sofab.ID(i), payload); err != nil {
 					t.Fatalf("place %d: %v", i, err)
 				}
 			}
@@ -806,7 +822,7 @@ func TestSequenceGrowthIsGeometric(t *testing.T) {
 	sparse := testing.AllocsPerRun(20, func() {
 		out := make([]string, 0)
 		s := &sofab.StringSeq{Out: &out, Cap: -1, ElemMax: -1}
-		if err := s.String(1000, "x"); err != nil {
+		if err := putPayload(s, 1000, payload); err != nil {
 			t.Fatalf("sparse place: %v", err)
 		}
 		if len(out) != 1001 {
@@ -816,4 +832,80 @@ func TestSequenceGrowthIsGeometric(t *testing.T) {
 	if sparse > 32 {
 		t.Errorf("one element at id 1000 cost %.0f allocations; the gap fill is not geometric", sparse)
 	}
+}
+
+// --- driving a collector by hand --------------------------------------------
+//
+// A collector is a Visitor, and the decoder now reports an aggregate IN PIECES
+// (CORELIB_PLAN §6.6.3): a payload as FixlenBegin plus String/Bytes pieces, an
+// array as ArrayBegin, one element callback per element, ArrayEnd. These
+// helpers make the same calls the decoder would for one whole element, so the
+// unit tests above can still state their case in terms of a value.
+
+func putString(v sofab.Visitor, id sofab.ID, s string) error {
+	return putPayload(v, id, []byte(s))
+}
+
+// putPayload is putString without the string-to-[]byte conversion, for the
+// places that measure allocations.
+func putPayload(v sofab.Visitor, id sofab.ID, b []byte) error {
+	if err := v.FixlenBegin(id, sofab.FixlenStr, len(b)); err != nil {
+		return err
+	}
+	return v.String(id, len(b), 0, b)
+}
+
+func putBytes(v sofab.Visitor, id sofab.ID, b []byte) error {
+	if err := v.FixlenBegin(id, sofab.FixlenBlob, len(b)); err != nil {
+		return err
+	}
+	return v.Bytes(id, len(b), 0, b)
+}
+
+func putUArray(v sofab.Visitor, id sofab.ID, xs []uint64) error {
+	if err := v.ArrayBegin(id, sofab.ArrayUnsigned, len(xs)); err != nil {
+		return err
+	}
+	for i, x := range xs {
+		if err := v.ArrayUnsigned(id, i, x); err != nil {
+			return err
+		}
+	}
+	return v.ArrayEnd(id)
+}
+
+func putSArray(v sofab.Visitor, id sofab.ID, xs []int64) error {
+	if err := v.ArrayBegin(id, sofab.ArraySigned, len(xs)); err != nil {
+		return err
+	}
+	for i, x := range xs {
+		if err := v.ArraySigned(id, i, x); err != nil {
+			return err
+		}
+	}
+	return v.ArrayEnd(id)
+}
+
+func putF32Array(v sofab.Visitor, id sofab.ID, xs []float32) error {
+	if err := v.ArrayBegin(id, sofab.ArrayFp32, len(xs)); err != nil {
+		return err
+	}
+	for i, x := range xs {
+		if err := v.ArrayFloat32(id, i, x); err != nil {
+			return err
+		}
+	}
+	return v.ArrayEnd(id)
+}
+
+func putF64Array(v sofab.Visitor, id sofab.ID, xs []float64) error {
+	if err := v.ArrayBegin(id, sofab.ArrayFp64, len(xs)); err != nil {
+		return err
+	}
+	for i, x := range xs {
+		if err := v.ArrayFloat64(id, i, x); err != nil {
+			return err
+		}
+	}
+	return v.ArrayEnd(id)
 }

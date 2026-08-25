@@ -1,7 +1,7 @@
 package sofab
 
 // Option configures optional decode-time limits. Options are passed to
-// NewDecoder (Accept / AcceptStream) or to AcceptBytes.
+// NewDecoder or to AcceptBytes.
 //
 // With no options the decoder enforces no limits and behaves bit-for-bit as it
 // did before limits existed. Limits are strictly opt-in: this package invents no
@@ -26,8 +26,7 @@ package sofab
 // INVALID, so §6.2.1 forbids the cap there and §6.3 forbids ErrLimitExceeded on
 // such a field. The decoder learns which fields those are from the destination:
 // a visitor that implements SchemaBoundVisitor (generated code does, wherever
-// its schema declares a bound) is exempt on the fields it names, and a pull
-// caller says so per field with Decoder.SchemaBounded.
+// its schema declares a bound) is exempt on the fields it names.
 type Option func(*limits)
 
 // limits holds the optional per-field decode caps plus the string-validity
@@ -80,16 +79,15 @@ func WithMaxBlobLen(n int) Option {
 //     bytes verbatim on decode / writes them verbatim on encode — never lossy,
 //     never a silent replacement (§6.4).
 //
-// Scope on decode: this option governs Decoder.String, the pull read that
-// materializes a string by construction. The visitor path (Accept, AcceptBytes,
-// AcceptStream) never validates in the decoder itself, because the cursor cannot
-// tell a field the visitor binds from one it skips and §6.4 forbids validating a
-// skip; there the check belongs to the destination. The option still reaches it:
-// the decoder hands the resolved policy to a visitor that implements
-// StringPolicyVisitor — typically by embedding a StringCheck — before that
-// scope's first string, and the destination arm calls StringCheck.UTF8Valid
-// (utf8.go). A destination that instead calls the package-level UTF8Valid is
-// always strict, since a package-level function has no decode scope to read.
+// Scope on decode: the decoder itself never validates, because it cannot tell a
+// field the visitor binds from one it skips and §6.4.5 forbids validating a
+// skip. The check belongs to the destination, which is also the only place the
+// payload is assembled at all (§6.6.3). The option reaches it: the decoder hands
+// the resolved policy to a visitor that implements StringPolicyVisitor —
+// typically by embedding a StringCheck — before that scope's first string, and
+// the destination arm calls StringCheck.UTF8Valid (utf8.go). A destination that
+// instead calls the package-level UTF8Valid is always strict, since a
+// package-level function has no decode scope to read.
 //
 // The knob never changes how valid data is encoded, so two peers with different
 // settings interoperate on all valid data. It is a validation policy, never a
@@ -146,8 +144,8 @@ func applyOptions(opts []Option) limits {
 // "compiled OFF means the validation code is not compiled in"), then the RUNTIME
 // half (WithStrictUTF8). Both halves belong at every site that validates: gating
 // only the generated-code primitive (utf8.go) on the build tag would leave a
-// footprint build in which the corelib's own paths still validate, so the pull
-// parser and the visitor path would reach different verdicts on the same bytes
+// footprint build in which the corelib's own paths still validate, so the
+// encoder and the destination would reach different verdicts on the same bytes
 // in the same build (issue #88).
 //
 // It costs nothing in the default build: strictUTF8Compiled is a true constant

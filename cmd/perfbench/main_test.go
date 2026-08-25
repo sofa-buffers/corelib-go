@@ -92,49 +92,101 @@ type walkV struct {
 	out     *[]field
 	fixKind map[sofab.ID]string
 	prefix  string
+
+	// The decoder delivers an aggregate in pieces (CORELIB_PLAN §6.6.3), so the
+	// value a row of the expectation names is assembled HERE, on the
+	// destination's own storage. That is what a generated field's arm does.
+	pay  []byte
+	sub  sofab.FixlenSubtype
+	kind sofab.ArrayKind
+	us   []uint64
+	ss   []int64
+	f32  []float32
+	f64  []float64
 }
 
-func (v walkV) add(id sofab.ID, kind, val string) error {
+func (v *walkV) add(id sofab.ID, kind, val string) error {
 	*v.out = append(*v.out, field{id, v.prefix + kind, val})
 	return nil
 }
 
-func (v walkV) Unsigned(id sofab.ID, x uint64) error { return v.add(id, "u", fmt.Sprint(x)) }
-func (v walkV) Signed(id sofab.ID, x int64) error    { return v.add(id, "s", fmt.Sprint(x)) }
+func (v *walkV) Unsigned(id sofab.ID, x uint64) error { return v.add(id, "u", fmt.Sprint(x)) }
+func (v *walkV) Signed(id sofab.ID, x int64) error    { return v.add(id, "s", fmt.Sprint(x)) }
 
-func (v walkV) Float32(id sofab.ID, x float32) error {
+func (v *walkV) Float32(id sofab.ID, x float32) error {
 	return v.add(id, "fix", fmt.Sprintf("f32:%08x", math.Float32bits(x)))
 }
 
-func (v walkV) Float64(id sofab.ID, x float64) error {
+func (v *walkV) Float64(id sofab.ID, x float64) error {
 	return v.add(id, "fix", fmt.Sprintf("f64:%016x", math.Float64bits(x)))
 }
 
-func (v walkV) String(id sofab.ID, x string) error { return v.add(id, "fix", "str:"+x) }
-
-func (v walkV) Bytes(id sofab.ID, x []byte) error {
-	return v.add(id, "fix", fmt.Sprintf("blob:%x", x))
+func (v *walkV) FixlenBegin(_ sofab.ID, sub sofab.FixlenSubtype, _ int) error {
+	v.sub, v.pay = sub, v.pay[:0]
+	return nil
 }
 
-func (v walkV) UnsignedArray(id sofab.ID, x []uint64) error { return v.add(id, "ua", fmt.Sprint(x)) }
-func (v walkV) SignedArray(id sofab.ID, x []int64) error    { return v.add(id, "sa", fmt.Sprint(x)) }
-
-func (v walkV) Float32Array(id sofab.ID, x []float32) error {
-	return v.add(id, "f32a", fmt.Sprint(x))
+func (v *walkV) String(id sofab.ID, total, offset int, chunk []byte) error {
+	v.pay = append(v.pay, chunk...)
+	if offset+len(chunk) < total {
+		return nil
+	}
+	return v.add(id, "fix", "str:"+string(v.pay))
 }
 
-func (v walkV) Float64Array(id sofab.ID, x []float64) error {
-	return v.add(id, "f64a", fmt.Sprint(x))
+func (v *walkV) Bytes(id sofab.ID, total, offset int, chunk []byte) error {
+	v.pay = append(v.pay, chunk...)
+	if offset+len(chunk) < total {
+		return nil
+	}
+	return v.add(id, "fix", fmt.Sprintf("blob:%x", v.pay))
 }
 
-func (v walkV) BeginSequence(id sofab.ID) (sofab.Visitor, error) {
+func (v *walkV) ArrayBegin(_ sofab.ID, kind sofab.ArrayKind, _ int) error {
+	v.kind = kind
+	v.us, v.ss, v.f32, v.f64 = v.us[:0], v.ss[:0], v.f32[:0], v.f64[:0]
+	return nil
+}
+
+func (v *walkV) ArrayUnsigned(_ sofab.ID, _ int, x uint64) error {
+	v.us = append(v.us, x)
+	return nil
+}
+
+func (v *walkV) ArraySigned(_ sofab.ID, _ int, x int64) error {
+	v.ss = append(v.ss, x)
+	return nil
+}
+
+func (v *walkV) ArrayFloat32(_ sofab.ID, _ int, x float32) error {
+	v.f32 = append(v.f32, x)
+	return nil
+}
+
+func (v *walkV) ArrayFloat64(_ sofab.ID, _ int, x float64) error {
+	v.f64 = append(v.f64, x)
+	return nil
+}
+
+func (v *walkV) ArrayEnd(id sofab.ID) error {
+	switch v.kind {
+	case sofab.ArrayUnsigned:
+		return v.add(id, "ua", fmt.Sprint(v.us))
+	case sofab.ArraySigned:
+		return v.add(id, "sa", fmt.Sprint(v.ss))
+	case sofab.ArrayFp32:
+		return v.add(id, "f32a", fmt.Sprint(v.f32))
+	default:
+		return v.add(id, "f64a", fmt.Sprint(v.f64))
+	}
+}
+
+func (v *walkV) BeginSequence(id sofab.ID) (sofab.Visitor, error) {
 	*v.out = append(*v.out, field{id, v.prefix + "seq{", ""})
-	child := v
-	child.prefix = "seq:"
-	return child, nil
+	return &walkV{t: v.t, out: v.out, fixKind: v.fixKind, prefix: "seq:"}, nil
 }
 
-func (v walkV) EndSequence() error {
+func (v *walkV) EndSequence() error {
 	*v.out = append(*v.out, field{0, "}", ""})
 	return nil
 }
@@ -143,7 +195,7 @@ func (v walkV) EndSequence() error {
 func walkAll(t *testing.T, buf []byte, fixKind map[sofab.ID]string) []field {
 	t.Helper()
 	var out []field
-	if err := sofab.AcceptBytes(buf, walkV{t: t, out: &out, fixKind: fixKind}); err != nil {
+	if err := sofab.AcceptBytes(buf, &walkV{t: t, out: &out, fixKind: fixKind}); err != nil {
 		t.Fatalf("AcceptBytes: %v", err)
 	}
 	return out
@@ -291,6 +343,7 @@ type compositeWalk struct {
 	t     *testing.T
 	out   *[]string
 	depth int
+	pay   []byte
 }
 
 func (w *compositeWalk) add(format string, args ...any) error {
@@ -298,7 +351,22 @@ func (w *compositeWalk) add(format string, args ...any) error {
 	return nil
 }
 
-func (w *compositeWalk) String(id sofab.ID, s string) error   { return w.add("str %d %q", id, s) }
+func (w *compositeWalk) String(id sofab.ID, total, offset int, chunk []byte) error {
+	w.pay = append(w.pay, chunk...)
+	if offset+len(chunk) < total {
+		return nil
+	}
+	return w.add("str %d %q", id, string(w.pay))
+}
+
+func (w *compositeWalk) FixlenBegin(id sofab.ID, sub sofab.FixlenSubtype, _ int) error {
+	w.pay = w.pay[:0]
+	if sub != sofab.FixlenStr {
+		return w.unexpected("non-string fixlen", id)
+	}
+	return nil
+}
+
 func (w *compositeWalk) Unsigned(id sofab.ID, v uint64) error { return w.add("u %d %d", id, v) }
 func (w *compositeWalk) Signed(id sofab.ID, v int64) error    { return w.add("s %d %d", id, v) }
 
@@ -320,19 +388,27 @@ func (w *compositeWalk) unexpected(kind string, id sofab.ID) error {
 
 func (w *compositeWalk) Float32(id sofab.ID, _ float32) error { return w.unexpected("fp32", id) }
 func (w *compositeWalk) Float64(id sofab.ID, _ float64) error { return w.unexpected("fp64", id) }
-func (w *compositeWalk) Bytes(id sofab.ID, _ []byte) error    { return w.unexpected("blob", id) }
-func (w *compositeWalk) UnsignedArray(id sofab.ID, _ []uint64) error {
+
+func (w *compositeWalk) Bytes(id sofab.ID, _, _ int, _ []byte) error {
+	return w.unexpected("blob", id)
+}
+
+func (w *compositeWalk) ArrayBegin(id sofab.ID, _ sofab.ArrayKind, _ int) error {
+	return w.unexpected("array", id)
+}
+func (w *compositeWalk) ArrayUnsigned(id sofab.ID, _ int, _ uint64) error {
 	return w.unexpected("unsigned array", id)
 }
-func (w *compositeWalk) SignedArray(id sofab.ID, _ []int64) error {
+func (w *compositeWalk) ArraySigned(id sofab.ID, _ int, _ int64) error {
 	return w.unexpected("signed array", id)
 }
-func (w *compositeWalk) Float32Array(id sofab.ID, _ []float32) error {
+func (w *compositeWalk) ArrayFloat32(id sofab.ID, _ int, _ float32) error {
 	return w.unexpected("fp32 array", id)
 }
-func (w *compositeWalk) Float64Array(id sofab.ID, _ []float64) error {
+func (w *compositeWalk) ArrayFloat64(id sofab.ID, _ int, _ float64) error {
 	return w.unexpected("fp64 array", id)
 }
+func (w *compositeWalk) ArrayEnd(sofab.ID) error { return nil }
 
 // u64ArrayCapture takes the one unsigned array the u64 workload writes.
 type u64ArrayCapture struct {
@@ -342,15 +418,24 @@ type u64ArrayCapture struct {
 	fields int
 }
 
-func (c *u64ArrayCapture) UnsignedArray(id sofab.ID, v []uint64) error {
-	c.id, c.got, c.fields = id, append([]uint64(nil), v...), c.fields+1
+func (c *u64ArrayCapture) ArrayBegin(id sofab.ID, _ sofab.ArrayKind, count int) error {
+	c.id, c.fields = id, c.fields+1
+	c.got = make([]uint64, 0, count)
+	return nil
+}
+
+func (c *u64ArrayCapture) ArrayUnsigned(_ sofab.ID, _ int, v uint64) error {
+	c.got = append(c.got, v)
 	return nil
 }
 
 func (c *u64ArrayCapture) Unsigned(sofab.ID, uint64) error { c.fields++; return nil }
 func (c *u64ArrayCapture) Signed(sofab.ID, int64) error    { c.fields++; return nil }
-func (c *u64ArrayCapture) String(sofab.ID, string) error   { c.fields++; return nil }
-func (c *u64ArrayCapture) Bytes(sofab.ID, []byte) error    { c.fields++; return nil }
+
+func (c *u64ArrayCapture) FixlenBegin(sofab.ID, sofab.FixlenSubtype, int) error {
+	c.fields++
+	return nil
+}
 
 // The composite message is the only workload exercising the wrapper-array form,
 // multi-byte UTF-8, depth-3 nesting, an omitted all-default field and a two-byte
@@ -460,8 +545,13 @@ type blobCapture struct {
 	got []byte
 }
 
-func (c *blobCapture) Bytes(id sofab.ID, b []byte) error {
-	c.id, c.got = id, append([]byte(nil), b...)
+func (c *blobCapture) FixlenBegin(id sofab.ID, _ sofab.FixlenSubtype, total int) error {
+	c.id, c.got = id, make([]byte, 0, total)
+	return nil
+}
+
+func (c *blobCapture) Bytes(_ sofab.ID, _, _ int, chunk []byte) error {
+	c.got = append(c.got, chunk...)
 	return nil
 }
 
@@ -547,49 +637,59 @@ func TestDiscardSinkFoldsAndKeepsNothing(t *testing.T) {
 	}
 }
 
-// The blob decode is "fed in 4096-byte chunks", which is chunkReader's whole
-// job: never hand out more than one chunk per Read, and still decode correctly
-// whatever boundary a field straddles.
-func TestChunkReaderFeedsInChunks(t *testing.T) {
-	r := &chunkReader{buf: make([]byte, 10_000), chunk: blobChunk}
-	p := make([]byte, 8192)
-	total, calls := 0, 0
-	for {
-		k, err := r.Read(p)
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			t.Fatalf("Read: %v", err)
-		}
-		if k > blobChunk {
-			t.Fatalf("Read returned %d bytes, more than the %d-byte chunk", k, blobChunk)
-		}
-		total += k
-		calls++
-	}
-	if total != 10_000 || calls != 3 {
-		t.Errorf("read %d bytes in %d calls, want 10000 in 3", total, calls)
-	}
-	r.reset()
-	if k, err := r.Read(p); k == 0 || err != nil {
-		t.Errorf("after reset: Read = %d, %v, want the stream again", k, err)
-	}
-}
-
-// The chunk-fed decode must reach the same values as a one-shot decode, at any
-// boundary: a byte-at-a-time feed is the extreme case of the 4096-byte one.
-func TestDecodeOverAChunkedReaderResumesAtAnyBoundary(t *testing.T) {
+// The blob decode is "fed in 4096-byte chunks" — which is now literally what it
+// is: the message is handed to Feed 4096 bytes at a time, and the decoder
+// suspends and resumes wherever a field straddles a boundary.
+func TestChunkedFeedResumesAtAnyBoundary(t *testing.T) {
 	buf := encodeToBytes(t, encodeTypical)
-	for _, chunk := range []int{1, 3, 7, len(buf)} {
-		r := &chunkReader{buf: buf, chunk: chunk}
+	for _, chunk := range []int{1, 3, 7, blobChunk, len(buf)} {
+		d := sofab.NewDecoder(foldVisitor{})
 		before := sink
-		if err := sofab.NewDecoder(r).AcceptStream(foldVisitor{}); err != nil {
-			t.Fatalf("chunk %d: AcceptStream: %v", chunk, err)
+		for off := 0; off < len(buf); off += chunk {
+			end := off + chunk
+			if end > len(buf) {
+				end = len(buf)
+			}
+			if _, err := d.Feed(buf[off:end]); err != nil {
+				t.Fatalf("chunk %d: Feed: %v", chunk, err)
+			}
+		}
+		if d.Status() != sofab.Complete {
+			t.Fatalf("chunk %d: status = %v, want COMPLETE", chunk, d.Status())
 		}
 		if sink == before {
 			t.Errorf("chunk %d: the decode folded nothing", chunk)
 		}
+	}
+}
+
+// do_decode_blob is the harness's own chunked driver; this holds it to the same
+// contract on the real workload.
+func TestDecodeBlobIsFedInChunks(t *testing.T) {
+	setupDecodeBlob()
+	before := sink
+	run_decode_blob()
+	if sink == before {
+		t.Error("the chunked blob decode folded nothing")
+	}
+}
+
+// foldVisitor is the destination for the perf, composite and blob rows, so every
+// arm of it has to fold — one that silently dropped a field kind would report a
+// throughput for a decode that did less work than the row claims. The fp32 array
+// arm is the one no shared workload carries, so it is driven here.
+func TestFoldVisitorFoldsEveryFieldKind(t *testing.T) {
+	buf := encodeToBytes(t, func(e *sofab.Encoder) {
+		e.WriteFloat32Array(1, []float32{1.5, -2.5})
+		e.WriteFloat64Array(2, []float64{3.5})
+		sofab.WriteSignedArray(e, 3, []int64{-1, -2})
+	})
+	before := sink
+	if err := sofab.AcceptBytes(buf, foldVisitor{}); err != nil {
+		t.Fatalf("AcceptBytes: %v", err)
+	}
+	if sink == before {
+		t.Error("foldVisitor folded nothing for the float/signed array kinds")
 	}
 }
 
@@ -697,14 +797,21 @@ type countingVisitor struct {
 	n int
 }
 
-func (c *countingVisitor) Unsigned(sofab.ID, uint64) error        { c.n++; return nil }
-func (c *countingVisitor) Signed(sofab.ID, int64) error           { c.n++; return nil }
-func (c *countingVisitor) Float32(sofab.ID, float32) error        { c.n++; return nil }
-func (c *countingVisitor) Float64(sofab.ID, float64) error        { c.n++; return nil }
-func (c *countingVisitor) String(sofab.ID, string) error          { c.n++; return nil }
-func (c *countingVisitor) UnsignedArray(sofab.ID, []uint64) error { c.n++; return nil }
-func (c *countingVisitor) SignedArray(sofab.ID, []int64) error    { c.n++; return nil }
-func (c *countingVisitor) Float64Array(sofab.ID, []float64) error { c.n++; return nil }
+func (c *countingVisitor) Unsigned(sofab.ID, uint64) error { c.n++; return nil }
+func (c *countingVisitor) Signed(sofab.ID, int64) error    { c.n++; return nil }
+func (c *countingVisitor) Float32(sofab.ID, float32) error { c.n++; return nil }
+func (c *countingVisitor) Float64(sofab.ID, float64) error { c.n++; return nil }
+
+// One count per FIELD, not per piece or per element: FixlenBegin and ArrayBegin
+// fire exactly once each, which is what makes them the right place to count.
+func (c *countingVisitor) FixlenBegin(_ sofab.ID, sub sofab.FixlenSubtype, _ int) error {
+	if sub == sofab.FixlenStr || sub == sofab.FixlenBlob {
+		c.n++
+	}
+	return nil
+}
+
+func (c *countingVisitor) ArrayBegin(sofab.ID, sofab.ArrayKind, int) error { c.n++; return nil }
 func (c *countingVisitor) BeginSequence(sofab.ID) (sofab.Visitor, error) {
 	return c, nil
 }
