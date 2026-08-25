@@ -246,6 +246,23 @@ func (s *NestedSeq[T]) BeginSequence(id ID) (Visitor, error) {
 	return s.Make(&(*s.Out)[id]), nil
 }
 
+// arrivedRow is the row a matrix collector hands to PlaceRow: never nil, even
+// when it is empty.
+//
+// An empty row that ARRIVED and a row the message never carried are two
+// different things, and the destination is where the difference is visible. A
+// row is assembled by appending, so an empty one is still the nil slice the
+// collector opened with -- indistinguishable from the gap PlaceRow leaves for a
+// row that never came, and rendered as `null` rather than `[]` by anything that
+// serializes the result. The whole-row callback this replaced could not produce
+// that: it built the row before placing it, so an empty row was an empty slice.
+func arrivedRow[T any](row []T) []T {
+	if row == nil {
+		return []T{}
+	}
+	return row
+}
+
 // PlaceRow stores a FINISHED row of a matrix (an array whose elements are
 // native arrays) at the index its element id names, growing out with empty rows
 // so an id gap decodes as an empty row instead of shifting every later row down
@@ -331,7 +348,7 @@ func (s *UnsignedMatrixSeq[T]) ArrayUnsigned(_ ID, _ int, v uint64) error {
 func (s *UnsignedMatrixSeq[T]) ArrayEnd(id ID) error {
 	row := s.row
 	s.row = nil
-	return PlaceRow(s.Out, s.Cap, id, row)
+	return PlaceRow(s.Out, s.Cap, id, arrivedRow(row))
 }
 
 // SignedMatrixSeq is UnsignedMatrixSeq for signed element widths: elements
@@ -374,7 +391,7 @@ func (s *SignedMatrixSeq[T]) ArraySigned(_ ID, _ int, v int64) error {
 func (s *SignedMatrixSeq[T]) ArrayEnd(id ID) error {
 	row := s.row
 	s.row = nil
-	return PlaceRow(s.Out, s.Cap, id, row)
+	return PlaceRow(s.Out, s.Cap, id, arrivedRow(row))
 }
 
 // Float32MatrixSeq collects the rows of an fp32 matrix. No width check: the
@@ -408,7 +425,7 @@ func (s *Float32MatrixSeq) ArrayFloat32(_ ID, _ int, v float32) error {
 func (s *Float32MatrixSeq) ArrayEnd(id ID) error {
 	row := s.row
 	s.row = nil
-	return PlaceRow(s.Out, s.Cap, id, row)
+	return PlaceRow(s.Out, s.Cap, id, arrivedRow(row))
 }
 
 // Float64MatrixSeq is Float32MatrixSeq for fp64 rows.
@@ -441,7 +458,7 @@ func (s *Float64MatrixSeq) ArrayFloat64(_ ID, _ int, v float64) error {
 func (s *Float64MatrixSeq) ArrayEnd(id ID) error {
 	row := s.row
 	s.row = nil
-	return PlaceRow(s.Out, s.Cap, id, row)
+	return PlaceRow(s.Out, s.Cap, id, arrivedRow(row))
 }
 
 // BoolMatrixSeq collects the rows of a bool matrix. Bools travel as an unsigned
@@ -477,5 +494,5 @@ func (s *BoolMatrixSeq) ArrayUnsigned(_ ID, _ int, v uint64) error {
 func (s *BoolMatrixSeq) ArrayEnd(id ID) error {
 	row := s.row
 	s.row = nil
-	return PlaceRow(s.Out, s.Cap, id, row)
+	return PlaceRow(s.Out, s.Cap, id, arrivedRow(row))
 }
