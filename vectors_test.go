@@ -10,11 +10,11 @@ import (
 	"bytes"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
-	"io"
+	"fmt"
 	"math"
 	"os"
 	"strconv"
+	"strings"
 	"testing"
 	"testing/iotest"
 
@@ -333,168 +333,6 @@ func TestVectorEncodeOverCallerBuffer(t *testing.T) {
 
 // --- decode side -------------------------------------------------------------
 
-func decodeField(t *testing.T, d *sofab.Decoder, f vecField) {
-	t.Helper()
-	fd, err := d.Next()
-	if err != nil {
-		t.Fatalf("Next: %v", err)
-	}
-	switch f.Op {
-	case "sequence_begin":
-		if fd.Type != sofab.TypeSequenceStart || fd.ID != sofab.ID(f.ID) {
-			t.Fatalf("seq begin: got %+v", fd)
-		}
-		return
-	case "sequence_end":
-		// The end marker's id is discarded, so the decoder must report 0 for it
-		// however the vector spells it (§4.9, issue #94) — the vectors' own end
-		// markers carry no id at all, and f.ID is the zero value there.
-		if fd.Type != sofab.TypeSequenceEnd || fd.ID != 0 {
-			t.Fatalf("seq end: got %+v, want {ID:0 Type:TypeSequenceEnd}", fd)
-		}
-		return
-	}
-	if fd.ID != sofab.ID(f.ID) {
-		t.Fatalf("id = %d, want %d (op %s)", fd.ID, f.ID, f.Op)
-	}
-	switch f.Op {
-	case "unsigned":
-		got, err := d.Unsigned()
-		if err != nil || got != pUint(t, f.Value) {
-			t.Fatalf("unsigned = %d, %v; want %d", got, err, pUint(t, f.Value))
-		}
-	case "boolean":
-		got, err := d.Bool()
-		if err != nil || got != pBool(t, f.Value) {
-			t.Fatalf("bool = %v, %v; want %v", got, err, pBool(t, f.Value))
-		}
-	case "signed":
-		got, err := d.Signed()
-		if err != nil || got != pInt(t, f.Value) {
-			t.Fatalf("signed = %d, %v; want %d", got, err, pInt(t, f.Value))
-		}
-	case "fp32":
-		got, err := d.Float32()
-		want := float32(pFloat(t, f.Value))
-		if err != nil || math.Float32bits(got) != math.Float32bits(want) {
-			t.Fatalf("fp32 = %v, %v; want %v", got, err, want)
-		}
-	case "fp64":
-		got, err := d.Float64()
-		want := pFloat(t, f.Value)
-		if err != nil || math.Float64bits(got) != math.Float64bits(want) {
-			t.Fatalf("fp64 = %v, %v; want %v", got, err, want)
-		}
-	case "string":
-		got, err := d.String()
-		if err != nil || got != pString(t, f.Value) {
-			t.Fatalf("string = %q, %v; want %q", got, err, pString(t, f.Value))
-		}
-	case "blob":
-		got, err := d.Bytes()
-		want, _ := hex.DecodeString(f.ValueHex)
-		if err != nil || !bytes.Equal(got, want) {
-			t.Fatalf("blob = %x, %v; want %x", got, err, want)
-		}
-	case "array":
-		decodeArray(t, d, f)
-	default:
-		t.Fatalf("unknown op %q", f.Op)
-	}
-}
-
-func decodeArray(t *testing.T, d *sofab.Decoder, f vecField) {
-	t.Helper()
-	switch f.ElementType {
-	case "u8":
-		got, err := sofab.ReadUnsignedArray[uint8](d)
-		wantU(t, err, len(got), f, func(i int) uint64 { return uint64(got[i]) })
-	case "u16":
-		got, err := sofab.ReadUnsignedArray[uint16](d)
-		wantU(t, err, len(got), f, func(i int) uint64 { return uint64(got[i]) })
-	case "u32":
-		got, err := sofab.ReadUnsignedArray[uint32](d)
-		wantU(t, err, len(got), f, func(i int) uint64 { return uint64(got[i]) })
-	case "u64":
-		got, err := sofab.ReadUnsignedArray[uint64](d)
-		wantU(t, err, len(got), f, func(i int) uint64 { return got[i] })
-	case "i8":
-		got, err := sofab.ReadSignedArray[int8](d)
-		wantI(t, err, len(got), f, func(i int) int64 { return int64(got[i]) })
-	case "i16":
-		got, err := sofab.ReadSignedArray[int16](d)
-		wantI(t, err, len(got), f, func(i int) int64 { return int64(got[i]) })
-	case "i32":
-		got, err := sofab.ReadSignedArray[int32](d)
-		wantI(t, err, len(got), f, func(i int) int64 { return int64(got[i]) })
-	case "i64":
-		got, err := sofab.ReadSignedArray[int64](d)
-		wantI(t, err, len(got), f, func(i int) int64 { return got[i] })
-	case "fp32":
-		got, err := d.ReadFloat32Array()
-		if err != nil || len(got) != len(f.Values) {
-			t.Fatalf("fp32 array len = %d, %v; want %d", len(got), err, len(f.Values))
-		}
-		for i, r := range f.Values {
-			if math.Float32bits(got[i]) != math.Float32bits(float32(pFloat(t, r))) {
-				t.Fatalf("fp32[%d] = %v, want %v", i, got[i], pFloat(t, r))
-			}
-		}
-	case "fp64":
-		got, err := d.ReadFloat64Array()
-		if err != nil || len(got) != len(f.Values) {
-			t.Fatalf("fp64 array len = %d, %v; want %d", len(got), err, len(f.Values))
-		}
-		for i, r := range f.Values {
-			if math.Float64bits(got[i]) != math.Float64bits(pFloat(t, r)) {
-				t.Fatalf("fp64[%d] = %v, want %v", i, got[i], pFloat(t, r))
-			}
-		}
-	default:
-		t.Fatalf("unknown element_type %q", f.ElementType)
-	}
-}
-
-func wantU(t *testing.T, err error, n int, f vecField, get func(int) uint64) {
-	t.Helper()
-	if err != nil || n != len(f.Values) {
-		t.Fatalf("%s array len = %d, %v; want %d", f.ElementType, n, err, len(f.Values))
-	}
-	for i, r := range f.Values {
-		if get(i) != pUint(t, r) {
-			t.Fatalf("%s[%d] = %d, want %d", f.ElementType, i, get(i), pUint(t, r))
-		}
-	}
-}
-
-func wantI(t *testing.T, err error, n int, f vecField, get func(int) int64) {
-	t.Helper()
-	if err != nil || n != len(f.Values) {
-		t.Fatalf("%s array len = %d, %v; want %d", f.ElementType, n, err, len(f.Values))
-	}
-	for i, r := range f.Values {
-		if get(i) != pInt(t, r) {
-			t.Fatalf("%s[%d] = %d, want %d", f.ElementType, i, get(i), pInt(t, r))
-		}
-	}
-}
-
-func TestVectorDecode(t *testing.T) {
-	vf := loadVectors(t)
-	for _, v := range vf.Vectors {
-		t.Run(v.Name, func(t *testing.T) {
-			raw, err := hex.DecodeString(v.Serialized.Hex)
-			if err != nil {
-				t.Fatalf("hex: %v", err)
-			}
-			d := sofab.NewDecoder(bytes.NewReader(raw))
-			for _, f := range v.Fields {
-				decodeField(t, d, f)
-			}
-		})
-	}
-}
-
 // --- skip-ids scenario -------------------------------------------------------
 
 // advancePastSequence returns the index just after the sequence_end that matches
@@ -517,26 +355,62 @@ func advancePastSequence(fields []vecField, start int) int {
 	return len(fields)
 }
 
-// decodeSkipping replays the message but leaves every id in skip unread, letting
-// the decoder skip the field — and, when the id names a sequence, the whole
-// nested sub-sequence at any depth. Non-skipped fields are still verified, and
-// the stream must end exactly (io.EOF) once the structure is exhausted.
-func decodeSkipping(t *testing.T, d *sofab.Decoder, v vector, skip map[uint32]bool) {
+// skipIDsV is the destination the skip-ids scenario decodes into: it records
+// every field it is handed EXCEPT the ids the scenario skips, and declines a
+// sub-sequence whose id is skipped so the whole sub-tree is walked without
+// being delivered (§6.0, §7.2 item 7).
+type skipIDsV struct {
+	skip map[uint32]bool
+	log  *[]string
+}
+
+func (v skipIDsV) rec(id sofab.ID, s string) error {
+	if !v.skip[uint32(id)] {
+		*v.log = append(*v.log, s)
+	}
+	return nil
+}
+
+func (v skipIDsV) Unsigned(id sofab.ID, x uint64) error { return v.rec(id, evU(id, x)) }
+func (v skipIDsV) Signed(id sofab.ID, x int64) error    { return v.rec(id, evS(id, x)) }
+func (v skipIDsV) Float32(id sofab.ID, x float32) error { return v.rec(id, evF32(id, x)) }
+func (v skipIDsV) Float64(id sofab.ID, x float64) error { return v.rec(id, evF64(id, x)) }
+func (v skipIDsV) String(id sofab.ID, x string) error   { return v.rec(id, evStr(id, x)) }
+func (v skipIDsV) Bytes(id sofab.ID, x []byte) error    { return v.rec(id, evBlob(id, x)) }
+func (v skipIDsV) UnsignedArray(id sofab.ID, x []uint64) error {
+	return v.rec(id, evAU(id, x))
+}
+func (v skipIDsV) SignedArray(id sofab.ID, x []int64) error {
+	return v.rec(id, evAS(id, x))
+}
+func (v skipIDsV) Float32Array(id sofab.ID, x []float32) error {
+	return v.rec(id, evAF32(id, x))
+}
+func (v skipIDsV) Float64Array(id sofab.ID, x []float64) error {
+	return v.rec(id, evAF64(id, x))
+}
+
+func (v skipIDsV) BeginSequence(id sofab.ID) (any, error) {
+	if v.skip[uint32(id)] {
+		return nil, nil // decline the whole sub-tree
+	}
+	*v.log = append(*v.log, fmt.Sprintf("seqbegin/%d", id))
+	return v, nil
+}
+
+func (v skipIDsV) EndSequence() error {
+	*v.log = append(*v.log, "seqend")
+	return nil
+}
+
+// expectSkipped is expectLog with the skipped ids — and, for a skipped
+// sequence, its whole sub-tree — removed.
+func expectSkipped(t *testing.T, fields []vecField, skip map[uint32]bool) []string {
 	t.Helper()
-	fields := v.Fields
+	var kept []vecField
 	for i := 0; i < len(fields); {
 		f := fields[i]
 		if f.Op != "sequence_end" && skip[f.ID] {
-			fd, err := d.Next()
-			if err != nil {
-				t.Fatalf("Next (skip id %d): %v", f.ID, err)
-			}
-			if fd.ID != sofab.ID(f.ID) {
-				t.Fatalf("skip: id = %d, want %d", fd.ID, f.ID)
-			}
-			if err := d.Skip(); err != nil {
-				t.Fatalf("Skip id %d: %v", f.ID, err)
-			}
 			if f.Op == "sequence_begin" {
 				i = advancePastSequence(fields, i)
 			} else {
@@ -544,12 +418,10 @@ func decodeSkipping(t *testing.T, d *sofab.Decoder, v vector, skip map[uint32]bo
 			}
 			continue
 		}
-		decodeField(t, d, f)
+		kept = append(kept, f)
 		i++
 	}
-	if _, err := d.Next(); err != io.EOF {
-		t.Fatalf("message not fully consumed after skip-ids: Next = %v, want io.EOF", err)
-	}
+	return expectLog(t, kept)
 }
 
 // TestVectorSkipIDs drives the skip-ids decode scenario: for every vector that
@@ -572,96 +444,34 @@ func TestVectorSkipIDs(t *testing.T) {
 		if err != nil {
 			t.Fatalf("%s: hex: %v", v.Name, err)
 		}
-		readers := map[string]func() io.Reader{
-			"all-at-once": func() io.Reader { return bytes.NewReader(raw) },
-			"one-byte":    func() io.Reader { return iotest.OneByteReader(bytes.NewReader(raw)) },
+		want := strings.Join(expectSkipped(t, v.Fields, skip), "|")
+
+		// All three entry points, plus a one-byte reader, so skipping is proven
+		// to resume across any read boundary.
+		runs := map[string]func(any) error{
+			"AcceptBytes": func(vis any) error { return acceptBytes(raw, vis) },
+			"Feed":        func(vis any) error { return feedIn(raw, 0, vis) },
+			"Feed/1-byte": func(vis any) error {
+				return feedIn(raw, 1, vis)
+			},
+			"FeedFrom/one-byte": func(vis any) error {
+				return feedFrom(iotest.OneByteReader(bytes.NewReader(raw)), 1, vis)
+			},
 		}
-		for name, mk := range readers {
+		for name, run := range runs {
 			t.Run(v.Name+"/"+name, func(t *testing.T) {
-				decodeSkipping(t, sofab.NewDecoder(mk()), v, skip)
+				var log []string
+				if err := run(skipIDsV{skip: skip, log: &log}); err != nil {
+					t.Fatalf("%s = %v, want COMPLETE", name, err)
+				}
+				if got := strings.Join(log, "|"); got != want {
+					t.Fatalf("%s events =\n %s\nwant\n %s", name, got, want)
+				}
 			})
 		}
 	}
 	if ran == 0 {
 		t.Fatal("no vectors carried skip_ids; expected the suite to exercise the skip-ids scenario")
-	}
-}
-
-// --- §7.3 type-mismatch scenario ----------------------------------------------
-
-// readWrongType binds a deliberately wrong typed reader to the field the decoder
-// is sitting on: a signed read on an unsigned field, a blob read on a fixlen one
-// (which matches only an actual blob), an fp32-array read on a fixlen array
-// (which matches only an fp32 array), and so on. Sequence markers carry no
-// value, so there is nothing to bind.
-func readWrongType(d *sofab.Decoder, t sofab.WireType) error {
-	switch t {
-	case sofab.TypeVarintUnsigned:
-		_, err := d.Signed()
-		return err
-	case sofab.TypeVarintSigned:
-		_, err := d.Unsigned()
-		return err
-	case sofab.TypeFixlen:
-		_, err := d.Bytes()
-		return err
-	case sofab.TypeVarintArrayUnsigned:
-		_, err := sofab.ReadSignedArray[int64](d)
-		return err
-	case sofab.TypeVarintArraySigned:
-		_, err := sofab.ReadUnsignedArray[uint64](d)
-		return err
-	case sofab.TypeFixlenArray:
-		_, err := d.ReadFloat32Array()
-		return err
-	}
-	return nil
-}
-
-// TestVectorTypeMismatchStaysComplete replays every shared vector through the
-// pull parser with the wrong type bound to every field. MESSAGE_SPEC §7.3 makes
-// such a read a skip, exactly like an unknown id, so each of these decodes must
-// still walk the whole message and end COMPLETE (io.EOF at the top level) while
-// reporting nothing worse than ErrTypeMismatch. The vectors are valid messages,
-// and which type a *reader* asks for cannot make them malformed (issue #79) —
-// before the fix these same bytes came back as ErrInvalidMsg or as the "invalid
-// usage" code CORELIB_PLAN §6.3 removed, and the walk stopped at the first
-// mis-bound field.
-func TestVectorTypeMismatchStaysComplete(t *testing.T) {
-	vf := loadVectors(t)
-	mismatches := 0
-	for _, v := range vf.Vectors {
-		t.Run(v.Name, func(t *testing.T) {
-			raw, err := hex.DecodeString(v.Serialized.Hex)
-			if err != nil {
-				t.Fatalf("hex: %v", err)
-			}
-			d := sofab.NewDecoder(bytes.NewReader(raw))
-			for {
-				f, err := d.Next()
-				if err == io.EOF {
-					break // COMPLETE: the whole message was walked
-				}
-				if err != nil {
-					t.Fatalf("Next: %v", err)
-				}
-				switch err := readWrongType(d, f.Type); {
-				case err == nil:
-					// The wrong reader happened to be the right one for this
-					// field (a blob, or an fp32 array): a normal read.
-				case errors.Is(err, sofab.ErrTypeMismatch):
-					mismatches++
-					if errors.Is(err, sofab.ErrInvalidMsg) || errors.Is(err, sofab.ErrArgument) {
-						t.Fatalf("id %d: mismatch reported as %v", f.ID, err)
-					}
-				default:
-					t.Fatalf("id %d (wire type %d): %v, want nil or ErrTypeMismatch", f.ID, f.Type, err)
-				}
-			}
-		})
-	}
-	if mismatches == 0 {
-		t.Fatal("no vector produced a type mismatch; the scenario went vacuous")
 	}
 }
 
@@ -837,25 +647,16 @@ func TestVectorInvalidUTF8(t *testing.T) {
 				}
 			}
 
-			// Decode, pull: Decoder.String is a materializing read.
-			d := sofab.NewDecoder(bytes.NewReader(wire))
-			mustNext(t, d)
-			got, err := d.String()
-			checkUTF8Decode(t, "pull String", err)
-			if err == nil && got != string(payload) {
-				t.Fatalf("pull String = % X, want % X verbatim", got, payload)
-			}
-
-			// Decode, visitor: the destination is where the check runs.
+			// Decode: the destination is where the check runs (§6.4.3).
 			bind := &bindStrV{id: id}
-			checkUTF8Decode(t, "visitor destination", sofab.AcceptBytes(wire, bind))
+			checkUTF8Decode(t, "visitor destination", acceptBytes(wire, bind))
 			if !utf8CheckCompiled && bind.got != string(payload) {
 				t.Fatalf("destination bound % X, want % X verbatim", bind.got, payload)
 			}
 
 			// A visitor with no destination for the id skips the payload, and a
 			// skip is never validated — in either build (§6.4).
-			if err := sofab.AcceptBytes(wire, &bindStrV{id: id + 1}); err != nil {
+			if err := acceptBytes(wire, &bindStrV{id: id + 1}); err != nil {
 				t.Fatalf("skipped payload = %v, want nil", err)
 			}
 		})

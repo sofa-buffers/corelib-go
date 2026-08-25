@@ -1,7 +1,6 @@
 package sofab_test
 
 import (
-	"bytes"
 	"errors"
 	"testing"
 
@@ -9,14 +8,14 @@ import (
 )
 
 // boundedVisitor is a generated-style visitor that enforces schema bounds at the
-// header via the optional HeaderVisitor extension: array/fixlen field 15 has an
+// header via ArrayBegin / FixlenBegin: array/fixlen field 15 has an
 // element-count / maxlen bound of 4. It embeds baseV for the value callbacks it
 // does not care about, exactly as generated code would.
 type boundedVisitor struct{ baseV }
 
-// HeaderVisitor is satisfied structurally, so a stale ArrayBegin signature would
+// aggHeader is satisfied structurally, so a stale ArrayBegin signature would
 // silently opt the visitor out of the hooks instead of failing to compile. Pin it.
-var _ sofab.HeaderVisitor = boundedVisitor{}
+var _ aggHeader = boundedVisitor{}
 
 func (boundedVisitor) ArrayBegin(id sofab.ID, kind sofab.ArrayKind, count int) error {
 	if id == 15 && count > 4 {
@@ -32,7 +31,7 @@ func (boundedVisitor) FixlenHeader(id sofab.ID, subtype, length int) error {
 	return nil
 }
 
-// plainVisitor implements only Visitor (no HeaderVisitor), so it must behave
+// plainVisitor declares no bound at all, so it must behave
 // exactly as before the header hooks existed — a truncated over-count is
 // INCOMPLETE, since it never opts into a header-level bound.
 type plainVisitor struct{ baseV }
@@ -98,28 +97,28 @@ func TestHeaderHookAntiFolding(t *testing.T) {
 		c := c
 		t.Run(c.name, func(t *testing.T) {
 			// AcceptBytes (zero-copy cursor path).
-			if err := sofab.AcceptBytes(c.in, boundedVisitor{}); !errors.Is(err, c.want) {
+			if err := acceptBytes(c.in, boundedVisitor{}); !errors.Is(err, c.want) {
 				t.Errorf("AcceptBytes: got %v, want %v", err, c.want)
 			}
 			// Accept (streaming path: slurp then cursor).
-			if err := sofab.NewDecoder(bytes.NewReader(c.in)).Accept(boundedVisitor{}); !errors.Is(err, c.want) {
+			if err := feedIn(c.in, 0, boundedVisitor{}); !errors.Is(err, c.want) {
 				t.Errorf("Accept: got %v, want %v", err, c.want)
 			}
 		})
 	}
 }
 
-// TestHeaderHookBackwardCompat pins the additive contract: a visitor that does
-// NOT implement HeaderVisitor is unaffected by the hooks. The over-count +
-// truncated vector — INVALID for boundedVisitor above — stays INCOMPLETE here,
-// because a visitor without a declared bound has nothing to reject at the header.
+// TestHeaderHookBackwardCompat pins the other side: a destination that declares
+// NO bound rejects nothing at the header. The over-count + truncated vector —
+// INVALID for boundedVisitor above — stays INCOMPLETE here, because there is no
+// schema statement for it to breach.
 func TestHeaderHookBackwardCompat(t *testing.T) {
 	in := []byte{0x7b, 6, 1, 2} // over-count (6) then EOF
 
-	if err := sofab.AcceptBytes(in, plainVisitor{}); !errors.Is(err, sofab.ErrIncomplete) {
+	if err := acceptBytes(in, plainVisitor{}); !errors.Is(err, sofab.ErrIncomplete) {
 		t.Errorf("AcceptBytes: got %v, want ErrIncomplete", err)
 	}
-	if err := sofab.NewDecoder(bytes.NewReader(in)).Accept(plainVisitor{}); !errors.Is(err, sofab.ErrIncomplete) {
+	if err := feedIn(in, 0, plainVisitor{}); !errors.Is(err, sofab.ErrIncomplete) {
 		t.Errorf("Accept: got %v, want ErrIncomplete", err)
 	}
 }

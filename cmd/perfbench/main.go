@@ -15,25 +15,22 @@
 // Callgrind harness toggles collection around ("main.run_<workload>").
 //
 // The datasets are BENCH_SPEC's: the 1000-element u64 array, the small "typical"
-// message, the 12-field perf message, the unbounded 1 MB blob (one-shot,
-// streaming and pass-through encode, chunk-fed decode) and the composite message
+// message, the 12-field perf message, the unbounded 1 MB blob (one-shot and
+// streaming encode, chunk-fed decode) and the composite message
 // that reaches the paths the flat ones never do — a wrapper array, multi-byte
 // UTF-8, depth-3 nesting, an omitted all-default field and a two-byte field
 // header.
 //
 // Read the `blob 1MB` rows against each other, not against the others: five
 // bytes of that message are metadata and a million are payload, so its MB/s is
-// the machine's memory bandwidth. The signal is the *differences* — one-shot to
-// streaming is the flush machinery, streaming to pass-through is what the
-// CORELIB_PLAN §5.1 permission buys — and both are best read as Callgrind Ir/op
-// (bench/run_callgrind.sh), where instruction counts do not care about
+// the machine's memory bandwidth. The signal is the *difference* — one-shot to
+// streaming is what the flush machinery costs — and it is best read as Callgrind
+// Ir/op (bench/run_callgrind.sh), where instruction counts do not care about
 // bandwidth.
 package main
 
 import (
-	"bytes"
 	"fmt"
-	"io"
 	"math"
 	"os"
 	"strconv"
@@ -77,6 +74,10 @@ var (
 	encOut     []byte // caller-supplied one-shot output buffer
 	encScratch []byte // caller-supplied streaming buffer, drained by discardSink
 	decBuf     []byte // a pre-encoded message, the decode workloads' input
+	// payloadDst is the destination a decoded string/blob payload is copied
+	// into. Sized once, at package init, from the largest payload any workload
+	// carries — never from a wire length, which is the whole point (§6.6).
+	payloadDst = make([]byte, blobLen)
 
 	// used is the encoded size of the message the last op produced (encode) or
 	// consumed (decode). It is the table's `bytes` column and is reported to
@@ -189,25 +190,19 @@ var compositeStr = strings.Repeat(compositeText, 32)
 
 // baseVisitor is a no-op visitor; workload visitors embed it and override only
 // the field kinds they care about (the generated code would do the same).
-type baseVisitor struct{}
+type baseVisitor struct{ sofab.VisitorBase }
 
-func (baseVisitor) Unsigned(sofab.ID, uint64) error                 { return nil }
-func (baseVisitor) Signed(sofab.ID, int64) error                    { return nil }
-func (baseVisitor) Float32(sofab.ID, float32) error                 { return nil }
-func (baseVisitor) Float64(sofab.ID, float64) error                 { return nil }
-func (baseVisitor) String(sofab.ID, string) error                   { return nil }
-func (baseVisitor) Bytes(sofab.ID, []byte) error                    { return nil }
-func (baseVisitor) UnsignedArray(sofab.ID, []uint64) error          { return nil }
-func (baseVisitor) SignedArray(sofab.ID, []int64) error             { return nil }
-func (baseVisitor) Float32Array(sofab.ID, []float32) error          { return nil }
-func (baseVisitor) Float64Array(sofab.ID, []float64) error          { return nil }
-func (b baseVisitor) BeginSequence(sofab.ID) (sofab.Visitor, error) { return b, nil }
-func (baseVisitor) EndSequence() error                              { return nil }
+type baseVisitorImpl = sofab.VisitorBase
 
 type u64ArrayVisitor struct{ baseVisitor }
 
-func (u64ArrayVisitor) UnsignedArray(_ sofab.ID, v []uint64) error {
-	sink += v[0] + v[len(v)-1]
+// ArrayUnsigned folds the first and last element, which is what the whole-slice
+// callback used to do — the array is delivered element by element now (§6.6.3),
+// so "first and last" is an index test rather than a slice index.
+func (u64ArrayVisitor) ArrayUnsigned(_ sofab.ID, i int, v uint64) error {
+	if i == 0 || i == n-1 {
+		sink += v
+	}
 	return nil
 }
 
@@ -236,15 +231,15 @@ func (typicalVisitor) Float32(id sofab.ID, v float32) error {
 	}
 	return nil
 }
-func (typicalVisitor) String(id sofab.ID, s string) error {
+func (typicalVisitor) String(id sofab.ID, _, _ int, chunk []byte) error {
 	if id == 5 {
-		sink += uint64(len(s))
+		sink += uint64(len(chunk))
 	}
 	return nil
 }
-func (typicalVisitor) UnsignedArray(id sofab.ID, v []uint64) error {
-	if id == 6 {
-		sink += v[0]
+func (typicalVisitor) ArrayUnsigned(id sofab.ID, i int, v uint64) error {
+	if id == 6 && i == 0 {
+		sink += v
 	}
 	return nil
 }
@@ -278,17 +273,39 @@ func (foldVisitor) Float32(_ sofab.ID, v float32) error {
 	return nil
 }
 func (foldVisitor) Float64(_ sofab.ID, v float64) error { sink += math.Float64bits(v); return nil }
-func (foldVisitor) String(_ sofab.ID, s string) error   { sink += uint64(len(s)); return nil }
-func (foldVisitor) Bytes(_ sofab.ID, b []byte) error    { sink += uint64(len(b)); return nil }
-func (foldVisitor) UnsignedArray(_ sofab.ID, a []uint64) error {
-	sink += uint64(len(a))
-	if len(a) > 0 {
-		sink += a[0] + a[len(a)-1]
-	}
+
+// String and Bytes COPY each piece into the destination the workload owns.
+//
+// That copy is the workload, not overhead. The decoder no longer materializes a
+// payload — §6.6.3 forbids it — so a row that only folded the piece lengths
+// would measure the framing and not the megabyte, and `decode: blob 1MB` is the
+// row BENCH_SPEC calls bandwidth-bound. Copying into a destination sized once,
+// at setup, is what a real consumer does and what the other ports' destinations
+// do: it is the "writes into storage the caller holds" route of §6.7.
+func (foldVisitor) String(_ sofab.ID, _, offset int, chunk []byte) error {
+	sink += uint64(copy(payloadDst[offset:], chunk))
 	return nil
 }
-func (foldVisitor) SignedArray(_ sofab.ID, a []int64) error         { sink += uint64(len(a)); return nil }
-func (foldVisitor) Float64Array(_ sofab.ID, a []float64) error      { sink += uint64(len(a)); return nil }
+
+func (foldVisitor) Bytes(_ sofab.ID, _, offset int, chunk []byte) error {
+	sink += uint64(copy(payloadDst[offset:], chunk))
+	return nil
+}
+
+func (foldVisitor) ArrayBegin(_ sofab.ID, _ sofab.ArrayKind, count int) error {
+	sink += uint64(count)
+	return nil
+}
+func (foldVisitor) ArrayUnsigned(_ sofab.ID, _ int, v uint64) error { sink += v; return nil }
+func (foldVisitor) ArraySigned(_ sofab.ID, _ int, v int64) error    { sink += uint64(v); return nil }
+func (foldVisitor) ArrayFloat32(_ sofab.ID, _ int, v float32) error {
+	sink += uint64(math.Float32bits(v))
+	return nil
+}
+func (foldVisitor) ArrayFloat64(_ sofab.ID, _ int, v float64) error {
+	sink += math.Float64bits(v)
+	return nil
+}
 func (v foldVisitor) BeginSequence(sofab.ID) (sofab.Visitor, error) { return v, nil }
 
 // ---- the streaming sink and the chunk-feeding reader ------------------------
@@ -307,35 +324,6 @@ func discardSink(_ *sofab.Encoder, b []byte) error {
 	}
 	return nil
 }
-
-// chunkReader hands out at most chunk bytes per Read, so a decode driven off it
-// is fed in chunks the way a socket delivers them — BENCH_SPEC's "fed in
-// 4096-byte chunks" for the blob decode.
-type chunkReader struct {
-	buf   []byte
-	chunk int
-	pos   int
-}
-
-func (r *chunkReader) reset() { r.pos = 0 }
-
-func (r *chunkReader) Read(p []byte) (int, error) {
-	if r.pos >= len(r.buf) {
-		return 0, io.EOF
-	}
-	k := len(r.buf) - r.pos
-	if k > r.chunk {
-		k = r.chunk
-	}
-	if k > len(p) {
-		k = len(p)
-	}
-	copy(p[:k], r.buf[r.pos:r.pos+k])
-	r.pos += k
-	return k, nil
-}
-
-var chunks chunkReader
 
 // ---- setup (excluded from measurement) -------------------------------------
 
@@ -377,6 +365,7 @@ func encodeOnce(buf []byte, fn func(*sofab.Encoder)) []byte {
 }
 
 func setupDecodeU64() {
+	dec = sofab.NewDecoder(sofab.VisitorBase{})
 	makeSrc()
 	decBuf = encodeOnce(make([]byte, n*11+16), func(e *sofab.Encoder) {
 		must(sofab.WriteUnsignedArray(e, 1, src[:]))
@@ -385,11 +374,13 @@ func setupDecodeU64() {
 }
 
 func setupDecodeTypical() {
+	dec = sofab.NewDecoder(sofab.VisitorBase{})
 	decBuf = encodeOnce(make([]byte, 256), encodeTypical)
 	used = len(decBuf)
 }
 
 func setupDecodeBlob() {
+	dec = sofab.NewDecoder(sofab.VisitorBase{})
 	makeBlob()
 	decBuf = encodeOnce(make([]byte, blobEncoded), func(e *sofab.Encoder) {
 		must(e.WriteBytes(1, blobSrc))
@@ -398,11 +389,11 @@ func setupDecodeBlob() {
 		panic(fmt.Sprintf("blob 1MB encodes to %d bytes, want %d (cross-port parity check)",
 			len(decBuf), blobEncoded))
 	}
-	chunks = chunkReader{buf: decBuf, chunk: blobChunk}
 	used = len(decBuf)
 }
 
 func setupDecodeComposite() {
+	dec = sofab.NewDecoder(sofab.VisitorBase{})
 	makeCompositeElements()
 	decBuf = encodeOnce(make([]byte, 4096), encodeComposite)
 	used = len(decBuf)
@@ -455,24 +446,11 @@ func do_encode_blob_oneshot() {
 }
 
 // do_encode_blob_streaming is the same megabyte through a 4096-byte
-// caller-supplied buffer and ~245 flushes, with pass-through NOT granted — so
-// every byte is copied through the buffer. Its distance from the one-shot row is
-// the cost of the divisible-run path (§5.1).
+// caller-supplied buffer and ~245 flushes: every byte is copied through the
+// buffer, because §5.1.6 admits no other route. Its distance from the one-shot
+// row is the cost of the divisible-run path.
 func do_encode_blob_streaming() {
 	e, err := sofab.NewEncoderSink(encScratch, 0, discardSink)
-	must(err)
-	must(e.WriteBytes(1, blobSrc))
-	must(e.Flush())
-	used = blobEncoded
-}
-
-// do_encode_blob_passthrough is BENCH_SPEC's optional row, printed because this
-// port implements the §5.1 permission: driven exactly like the streaming row but
-// with WithPassThrough(true), so the payload reaches the sink directly instead of
-// being copied through the 4096-byte buffer. Its gap to the streaming row is what
-// the permission is worth here.
-func do_encode_blob_passthrough() {
-	e, err := sofab.NewEncoderSink(encScratch, 0, discardSink, sofab.WithPassThrough(true))
 	must(err)
 	must(e.WriteBytes(1, blobSrc))
 	must(e.Flush())
@@ -487,46 +465,75 @@ func do_encode_composite() {
 	used = len(e.Bytes())
 }
 
+// dec is the decode workloads' codec, constructed ONCE in setup and Reset per
+// message. That is the shape CORELIB_PLAN §6.6 describes — "constructing the
+// encoder or decoder ... happens once, at setup, and MAY allocate. The
+// prohibition binds everything after" — so the measured op is a pure decode with
+// no allocation in it at all.
+var dec *sofab.Decoder
+
+// feedWhole hands the message over in a single Feed, which is what a caller
+// with the bytes already in memory does.
+func feedWhole(msg []byte, v sofab.Visitor) {
+	dec.Reset(v)
+	if _, err := dec.Feed(msg); err != nil {
+		must(err)
+	}
+	if dec.Status() != sofab.Complete {
+		panic("perfbench: decode did not reach COMPLETE")
+	}
+}
+
 func do_decode_u64_array() {
-	must(sofab.NewDecoder(bytes.NewReader(decBuf)).Accept(u64ArrayVisitor{}))
+	feedWhole(decBuf, u64ArrayVisitor{})
 }
 
 func do_decode_typical() {
-	must(sofab.NewDecoder(bytes.NewReader(decBuf)).Accept(typicalVisitor{}))
+	feedWhole(decBuf, typicalVisitor{})
 }
 
 // do_decode_blob is the chunk-fed decode: the message arrives in 4096-byte
-// pieces and is dispatched with AcceptStream, which never buffers the whole
-// message — peak memory is one field, not one megabyte plus the payload.
+// pieces and each is handed to Feed, which never buffers the whole message —
+// peak memory is the decoder's own fixed state, not one megabyte plus the
+// payload.
 func do_decode_blob() {
-	chunks.reset()
-	must(sofab.NewDecoder(&chunks).AcceptStream(foldVisitor{}))
+	dec.Reset(foldVisitor{})
+	for off := 0; off < len(decBuf); off += blobChunk {
+		end := off + blobChunk
+		if end > len(decBuf) {
+			end = len(decBuf)
+		}
+		if _, err := dec.Feed(decBuf[off:end]); err != nil {
+			must(err)
+		}
+	}
+	if dec.Status() != sofab.Complete {
+		panic("perfbench: chunked decode did not reach COMPLETE")
+	}
 }
 
 func do_decode_composite() {
-	must(sofab.NewDecoder(bytes.NewReader(decBuf)).Accept(foldVisitor{}))
+	feedWhole(decBuf, foldVisitor{})
 }
 
+// declineVisitor declines every sub-sequence: BeginSequence returning nil skips
+// the scope whole — nothing in it is delivered and nothing in it is built
+// (§6.0's "skip an unwanted sub-sequence whole").
+type declineVisitor struct{ baseVisitor }
+
+func (declineVisitor) BeginSequence(sofab.ID) (sofab.Visitor, error) { return nil, nil }
+
 // do_decode_composite_skip is `decode: composite skip-all`: walk the message,
-// materialize nothing — the path a router or filter runs in production.
+// materialize as little as the surface allows — the path a router or filter runs
+// in production.
 //
-// On this port that is the pull surface, because it is the only one that really
-// skips: Skip over a sequence start consumes the whole sub-tree and Skip over a
-// fixlen is a length jump over bytes that are never inspected, while the visitor
-// surfaces materialize each value before the destination can decline it (a
-// no-op Visitor would still allocate every string). The two composite decode
-// rows therefore differ in surface as well as in work — read the gap as "what
-// not-decoding is worth on this port", not as one surface's overhead.
+// It runs on the visitor surface like every other decode row, because that is
+// the only decode surface there is (§5.3.1). What it measures is the skip §6.0
+// makes normative: a declined sub-sequence is walked, not built. Top-level
+// scalars are still delivered, so read the gap to `decode: composite` as "what
+// declining the sub-trees is worth", not as a whole-message skip.
 func do_decode_composite_skip() {
-	d := sofab.NewDecoder(bytes.NewReader(decBuf))
-	for {
-		_, err := d.Next()
-		if err == io.EOF {
-			break
-		}
-		must(err)
-		must(d.Skip())
-	}
+	feedWhole(decBuf, declineVisitor{})
 	sink++
 }
 
@@ -549,8 +556,6 @@ func run_encode_blob_oneshot() { do_encode_blob_oneshot() }
 func run_encode_blob_streaming() { do_encode_blob_streaming() }
 
 //go:noinline
-func run_encode_blob_passthrough() { do_encode_blob_passthrough() }
-
 //go:noinline
 func run_encode_composite() { do_encode_composite() }
 
@@ -592,7 +597,6 @@ var workloads = []workload{
 	{"encode_typical", "encode: typical message", setupEncodeTypical, do_encode_typical, run_encode_typical},
 	{"encode_blob_oneshot", "encode: blob 1MB one-shot", setupEncodeBlobOneShot, do_encode_blob_oneshot, run_encode_blob_oneshot},
 	{"encode_blob_streaming", "encode: blob 1MB streaming", setupEncodeBlobStreaming, do_encode_blob_streaming, run_encode_blob_streaming},
-	{"encode_blob_passthrough", "encode: blob 1MB passthrough", setupEncodeBlobStreaming, do_encode_blob_passthrough, run_encode_blob_passthrough},
 	{"encode_composite", "encode: composite", setupEncodeComposite, do_encode_composite, run_encode_composite},
 	{"decode_u64_array", "decode: u64 array (1000)", setupDecodeU64, do_decode_u64_array, run_decode_u64_array},
 	{"decode_typical", "decode: typical message", setupDecodeTypical, do_decode_typical, run_decode_typical},
@@ -774,8 +778,9 @@ func runPerf() {
 	}, len(buf))
 	perfReport("serialize (stream API)", encR, len(buf))
 
+	dec = sofab.NewDecoder(foldVisitor{})
 	decR := perfMeasure(func() {
-		must(sofab.NewDecoder(bytes.NewReader(buf)).Accept(foldVisitor{}))
+		feedWhole(buf, foldVisitor{})
 	}, len(buf))
 	perfReport("deserialize (stream API)", decR, len(buf))
 

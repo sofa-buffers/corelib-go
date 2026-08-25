@@ -14,9 +14,9 @@ import "unicode/utf8"
 // point the payload is bound into a declared destination — which only generated
 // code can identify. Generated code calls UTF8Valid inside each destination arm
 // and rejects with ErrInvalidMsg (the INVALID outcome, §5.2) when it returns
-// false. The pull parser needs no such help: Decoder.String is by construction a
-// materializing read and validates internally, while Decoder.Skip stays a pure
-// Discard.
+// false. The destination is the only place that knows a value was materialized
+// at all, which is why the check lives there and not in the codec (§6.4.5: a
+// field that is only skipped is never validated).
 //
 // It is a real validator, not a byte-range shortcut (§6.4 "Validator
 // correctness", normative): overlong encodings (including C0 80, Java's
@@ -107,8 +107,8 @@ func (c *StringCheck) SetStringCheck(policy StringCheck) { *c = policy }
 // normative was reachable only by rebuilding with a different build tag — the
 // regeneration/rebuild the design exists to avoid (issue #82).
 //
-// Delivery mirrors the other visitor extensions (HeaderVisitor,
-// ElemBoundVisitor): the type assertion is made at most once per scope, and only
+// Delivery mirrors the other optional visitor extension (SchemaBoundVisitor):
+// the type assertion is made at most once per scope, and only
 // where it can matter — at the first string field of that scope, so a visitor
 // that never sees a string never pays for the assertion. A nested sequence
 // visitor is its own scope and is handed the same policy when its first string
@@ -120,24 +120,4 @@ func (c *StringCheck) SetStringCheck(policy StringCheck) { *c = policy }
 // concurrently, and never with a different policy inside one decode.
 type StringPolicyVisitor interface {
 	SetStringCheck(StringCheck)
-}
-
-// spCache delivers the scope's StringCheck to the visitor at most once, and asks
-// the interface question at most once — the same laziness, and for the same
-// reason, as hvCache (cursor.go): a failed v.(StringPolicyVisitor) walks the
-// type's whole method list, so a scope with no string field must not pay it.
-type spCache struct {
-	done bool
-}
-
-// deliver hands l's policy to v if v accepts one. Called immediately before the
-// first Visitor.String of the scope.
-func (c *spCache) deliver(v Visitor, l limits) {
-	if c.done {
-		return
-	}
-	c.done = true
-	if sp, ok := v.(StringPolicyVisitor); ok {
-		sp.SetStringCheck(l.stringCheck())
-	}
 }

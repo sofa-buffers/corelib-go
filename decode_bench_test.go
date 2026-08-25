@@ -1,6 +1,6 @@
 package sofab_test
 
-// Benchmarks for the visitor-driven decode path (Decoder.Accept). These drive
+// Benchmarks for the visitor-driven decode path (Decoder.Feed). These drive
 // two of cmd/perfbench's shared workloads (a 1000-element u64 array and the
 // mixed "typical" message) but under the go test harness, so -count/benchstat
 // give stable, comparable numbers across optimization steps.
@@ -74,7 +74,7 @@ func BenchmarkDecodeU64Array(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if err := sofab.NewDecoder(bytes.NewReader(msg)).Accept(benchU64Visitor{}); err != nil {
+		if err := feedIn(msg, 0, benchU64Visitor{}); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -86,7 +86,7 @@ func BenchmarkDecodeTypical(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if err := sofab.NewDecoder(bytes.NewReader(msg)).Accept(benchTypicalVisitor{}); err != nil {
+		if err := feedIn(msg, 0, benchTypicalVisitor{}); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -101,7 +101,7 @@ func BenchmarkDecodeU64ArrayBytes(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if err := sofab.AcceptBytes(msg, benchU64Visitor{}); err != nil {
+		if err := acceptBytes(msg, benchU64Visitor{}); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -113,7 +113,7 @@ func BenchmarkDecodeTypicalBytes(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if err := sofab.AcceptBytes(msg, benchTypicalVisitor{}); err != nil {
+		if err := acceptBytes(msg, benchTypicalVisitor{}); err != nil {
 			b.Fatal(err)
 		}
 	}

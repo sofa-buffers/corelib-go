@@ -39,11 +39,11 @@ func TestUTF8ValidatorIsCompiledIn(t *testing.T) {
 		t.Fatal("StringCheck.UTF8Valid(C0 80) = true in the default build, want false")
 	}
 
+	// The destination is where the check runs on decode (§6.4.3): a visitor
+	// that binds the id and calls the primitive rejects it.
 	in := strField(1, []byte{0xFF})
-	d := sofab.NewDecoder(bytes.NewReader(in))
-	mustNext(t, d)
-	if _, err := d.String(); !errors.Is(err, sofab.ErrInvalidMsg) {
-		t.Fatalf("pull String = %v, want ErrInvalidMsg", err)
+	if err := acceptBytes(in, &bindStrV{id: 1}); !errors.Is(err, sofab.ErrInvalidMsg) {
+		t.Fatalf("bound invalid UTF-8 = %v, want ErrInvalidMsg", err)
 	}
 	var buf bytes.Buffer
 	e := sofab.NewEncoder(&buf)

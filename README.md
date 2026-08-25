@@ -42,35 +42,42 @@ import sofab "github.com/sofa-buffers/corelib-go"
 ### Feature flags
 
 Go always ships the full wire format; there are no build-time toggles for wire
-features. Two policies are configurable, and neither changes a byte on the wire.
+features. One policy is configurable, and it changes no byte on the wire.
 
 | Option | Default | Effect |
 |--------|---------|--------|
 | `WithStrictUTF8(bool)` (`SOFAB_STRICT_UTF8`) | on | Reject an invalid-UTF-8 `string`: `ErrArgument` on encode, `ErrInvalidMsg` where one is read on decode. Off stores and writes the bytes verbatim — never lossy, never replaced. |
-| `WithPassThrough(bool)` | off | Allow a `string`/blob payload larger than the buffer to reach the sink directly instead of being copied through it — see [Memory handling](#memory-handling). |
-| `-tags sofab_no_strict_utf8` | check compiled in | Footprint build: compiles the validator out everywhere — `Decoder.String`, `Encoder.WriteString` and `UTF8Valid` alike — and wins over `WithStrictUTF8`. CI builds and tests this leg; the default build is the one tested against the shared vectors. |
+| `-tags sofab_no_strict_utf8` | check compiled in | Footprint build: compiles the validator out everywhere — `Encoder.WriteString` and `UTF8Valid` alike — and wins over `WithStrictUTF8`. CI builds and tests this leg; the default build is the one tested against the shared vectors. |
 
 Pass the options to `NewEncoder`, `NewDecoder` or `AcceptBytes`.
 
-**A string handed to a visitor is checked at the destination.** `Decoder.String`
-validates internally. `Accept` / `AcceptBytes` / `AcceptStream` pass the wire
-bytes to `Visitor.String` verbatim, because the cursor cannot tell a field the
-visitor binds from one it ignores. Embed `sofab.StringCheck` to receive this
+**A string is checked at the destination.** The decoder passes the wire bytes to
+`Visitor.String` verbatim, and never builds a `string` of its own, because it
+cannot tell a field the visitor binds from one it ignores — and a field that is
+only skipped must never be validated.
+Embed `sofab.StringCheck` to receive this
 decode's policy, so flipping the option never means regenerating code:
 
 ```go
 type Msg struct {
-	sofab.StringCheck // adds SetStringCheck + UTF8Valid
+	sofab.VisitorBase
+	sofab.StringCheck  // adds SetStringCheck + UTF8Valid
+	pay  sofab.PayloadAcc
 	Name string
 }
 
-func (m *Msg) String(id sofab.ID, v string) error {
-	if id == 1 {
-		if !m.UTF8Valid([]byte(v)) { // this decode's policy, not the build's
-			return sofab.ErrInvalidMsg
-		}
-		m.Name = v
+func (m *Msg) String(id sofab.ID, total, offset int, chunk []byte) error {
+	if id != 1 {
+		return nil
 	}
+	b, done := m.pay.Take(total, offset, chunk) // sofab.PayloadAcc
+	if !done {
+		return nil // more pieces to come
+	}
+	if !m.UTF8Valid(b) { // this decode's policy, not the build's
+		return sofab.ErrInvalidMsg
+	}
+	m.Name = string(b)
 	return nil
 }
 ```
@@ -84,13 +91,14 @@ overflow — is checked on every field regardless; only the content check moves.
 
 | Goal | How |
 |------|-----|
-| Streaming **out** | `Encoder` writes into an output buffer drained as it fills. The buffer is the caller's (`NewEncoderBuffer` / `NewEncoderSink`, with a start offset for a framing header); `NewEncoder` over an `io.Writer` allocates one for you. |
-| Streaming **in** | `Decoder` is a pull parser over any `io.Reader`; `Next()` returns one field header at a time. |
-| Three decode styles | Pull with `Decoder.Next`; implement `Visitor` and call `Decoder.Accept`, which binds each field into a struct member, with `AcceptBytes` as its zero-copy form for a message already in a `[]byte`; or `Decoder.AcceptStream`, the same visitor events driven off a reader with a peak memory of one field. |
+| Streaming **out** | `Encoder` writes into an output buffer drained as it fills. The buffer is the caller's (`NewEncoderBuffer` / `NewEncoderSink`, with a start offset for a framing header); `NewEncoder` over an `io.Writer` sizes a fixed scratch window for you, once, at construction. |
+| Streaming **in** | `Decoder.Feed` takes bytes in chunks of any size — one byte included — and returns `Complete` / `Incomplete` / `Invalid` for everything consumed so far. A header, a varint, a payload or an array may be split across any number of calls; the machine suspends and resumes at any byte boundary, and there is no finish step. |
+| One decode surface | The visitor, and nothing else — no pull parser, no iterator, no cursor — and behind it ONE implementation: `Feed`. `AcceptBytes` is a single `Feed` of a whole buffer and `Decoder.FeedFrom` is a read loop over your own scratch buffer. One surface is one place to be correct. |
+| Nothing the decoder hands you is storage | A payload arrives in pieces (`FixlenBegin`, then `String`/`Bytes` with the total, this piece's offset and the piece); an array arrives as `ArrayBegin`, one callback per element, `ArrayEnd`. The decoder therefore sizes nothing from the wire and **allocates nothing at all after construction**. |
 | No dependencies | Standard library only, no `cgo`. |
 | Sticky errors | The encoder records the first failure and turns later writes into no-ops, so generated code can issue a run of writes and check once at `Flush`. |
-| Generics for arrays | `WriteUnsignedArray[T]` / `ReadUnsignedArray[T]` (and the signed variants) accept any `~uint8..~uint64` / `~int8..~int64`; float arrays have dedicated methods. On decode `T` is also the declared-width bound — see [Deserialize](#deserialize). |
-| Forward/backward compatible | Unknown fields are consumed with `Skip()`: old readers tolerate new fields, new readers tolerate missing ones. |
+| Generics for arrays | `WriteUnsignedArray[T]` / `WriteSignedArray[T]` accept any `~uint8..~uint64` / `~int8..~int64`; float arrays have dedicated methods. |
+| Forward/backward compatible | A field the visitor binds nothing to is walked, not built: old readers tolerate new fields, new readers tolerate missing ones. Returning `nil` from `BeginSequence` declines a whole sub-tree. |
 | Canonical sequence framing | `WriteSequenceBeginLazy` holds a sequence header back until the sequence gets content, so an all-default sequence **field** is omitted rather than framed empty — in one forward pass, without buffering. A wrapper-array **element** keeps its frame even when all-default, since element presence carries the array's length; it closes with `WriteSequenceEndKeep`. |
 
 ## Usage
@@ -174,50 +182,79 @@ e, _ := sofab.NewEncoderSink(pool.Get(), 4, func(enc *sofab.Encoder, b []byte) e
 
 ### Deserialize
 
-`Decoder` is a pull parser: `Next()` returns one field header at a time; read
-the value with a typed accessor, or `Skip()` it:
+**The visitor is the only decode surface.** You implement `sofab.Visitor` on the
+type the fields land in, and the decoder drives — writing each value straight
+into a member you own. There is no pull parser, no iterator and no cursor: one
+surface means every rule in the format is implemented once.
 
 ```go
-d := sofab.NewDecoder(bytes.NewReader(msg))
-for {
-    f, err := d.Next()
-    if err == io.EOF { break }
-    if err != nil { /* ... */ }
-    switch {
-    case f.ID == 1: v, _ := d.Unsigned(); _ = v
-    case f.ID == 2: v, _ := d.Signed();   _ = v
-    case f.ID == 3: s, _ := d.String();   _ = s
-    default:        d.Skip()   // unknown field
+type Point struct {
+    sofab.VisitorBase // no-op defaults for the callbacks this message does not use
+    X, Y int32
+}
+
+func (m *Point) Signed(id sofab.ID, v int64) error {
+    switch id {
+    case 1:
+        m.X = int32(v)
+    case 2:
+        m.Y = int32(v)
     }
+    return nil // an id this schema does not declare is simply not bound
+}
+
+m := &Point{}
+if err := sofab.AcceptBytes(msg, m); err != nil {
+    /* ErrInvalidMsg / ErrIncomplete / ErrLimitExceeded */
 }
 ```
 
-`Next` owns the stream's nesting state, so the loop needs no depth bookkeeping:
-it refuses a sequence nesting past `MaxDepth` (255) and an end marker that
-closes nothing, both `ErrInvalidMsg`. A balanced end marker arrives as a
-`TypeSequenceEnd` header with `ID` always **0**.
+**Aggregates arrive in pieces**, because a callback carrying a whole value would
+oblige the decoder to build it from a size the sender chose:
 
-Three decode behaviours are worth knowing before you write the loop:
+| Field | Callbacks, in order |
+|---|---|
+| `string` / `blob` | `FixlenBegin(id, subtype, total)`, then one or more `String`/`Bytes(id, total, offset, chunk)` — one call when the payload arrives whole, as many as it took to feed when it does not. An empty payload is one call with `total == 0`. |
+| any array | `ArrayBegin(id, kind, count)`, then `ArrayUnsigned` / `ArraySigned` / `ArrayFloat32` / `ArrayFloat64` per element, then `ArrayEnd(id)`. An empty array is `ArrayBegin` straight to `ArrayEnd`; a truncated one never reaches `ArrayEnd`. |
 
-* **An integer array's element type bounds validity.**
-  `ReadUnsignedArray[T]` / `ReadSignedArray[T]` take the schema's element type
-  as `T`, and an element the width cannot hold is `ErrInvalidMsg`, never quietly
-  masked down — `300` read as `[]uint8` rejects the message rather than yielding
-  `44`. On the visitor surface the bound arrives through `ElemBoundVisitor`.
-* **A reader bound to the wrong wire type is not an error.** It returns
-  `ErrTypeMismatch`: the field is skipped exactly like one with an unknown id,
-  your destination is untouched, and the decode stays valid — the same bytes
-  decode fine for a peer whose schema declares the other type. Framing still
-  wins: a reserved fixlen subtype or a count past `ARRAY_MAX` is `ErrInvalidMsg`
-  either way.
+`sofab.PayloadAcc` assembles a payload out of its pieces if you want it whole.
+`FixlenBegin` and `ArrayBegin` fire **before any payload byte or element**, which
+is where a schema `maxlen:`/`count:` belongs: a message that breaches one and is
+then truncated must still be `ErrInvalidMsg`.
+
+The decoder owns the stream's nesting state, so nothing in your callbacks does
+depth bookkeeping: it refuses a sequence nesting past `MaxDepth` (255) and an end
+marker that closes nothing, both `ErrInvalidMsg`. A sequence-end marker's id is
+discarded (§4.9), so `EndSequence` carries none.
+
+Three decode behaviours are worth knowing before you write the callbacks:
+
+* **A field the destination does not bind is not an error.** An unknown id, and
+  a field whose wire type contradicts the one your schema declares
+  (MESSAGE_SPEC §7.3), simply land in no arm: the destination is untouched and
+  the decode stays valid — the same bytes decode fine for a peer whose schema
+  declares the other type. Framing still wins: a reserved fixlen subtype or a
+  count past `ARRAY_MAX` is `ErrInvalidMsg` either way.
+* **An integer array's element type bounds validity.** Elements arrive one at a
+  time, widened to 64 bits, and narrowing them is yours to check: an element the
+  schema's width cannot hold must be `ErrInvalidMsg`, never quietly masked down.
+  Check it in `ArrayUnsigned` / `ArraySigned` as the element goes past — that is
+  what keeps a message INVALID rather than INCOMPLETE when the array behind the
+  offending element is truncated.
 * **Receiver-side limits stop at a schema bound** (below).
 
+**A sub-tree you have no destination for is declined whole.** Return `nil` from
+`BeginSequence` and nothing under it is delivered and nothing under it is built,
+however deep it goes — the bytes are still parsed, so the field after it resyncs
+exactly.
+
 ```go
-case f.ID == 3:
-    s, err := d.String()
-    if errors.Is(err, sofab.ErrTypeMismatch) { break } // keep the default
-    if err != nil { /* ErrInvalidMsg / ErrIncomplete / ErrLimitExceeded */ }
-    _ = s
+func (m *Point) BeginSequence(id sofab.ID) (sofab.Visitor, error) {
+    if id == 7 {
+        return &m.Meta, nil // descend into the nested object
+    }
+    return nil, nil // decline: walk it, build nothing
+}
 ```
 
 #### Receiver-side limits
@@ -247,43 +284,46 @@ func (m *Msg) ArrayBegin(id sofab.ID, kind sofab.ArrayKind, count int) error {
 ```
 
 A 5000-element array on field 4 then decodes even under
-`WithMaxArrayCount(1000)`, while every unbounded field stays capped. On the pull
-surface the caller knows the schema and says so per field with
-`d.SchemaBounded()`.
+`WithMaxArrayCount(1000)`, while every unbounded field stays capped.
 
 ### Deserialize stream
 
-The same loop reads a stream: hand `NewDecoder` any `io.Reader` and it refills
-on demand, so the chunk boundaries live in the reader rather than in your code.
+The same visitor reads a stream, through the surface everything else is built
+on: hand `Feed` whatever bytes you have. Every call returns the outcome for the
+bytes consumed so far, so there is no finish step — the status *is* the answer,
+and whether an `Incomplete` is a truncation is your framing's call, not the
+decoder's.
 
 ```go
-d := sofab.NewDecoder(conn)  // socket, pipe, gzip.Reader, os.Stdin
+d := sofab.NewDecoder(m) // m is the *Point above; construct once, Reset per message
 for {
-    f, err := d.Next()
-    if err == io.EOF { break }
-    if err != nil { /* ... */ }
-    switch {
-    case f.ID == 1: id, _ := d.Unsigned(); _ = id
-    default:        d.Skip()
+    n, err := conn.Read(buf)
+    if n > 0 {
+        switch out, derr := d.Feed(buf[:n]); out {
+        case sofab.Invalid:
+            return derr // ErrInvalidMsg / ErrLimitExceeded / your own visitor error
+        case sofab.Complete:
+            // a valid message may end here; more valid fields could extend it
+        case sofab.Incomplete:
+            // the bytes end inside a field — feed the next chunk
+        }
+    }
+    if err != nil {
+        break
     }
 }
 ```
 
-A visitor streams too. `Accept` reads the whole message into one buffer before
-parsing it; `AcceptStream` reads and dispatches each field as the reader
-delivers it, so peak memory is the largest single field. Same events, same
-verdict:
+`Decoder.FeedFrom(r, scratch)` is that loop, for an `io.Reader`. The scratch
+buffer is yours: this package sizes no buffer from a stream.
 
-```go
-d := sofab.NewDecoder(conn)
-m := &Point{}
-if err := d.AcceptStream(m); err != nil {
-    /* ErrInvalidMsg / ErrIncomplete / a reader error, verbatim */
-}
-```
+**One decoder, many messages.** Construction is the only allocating step;
+`Reset(v)` rebinds a destination and clears every trace of the message before it,
+allocating nothing. `AcceptBytes` constructs one per call, which is the single
+allocation on that path.
 
-Every `string` and blob it hands the visitor is fresh storage the visitor may
-keep — see [Memory handling](#memory-handling).
+Whatever a callback receives is valid only until it returns — see
+[Memory handling](#memory-handling).
 
 ### Code generator
 
@@ -343,7 +383,7 @@ structs/unions or arrays arrives as a nested sequence whose child ids are the
 element indices, and rebuilding a slice from those events is the same code for
 every schema, so it lives here: `VisitorBase`, `StringSeq` / `BlobSeq` /
 `MessageSeq` / `NestedSeq`, the matrix collectors with `PlaceRow`, and
-`PayloadAcc` for a payload arriving in chunks. The generator switches over in
+`PayloadAcc` for the pieces a payload arrives in. The generator switches over in
 [generator#345](https://github.com/sofa-buffers/generator/issues/345); both
 spellings compile against this package meanwhile.
 
@@ -355,7 +395,7 @@ You **must call `Flush`** to push the tail and surface a late write error.
 
 | Constructor | Who owns the buffer | When it fills |
 |---|---|---|
-| `NewEncoder(w)` | this package: a 512 B window, grown once to 4 KiB by the first message that outgrows it | flushed to `w`, then reused |
+| `NewEncoder(w)` | this package: a fixed 512 B scratch window, sized once at construction and never grown | flushed to `w`, then reused |
 | `NewEncoderBuffer(buf, offset)` | you | nothing to flush to — the encode stops with `ErrBufferFull` |
 | `NewEncoderSink(buf, offset, sink)` | you | handed to `sink`, then reused, or replaced via `SetBuffer` |
 
@@ -374,31 +414,46 @@ payload far larger than the buffer streams through it. A buffer installed
 **without** a sink has no minimum: a message that encodes to two bytes encodes
 into a two-byte buffer.
 
-**Pass-through** (`WithPassThrough`, off by default everywhere) hands a
-`string`/blob payload larger than the buffer to the sink directly, after the
-buffered bytes so wire order is unchanged. Such a call hands the sink memory
-that is **not** the output buffer: it is borrowed for the duration of the call
-and must not be retained, and it is never a buffer handover — `SetBuffer` is
-rejected while the permission is granted, since a sink cannot tell the two calls
-apart. The bytes on the wire are identical either way.
+A sink is **only ever** handed memory inside the installed output buffer. There
+is no second case to handle: a `string` or blob payload is copied through the
+buffer however large it is, and there is no option that changes that.
 
-**Decoder.** The pull path is safe by default and streaming: `String()` and
-`Bytes()` both return fresh copies. `Accept` / `AcceptBytes` buffer the whole
-message and are faster, but only strings are copied — blob values alias the read
-buffer or the caller's `[]byte`. `AcceptStream` buffers no message at all, so
-there is nothing to alias and both its strings and blobs are fresh storage.
+**Decoder — input bytes, and nothing that outlives the call.** The bytes being
+parsed are yours: the chunk you passed to `Feed`, or the scratch buffer
+`FeedFrom` reads into. A chunk is borrowed only for the duration of that one
+call — once it returns you may reuse, overwrite or free it and the decode is
+unaffected.
 
-| Path | `String` | `Bytes` (blob) |
-|------|----------|----------------|
-| `Next` (pull, streaming) | fresh copy | fresh copy |
-| `Accept` | fresh copy | aliases read buffer — copy to keep |
-| `AcceptBytes` | fresh copy | aliases caller's `[]byte` — keep it alive |
-| `AcceptStream` (visitor, streaming) | fresh copy | fresh copy |
+**Whatever a callback receives is valid only until that callback returns** — a
+caller that keeps a value copies it first. That holds on the one-shot path
+exactly as on the streaming one; no value the decoder produces is readable after
+the call that delivered it, and there is no payload-position getter and no
+"valid until the next feed" value. A `String`/`Bytes` chunk is a window into the
+bytes *you* fed, so keeping it means copying it — exactly as `io.Reader.Read`'s
+contract works.
 
-Numeric arrays are always freshly allocated, but only the output slice is: no
-reader path allocates per element. Varint elements are decoded in batches out of
-the reader's own buffer and fp32/fp64 elements are read in place, so a
-1000-element array costs that slice's growth and nothing else.
+**The codec allocates nothing after construction, on either side.** No buffer,
+no accumulator and no destination is sized from a wire count or a wire length,
+anywhere. That is what the piecewise callback surface buys: a value that needs
+storage is handed over in pieces and the *destination's* storage takes it.
+`TestNoAllocationsAfterConstruction` asserts zero for every encoder form and
+`TestDecodeAllocatesNothingAfterConstruction` asserts zero for a decode — a
+small message and a 12 KB one, whole and one byte at a time.
+
+The decoder's own state is sized once, in `NewDecoder`: the parse stack to
+`MaxDepth`, the landing zone to the widest fixlen element. Nothing on the wire
+chooses those sizes and nothing grows afterwards. `AcceptBytes` constructs a
+decoder per call — the one allocation on that path, and it does not move with
+the message (`TestAcceptBytesAllocatesOnlyItsDecoder`).
+
+`collectors.go` and `payload.go` are the **static helper layer**: they ship here
+for reuse by the generated layer, are never used by the codec itself, and
+allocate on the generated layer's behalf. A wrapper array's length is only known
+when the array ends, so `StringSeq`/`BlobSeq`/`MessageSeq` grow their container
+as elements arrive — geometrically, via Go's `append`, so a sparse array does
+not cost O(n²) copies (`TestSequenceGrowthIsGeometric`). That is the one
+allocation shape where growth is correct, and it is deliberately outside the
+codec.
 
 ## Build & test
 
@@ -415,14 +470,13 @@ go test -tags sofab_no_strict_utf8 ./...
 
 Tests cover the shared conformance suite (`vectors_test.go`), chunked and
 byte-at-a-time streaming that resumes at any boundary (`streaming_test.go`),
-byte-exact encode/decode, the visitor path (`visitor_test.go`), roundtrip value
-preservation, and a generated-code-style walkthrough (`example_test.go`). The
-malformed and truncated inputs are declared once as `malformedCases` in
-`malformed_test.go` and driven through every decode surface, so a new case holds
-all three by construction. The docs are tested too: `readme_shape_test.go`,
-`closed_names_test.go` and `docs_decode_paths_test.go` check this README against
-the structure, the closed generated-object name set, and the decode entry points
-the package actually exports.
+byte-exact encode/decode, the visitor path (`visitor_test.go`), the push surface
+and its chunk invariance (`feed_test.go`), roundtrip value preservation, and a
+generated-code-style walkthrough (`example_test.go`). The malformed and
+truncated inputs are declared once as `malformedCases` in `malformed_test.go`
+and driven at every chunking, so a new case holds them all by construction. `alloc_conformance_test.go` carries the
+allocation measurement, and `readme_example_test.go` compiles and runs the
+generated-code example in this README so the docs cannot drift from the API.
 
 ## Benchmarks
 
@@ -443,11 +497,10 @@ caller uses:
 | `encode: u64 array (1000)`, `encode: typical message`, `encode: composite` | a caller-supplied buffer (`NewEncoderBuffer`), no sink |
 | `encode: blob 1MB one-shot` | one caller buffer of exactly 1,000,005 bytes, no sink |
 | `encode: blob 1MB streaming` | a 4096-byte caller buffer with a flush sink, so the megabyte is copied through it in ~245 flushes |
-| `encode: blob 1MB passthrough` | the same with `WithPassThrough(true)`: the payload goes to the sink directly |
-| `decode: blob 1MB` | fed to `AcceptStream` in 4096-byte chunks, so peak memory is one field |
-| `decode: composite` / `decode: composite skip-all` | the whole message read into a visitor, versus a pull loop that `Skip`s every field |
+| `decode: blob 1MB` | fed to `Feed` in 4096-byte chunks and copied into a destination sized once at setup, so peak memory is that destination and not the message |
+| `decode: composite` / `decode: composite skip-all` | the whole message read into a visitor, versus one that declines every sub-sequence |
 
-The three `blob 1MB` rows are bandwidth-bound — a million of their bytes are
+The two `blob 1MB` rows are bandwidth-bound — a million of their bytes are
 payload — so read them against each other rather than as a statement about the
 library. The `composite` message is the one that reaches what the flat datasets
 do not: a wrapper array of 64 string elements, 320 bytes of 1- to 4-byte UTF-8,

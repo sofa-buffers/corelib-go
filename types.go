@@ -36,16 +36,29 @@ const (
 	TypeSequenceEnd         WireType = 0x7 // close nested sequence
 )
 
-// fixlen subtypes (3-bit tag inside the fixlen header).
+// FixlenSubtype is the 3-bit subtype tag inside a fixlen field's length word
+// (§4.6), as delivered to Visitor.FixlenBegin. It names what ARRIVED, which is
+// what a destination needs to tell its own field from a MESSAGE_SPEC §7.3 skip.
+// The reserved tags 0x4-0x7 never reach a visitor: they are INVALID at the word.
+type FixlenSubtype uint8
+
 const (
-	fixFp32 uint64 = 0x0
-	fixFp64 uint64 = 0x1
-	fixStr  uint64 = 0x2
-	fixBlob uint64 = 0x3
+	FixlenFp32 FixlenSubtype = 0x0 // 4 raw little-endian bytes
+	FixlenFp64 FixlenSubtype = 0x1 // 8 raw little-endian bytes
+	FixlenStr  FixlenSubtype = 0x2 // UTF-8 payload (§6.4)
+	FixlenBlob FixlenSubtype = 0x3 // opaque payload
+)
+
+// fixlen subtypes as the encoder writes them into the word.
+const (
+	fixFp32 uint64 = uint64(FixlenFp32)
+	fixFp64 uint64 = uint64(FixlenFp64)
+	fixStr  uint64 = uint64(FixlenStr)
+	fixBlob uint64 = uint64(FixlenBlob)
 )
 
 // ArrayKind names the element kind an array header on the wire declares, as
-// delivered to HeaderVisitor.ArrayBegin. It distinguishes the two fixlen
+// delivered to Visitor.ArrayBegin. It distinguishes the two fixlen
 // element subtypes — fp32 and fp64 — rather than collapsing them, because for a
 // fixlen array (§4.8) the element subtype decides whether the field is this
 // array's value at all: a header whose subtype contradicts the declared element
@@ -65,17 +78,6 @@ const (
 	ArrayFp32     ArrayKind = 2 // wire type 0b101, fixlen_word subtype fp32 / 4 B
 	ArrayFp64     ArrayKind = 3 // wire type 0b101, fixlen_word subtype fp64 / 8 B
 )
-
-// Field is a decoded field header returned by Decoder.Next.
-//
-// On a TypeSequenceEnd marker ID is always 0, whatever id the header on the
-// wire spelled: the end marker's id carries no information, so the decoder
-// discards it (§4.9) instead of handing a sender-chosen number to a caller that
-// switches on ID.
-type Field struct {
-	ID   ID
-	Type WireType
-}
 
 // Unsigned constrains integer element types accepted by the unsigned array
 // helpers.
@@ -102,36 +104,12 @@ var (
 	// own to grow; there a failed write surfaces as the io.Writer's own error.
 	ErrBufferFull = errors.New("sofab: output buffer full")
 	// ErrArgument is an invalid caller argument (e.g. id > IDMax, opening a
-	// nested sequence past MaxDepth, calling a typed pull reader when no field's
-	// value is waiting to be read, or — with strict UTF-8 enabled, §6.4 — a
-	// WriteString value that is not valid UTF-8). This is the InvalidArgument code
-	// (§6.3), and since §6.3 removed the separate "invalid usage" code it is the
-	// only code for a caller mistake.
+	// nested sequence past MaxDepth, installing an output buffer the encoder form
+	// or the minimum refuses, or — with strict UTF-8 enabled, §6.4 — a WriteString
+	// value that is not valid UTF-8). This is the InvalidArgument code (§6.3), and
+	// since §6.3 removed the separate "invalid usage" code it is the only code for
+	// a caller mistake.
 	ErrArgument = errors.New("sofab: invalid argument")
-	// ErrTypeMismatch reports that a typed pull read did not match the field on
-	// the wire — a different wire type, or for a fixlen a different subtype than
-	// the one the requested type maps to. Per MESSAGE_SPEC §7.3 this is *not an
-	// error about the message*: the field is skipped exactly like one with an
-	// unknown id, the destination is left untouched, and a decode that meets
-	// nothing else stays COMPLETE. The same bytes decode fine for a peer whose
-	// schema declares the other type, so reporting them as malformed would turn
-	// the forward-compatibility case §7.3 exists for into a hard failure.
-	//
-	// It is therefore a distinct sentinel, deliberately neither ErrInvalidMsg nor
-	// ErrArgument: a mismatch is not a caller mistake either, because nothing at
-	// the call distinguishes "the caller bound the wrong type" from "a peer sent
-	// another type for this id" — and §6.3 says the outcome is the same skip
-	// regardless.
-	//
-	// The value is consumed before the error is returned, so the decoder sits on
-	// the next field boundary and a pull loop simply continues with Next. The one
-	// exception is a sequence start/end, which carries no value: there nothing is
-	// consumed and the caller skips the sub-tree with Skip, exactly as it does for
-	// an unknown id.
-	//
-	// Test for it with errors.Is. Generated code decodes through Accept /
-	// AcceptBytes and applies §7.3 in its own field switch, so it never sees this.
-	ErrTypeMismatch = errors.New("sofab: field type does not match the read")
 	// ErrInvalidMsg is malformed input that is wrong regardless of what bytes
 	// might follow: varint overflow (> 64 bits), a bad type/subtype tag, a length
 	// or count past arrayMax, a dangling sequence end, nesting past MaxDepth, or

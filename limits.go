@@ -1,7 +1,7 @@
 package sofab
 
 // Option configures optional decode-time limits. Options are passed to
-// NewDecoder (covering the pull parser and Decoder.Accept) or to AcceptBytes.
+// NewDecoder or to AcceptBytes.
 //
 // With no options the decoder enforces no limits and behaves bit-for-bit as it
 // did before limits existed. Limits are strictly opt-in: this package invents no
@@ -26,8 +26,7 @@ package sofab
 // INVALID, so §6.2.1 forbids the cap there and §6.3 forbids ErrLimitExceeded on
 // such a field. The decoder learns which fields those are from the destination:
 // a visitor that implements SchemaBoundVisitor (generated code does, wherever
-// its schema declares a bound) is exempt on the fields it names, and a pull
-// caller says so per field with Decoder.SchemaBounded.
+// its schema declares a bound) is exempt on the fields it names.
 type Option func(*limits)
 
 // limits holds the optional per-field decode caps plus the string-validity
@@ -41,11 +40,6 @@ type limits struct {
 	maxStringLen  uint64 // 0 = unlimited
 	maxBlobLen    uint64 // 0 = unlimited
 	strictUTF8    bool   // SOFAB_STRICT_UTF8 (§6.4); default ON via newLimits
-	// passThrough is the §5.1 pass-through permission. Its zero value is the
-	// default the spec states for every encoder form — OFF, "a sink that was not
-	// told it may receive foreign memory never does" — so only
-	// WithPassThrough(true) ever turns it on.
-	passThrough bool
 }
 
 // WithMaxArrayCount caps the element count of every count-prefixed array — the
@@ -85,48 +79,21 @@ func WithMaxBlobLen(n int) Option {
 //     bytes verbatim on decode / writes them verbatim on encode — never lossy,
 //     never a silent replacement (§6.4).
 //
-// Scope on decode: this option governs Decoder.String, the pull read that
-// materializes a string by construction. The visitor path (Accept, AcceptBytes,
-// AcceptStream) never validates in the decoder itself, because the cursor cannot
-// tell a field the visitor binds from one it skips and §6.4 forbids validating a
-// skip; there the check belongs to the destination. The option still reaches it:
-// the decoder hands the resolved policy to a visitor that implements
-// StringPolicyVisitor — typically by embedding a StringCheck — before that
-// scope's first string, and the destination arm calls StringCheck.UTF8Valid
-// (utf8.go). A destination that instead calls the package-level UTF8Valid is
-// always strict, since a package-level function has no decode scope to read.
+// Scope on decode: the decoder itself never validates, because it cannot tell a
+// field the visitor binds from one it skips and §6.4.5 forbids validating a
+// skip. The check belongs to the destination, which is also the only place the
+// payload is assembled at all (§6.6.3). The option reaches it: the decoder hands
+// the resolved policy to a visitor that implements StringPolicyVisitor —
+// typically by embedding a StringCheck — before that scope's first string, and
+// the destination arm calls StringCheck.UTF8Valid (utf8.go). A destination that
+// instead calls the package-level UTF8Valid is always strict, since a
+// package-level function has no decode scope to read.
 //
 // The knob never changes how valid data is encoded, so two peers with different
 // settings interoperate on all valid data. It is a validation policy, never a
 // wire-format switch.
 func WithStrictUTF8(enabled bool) Option {
 	return func(l *limits) { l.strictUTF8 = enabled }
-}
-
-// WithPassThrough grants the encoder permission to hand a string/blob payload to
-// its sink directly, instead of copying it through the output buffer
-// (CORELIB_PLAN §5.1). It is an encode-side option; the decoder ignores it.
-//
-// It is OFF by default for every encoder form, io.Writer included: §5.1 makes
-// the permission the caller's to give, and a destination that was not told it
-// may receive foreign memory never does. Without it the bytes are identical —
-// the sink simply only ever sees the output buffer.
-//
-// Pass-through saves a pass over the payload — for a large blob the dominant
-// cost of encoding it — but it means the sink is handed memory that is not the
-// output buffer. Granting it is therefore a promise about what the sink does
-// with what it receives:
-//
-//   - the payload is BORROWED for the duration of the call and must not be
-//     retained (io.Writer's own contract says the same thing);
-//   - such a call is not a buffer handover, so a sink granted pass-through must
-//     never take the buffer — SetBuffer is rejected with ErrArgument while the
-//     permission is granted, since the sink cannot tell the two calls apart.
-//
-// Without a sink (NewEncoderBuffer) there is nothing to hand a payload to and
-// the option has no effect.
-func WithPassThrough(granted bool) Option {
-	return func(l *limits) { l.passThrough = granted }
 }
 
 // clampLimit maps a caller-supplied limit to its internal form: a non-positive
@@ -177,8 +144,8 @@ func applyOptions(opts []Option) limits {
 // "compiled OFF means the validation code is not compiled in"), then the RUNTIME
 // half (WithStrictUTF8). Both halves belong at every site that validates: gating
 // only the generated-code primitive (utf8.go) on the build tag would leave a
-// footprint build in which the corelib's own paths still validate, so the pull
-// parser and the visitor path would reach different verdicts on the same bytes
+// footprint build in which the corelib's own paths still validate, so the
+// encoder and the destination would reach different verdicts on the same bytes
 // in the same build (issue #88).
 //
 // It costs nothing in the default build: strictUTF8Compiled is a true constant

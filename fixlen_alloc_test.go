@@ -3,7 +3,7 @@ package sofab_test
 // Allocation regression tests for the fixed-width (fp32/fp64) reader path,
 // issue #85. This is a maxspeed corelib: decoding an fp32/fp64 array over a
 // reader must not cost one heap allocation per element. The tests below hold
-// the streaming visitor path (AcceptStream) and the pull path
+// the streaming visitor path
 // (ReadFloat32Array / ReadFloat64Array, Float32 / Float64) to allocation counts
 // that do NOT scale with the element count, and check that the batched reads
 // still decode bit-exactly at every chunk boundary.
@@ -123,12 +123,12 @@ func allocGrowth(t *testing.T, small, big []byte, decode func([]byte)) float64 {
 	return b - a
 }
 
-// TestAcceptStreamFixlenArrayAllocsDoNotScale is the regression test for issue
+// TestFeedFixlenArrayAllocsDoNotScale is the regression test for issue
 // #85: reading a fixlen array element-by-element through readRaw allocated one
 // slice per element, so a 1000-element array cost ~1000 allocations more than a
 // 100-element one. Batched reads out of the reader's own buffer allocate only
 // the output slice's growth.
-func TestAcceptStreamFixlenArrayAllocsDoNotScale(t *testing.T) {
+func TestFeedFixlenArrayAllocsDoNotScale(t *testing.T) {
 	for _, tc := range []struct {
 		name       string
 		small, big []byte
@@ -139,8 +139,8 @@ func TestAcceptStreamFixlenArrayAllocsDoNotScale(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			growth := allocGrowth(t, tc.small, tc.big, func(msg []byte) {
 				var sink fpSink
-				if err := sofab.NewDecoder(bytes.NewReader(msg)).AcceptStream(&sink); err != nil {
-					t.Fatalf("AcceptStream: %v", err)
+				if err := feedIn(msg, 1, &sink); err != nil {
+					t.Fatalf("Feed: %v", err)
 				}
 			})
 			// 1000 extra elements: the output slice doubles a handful of times
@@ -152,82 +152,19 @@ func TestAcceptStreamFixlenArrayAllocsDoNotScale(t *testing.T) {
 	}
 }
 
-// TestAcceptStreamFloatScalarAllocsDoNotScale covers the scalar fp32/fp64
+// TestFeedFloatScalarAllocsDoNotScale covers the scalar fp32/fp64
 // fields, which took the same per-value allocation (issue #85).
-func TestAcceptStreamFloatScalarAllocsDoNotScale(t *testing.T) {
+func TestFeedFloatScalarAllocsDoNotScale(t *testing.T) {
 	small, big := encodeFloatScalars(t, 100), encodeFloatScalars(t, 1100)
 	growth := allocGrowth(t, small, big, func(msg []byte) {
 		var sink fpSink
-		if err := sofab.NewDecoder(bytes.NewReader(msg)).AcceptStream(&sink); err != nil {
-			t.Fatalf("AcceptStream: %v", err)
+		if err := feedIn(msg, 1, &sink); err != nil {
+			t.Fatalf("Feed: %v", err)
 		}
 	})
 	if growth > 4 {
 		t.Fatalf("1000 extra float fields cost %v extra allocations; the value read is allocating per field", growth)
 	}
-}
-
-// TestPullFloatAllocsDoNotScale holds the pull surface to the same rule: it read
-// every fp32/fp64 element and every float scalar through the same allocating
-// helper.
-func TestPullFloatAllocsDoNotScale(t *testing.T) {
-	t.Run("fp32 array", func(t *testing.T) {
-		growth := allocGrowth(t, encodeFp32Array(t, 100), encodeFp32Array(t, 1100), func(msg []byte) {
-			d := sofab.NewDecoder(bytes.NewReader(msg))
-			if _, err := d.Next(); err != nil {
-				t.Fatalf("Next: %v", err)
-			}
-			if _, err := d.ReadFloat32Array(); err != nil {
-				t.Fatalf("ReadFloat32Array: %v", err)
-			}
-		})
-		if growth > 16 {
-			t.Fatalf("1000 extra elements cost %v extra allocations", growth)
-		}
-	})
-	t.Run("fp64 array", func(t *testing.T) {
-		growth := allocGrowth(t, encodeFp64Array(t, 100), encodeFp64Array(t, 1100), func(msg []byte) {
-			d := sofab.NewDecoder(bytes.NewReader(msg))
-			if _, err := d.Next(); err != nil {
-				t.Fatalf("Next: %v", err)
-			}
-			if _, err := d.ReadFloat64Array(); err != nil {
-				t.Fatalf("ReadFloat64Array: %v", err)
-			}
-		})
-		if growth > 16 {
-			t.Fatalf("1000 extra elements cost %v extra allocations", growth)
-		}
-	})
-	t.Run("scalars", func(t *testing.T) {
-		growth := allocGrowth(t, encodeFloatScalars(t, 100), encodeFloatScalars(t, 1100), func(msg []byte) {
-			d := sofab.NewDecoder(bytes.NewReader(msg))
-			// encodeFloatScalars alternates fp32, fp64, fp32, ...
-			for i := 0; ; i++ {
-				f, err := d.Next()
-				if err == io.EOF {
-					return
-				}
-				if err != nil {
-					t.Fatalf("Next: %v", err)
-				}
-				if f.Type != sofab.TypeFixlen {
-					t.Fatalf("unexpected wire type %v", f.Type)
-				}
-				if i%2 == 0 {
-					_, err = d.Float32()
-				} else {
-					_, err = d.Float64()
-				}
-				if err != nil {
-					t.Fatalf("read scalar %d: %v", i, err)
-				}
-			}
-		})
-		if growth > 4 {
-			t.Fatalf("1000 extra float fields cost %v extra allocations", growth)
-		}
-	})
 }
 
 // TestFixlenArrayBatchedReadIsBitExact guards the batching itself: a long array
@@ -248,13 +185,9 @@ func TestFixlenArrayBatchedReadIsBitExact(t *testing.T) {
 	for name, mk := range readers {
 		t.Run("fp32/"+name, func(t *testing.T) {
 			var got []float32
-			d := sofab.NewDecoder(mk(msg32))
-			if _, err := d.Next(); err != nil {
-				t.Fatalf("Next: %v", err)
-			}
-			got, err := d.ReadFloat32Array()
-			if err != nil {
-				t.Fatalf("ReadFloat32Array: %v", err)
+			v := collectF32{&got}
+			if err := feedFrom(mk(msg32), 8, v); err != nil {
+				t.Fatalf("FeedFrom: %v", err)
 			}
 			if len(got) != len(want32) {
 				t.Fatalf("len = %d, want %d", len(got), len(want32))
@@ -267,13 +200,10 @@ func TestFixlenArrayBatchedReadIsBitExact(t *testing.T) {
 			}
 		})
 		t.Run("fp64/"+name, func(t *testing.T) {
-			d := sofab.NewDecoder(mk(msg64))
-			if _, err := d.Next(); err != nil {
-				t.Fatalf("Next: %v", err)
-			}
-			got, err := d.ReadFloat64Array()
-			if err != nil {
-				t.Fatalf("ReadFloat64Array: %v", err)
+			var got []float64
+			v := collectF64{out: &got}
+			if err := feedFrom(mk(msg64), 8, v); err != nil {
+				t.Fatalf("FeedFrom: %v", err)
 			}
 			if len(got) != len(want64) {
 				t.Fatalf("len = %d, want %d", len(got), len(want64))
@@ -282,22 +212,6 @@ func TestFixlenArrayBatchedReadIsBitExact(t *testing.T) {
 				if math.Float64bits(got[i]) != math.Float64bits(want64[i]) {
 					t.Fatalf("element %d = %016x, want %016x", i,
 						math.Float64bits(got[i]), math.Float64bits(want64[i]))
-				}
-			}
-		})
-		t.Run("stream/fp32/"+name, func(t *testing.T) {
-			var got []float32
-			v := collectF32{&got}
-			if err := sofab.NewDecoder(mk(msg32)).AcceptStream(v); err != nil {
-				t.Fatalf("AcceptStream: %v", err)
-			}
-			if len(got) != len(want32) {
-				t.Fatalf("len = %d, want %d", len(got), len(want32))
-			}
-			for i := range want32 {
-				if math.Float32bits(got[i]) != math.Float32bits(want32[i]) {
-					t.Fatalf("element %d = %08x, want %08x", i,
-						math.Float32bits(got[i]), math.Float32bits(want32[i]))
 				}
 			}
 		})
@@ -320,7 +234,7 @@ func TestFixlenArrayTruncatedMidBatch(t *testing.T) {
 			t.Run(tc.name, func(t *testing.T) {
 				short := tc.msg[:len(tc.msg)-cut]
 				var sink fpSink
-				err := sofab.NewDecoder(bytes.NewReader(short)).AcceptStream(&sink)
+				err := feedIn(short, 1, &sink)
 				if err != sofab.ErrIncomplete {
 					t.Fatalf("cut %d: err = %v, want ErrIncomplete", cut, err)
 				}
@@ -345,9 +259,19 @@ func (c collectF32) Float32Array(_ sofab.ID, v []float32) error {
 	*c.out = append(*c.out, v...)
 	return nil
 }
-func (c collectF32) Float64Array(sofab.ID, []float64) error        { return nil }
-func (c collectF32) BeginSequence(sofab.ID) (sofab.Visitor, error) { return c, nil }
-func (c collectF32) EndSequence() error                            { return nil }
+func (c collectF32) Float64Array(sofab.ID, []float64) error { return nil }
+func (c collectF32) BeginSequence(sofab.ID) (any, error)    { return c, nil }
+func (c collectF32) EndSequence() error                     { return nil }
+
+type collectF64 struct {
+	baseV
+	out *[]float64
+}
+
+func (c collectF64) Float64Array(_ sofab.ID, v []float64) error {
+	*c.out = append(*c.out, v...)
+	return nil
+}
 
 // chunkReader hands out at most n bytes per Read, so element and buffer-fill
 // boundaries land at strides the batch loop must not assume anything about.
@@ -368,27 +292,27 @@ func (r *chunkReader) Read(p []byte) (int, error) {
 
 // --- benchmarks (issue #85) --------------------------------------------------
 
-func BenchmarkAcceptStreamFp32Array(b *testing.B) {
+func BenchmarkFeedFp32Array(b *testing.B) {
 	msg := encodeFp32Array(b, 1000)
 	b.SetBytes(int64(len(msg)))
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		var sink fpSink
-		if err := sofab.NewDecoder(bytes.NewReader(msg)).AcceptStream(&sink); err != nil {
+		if err := feedIn(msg, 1, &sink); err != nil {
 			b.Fatal(err)
 		}
 	}
 }
 
-func BenchmarkAcceptStreamFp64Array(b *testing.B) {
+func BenchmarkFeedFp64Array(b *testing.B) {
 	msg := encodeFp64Array(b, 1000)
 	b.SetBytes(int64(len(msg)))
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		var sink fpSink
-		if err := sofab.NewDecoder(bytes.NewReader(msg)).AcceptStream(&sink); err != nil {
+		if err := feedIn(msg, 1, &sink); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -401,7 +325,7 @@ func BenchmarkAcceptBytesFp32Array(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		var sink fpSink
-		if err := sofab.AcceptBytes(msg, &sink); err != nil {
+		if err := acceptBytes(msg, &sink); err != nil {
 			b.Fatal(err)
 		}
 	}

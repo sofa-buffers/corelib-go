@@ -5,10 +5,12 @@ package sofab_test
 // "typical" message — so an encode change has a number next to it under the same
 // harness the decode side is measured with (-count/benchstat).
 //
-// Both encoder forms are covered, because they allocate differently: the
-// io.Writer form owns (and grows) a window of its own, while the caller-supplied
-// buffer form (CORELIB_PLAN §5.1) writes straight into the caller's storage and
-// must allocate nothing per message.
+// Both encoder forms are covered, because they are constructed differently: the
+// io.Writer form sizes a fixed scratch window once at construction, while the
+// caller-supplied buffer form (CORELIB_PLAN §5.1) writes straight into the
+// caller's storage. Neither allocates per message; these loops construct a fresh
+// Encoder per iteration, so what they measure includes that one-time cost, which
+// §6.6.4 excludes from the conformance measurement (see TestNoAllocationsAfterConstruction).
 
 import (
 	"testing"
@@ -67,8 +69,8 @@ func BenchmarkEncodeU64Array(b *testing.B) {
 }
 
 // The *Buffer variants encode into a caller-supplied buffer (§5.1) — the form
-// with no window of its own and nowhere to flush to, so the steady state must be
-// allocation-free apart from the Encoder itself.
+// with no window of its own and nowhere to flush to, so the steady state is
+// allocation-free apart from constructing the Encoder itself.
 
 func BenchmarkEncodeTypicalBuffer(b *testing.B) {
 	buf := make([]byte, 512)

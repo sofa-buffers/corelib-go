@@ -50,7 +50,7 @@ func (r *arrayRecorder) Float64Array(_ sofab.ID, v []float64) error {
 func decodeOneArray(t *testing.T, raw []byte) *arrayRecorder {
 	t.Helper()
 	r := &arrayRecorder{}
-	if err := sofab.AcceptBytes(raw, r); err != nil {
+	if err := acceptBytes(raw, r); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
 	if !r.seen {
@@ -163,11 +163,8 @@ func TestEmptyArrayStaysEmpty(t *testing.T) {
 	}
 }
 
-func TestNarrow(t *testing.T) {
-	if got := sofab.NarrowUnsigned[uint8]([]uint64{1, 255}); got[1] != 255 {
-		t.Errorf("NarrowUnsigned = %v", got)
-	}
-	if got := sofab.NarrowSigned[int16]([]int64{-1, 32767}); got[0] != -1 || got[1] != 32767 {
-		t.Errorf("NarrowSigned = %v", got)
-	}
-}
+// NarrowUnsigned / NarrowSigned are gone with the whole-slice array callbacks
+// they existed to serve: the decoder delivers elements one at a time, widened to
+// the 64-bit value domain, so a destination narrows AS IT BINDS — and checks the
+// declared width there too, which the after-the-fact narrowing never could
+// (elem_bound_test.go). Nothing replaces them, which is the point.

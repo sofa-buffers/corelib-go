@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"encoding/hex"
 	"io"
+	"strings"
 	"testing"
 	"testing/iotest"
 
@@ -84,11 +85,15 @@ func TestChunkedDecodeAtEveryBoundary(t *testing.T) {
 		"one-byte":    func() io.Reader { return iotest.OneByteReader(bytes.NewReader(raw)) },
 		"half-sized":  func() io.Reader { return iotest.HalfReader(bytes.NewReader(raw)) },
 	}
+	want := strings.Join(expectLog(t, comp.Fields), "|")
 	for name, mk := range readers {
 		t.Run(name, func(t *testing.T) {
-			d := sofab.NewDecoder(mk())
-			for _, f := range comp.Fields {
-				decodeField(t, d, f)
+			var log []string
+			if err := feedFrom(mk(), 1, recorder{&log}); err != nil {
+				t.Fatalf("Feed: %v", err)
+			}
+			if got := strings.Join(log, "|"); got != want {
+				t.Fatalf("events =\n %s\nwant\n %s", got, want)
 			}
 		})
 	}

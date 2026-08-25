@@ -19,11 +19,6 @@ func TestDecodeOutcome(t *testing.T) {
 		name string
 		in   []byte
 		want error // nil = COMPLETE
-		// visitorOnly marks a case whose outcome is a structural (sequence
-		// nesting) property that only the whole-message visitor path enforces —
-		// the low-level pull Next() is nesting-agnostic by design (generated code
-		// tracks sequence depth itself), so the pull assertion is skipped.
-		visitorOnly bool
 	}{
 		// COMPLETE — ends exactly at a field boundary.
 		{name: "empty message", in: []byte{}, want: nil},
@@ -33,12 +28,12 @@ func TestDecodeOutcome(t *testing.T) {
 		{name: "lone dangling 0x80", in: []byte{0x80}, want: sofab.ErrIncomplete},
 		{name: "unterminated value varint", in: append(vhdr(0, sofab.TypeVarintUnsigned), 0x80), want: sofab.ErrIncomplete},
 		{name: "short fixlen payload", in: append(vhdr(0, sofab.TypeFixlen), append(vbytes((4<<3)|subStr), 'h', 'i')...), want: sofab.ErrIncomplete},
-		{name: "unclosed sequence", in: vhdr(0, sofab.TypeSequenceStart), want: sofab.ErrIncomplete, visitorOnly: true},
+		{name: "unclosed sequence", in: vhdr(0, sofab.TypeSequenceStart), want: sofab.ErrIncomplete},
 
 		// INVALID — malformed regardless of what follows.
 		{name: "varint over 64 bits", in: append(vhdr(0, sofab.TypeVarintUnsigned),
 			0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80), want: sofab.ErrInvalidMsg},
-		{name: "dangling sequence end", in: vhdr(0, sofab.TypeSequenceEnd), want: sofab.ErrInvalidMsg, visitorOnly: true},
+		{name: "dangling sequence end", in: vhdr(0, sofab.TypeSequenceEnd), want: sofab.ErrInvalidMsg},
 	}
 
 	check := func(t *testing.T, path string, err, want error) {
@@ -56,28 +51,12 @@ func TestDecodeOutcome(t *testing.T) {
 
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			// Visitor path (what a generated Decode<Name> uses).
-			check(t, "AcceptBytes", sofab.AcceptBytes(c.in, baseV{}), c.want)
-
-			if c.visitorOnly {
-				return
-			}
-
-			// Pull path: drive Next + auto-skip to the same terminal outcome. A
-			// clean top-level end surfaces as io.EOF, which is COMPLETE here.
-			d := newDec(c.in)
-			var perr error
-			for {
-				_, err := d.Next()
-				if err != nil {
-					if !errors.Is(err, sofab.ErrIncomplete) && !errors.Is(err, sofab.ErrInvalidMsg) {
-						err = nil // io.EOF at a clean boundary = COMPLETE
-					}
-					perr = err
-					break
-				}
-			}
-			check(t, "pull Next", perr, c.want)
+			// The visitor is the only decode surface (§5.3.1), so the outcome is
+			// checked on all three of its entry points: they must agree byte for
+			// byte, which is the divergence class §5.3.1 exists to prevent.
+			check(t, "AcceptBytes", acceptBytes(c.in, baseV{}), c.want)
+			check(t, "Feed", feedIn(c.in, 0, baseV{}), c.want)
+			check(t, "Feed/1-byte", feedIn(c.in, 1, baseV{}), c.want)
 		})
 	}
 }

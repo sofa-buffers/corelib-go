@@ -39,64 +39,31 @@ func TestPartA_NoEagerAllocFromWireCount(t *testing.T) {
 	cases := []struct {
 		name string
 		in   []byte
-		// pull reads the first field's value with its matching typed reader, so the
-		// allocation path under test (not Skip, which discards without buffering) is
-		// exercised on the pull parser.
-		pull func(*sofab.Decoder) error
 	}{
-		{
-			name: "varint unsigned array",
-			in: append(vhdr(0, sofab.TypeVarintArrayUnsigned),
-				append(vbytes(arrayMaxCount), 0x00, 0x00)...),
-			pull: func(d *sofab.Decoder) error { _, err := sofab.ReadUnsignedArray[uint64](d); return err },
-		},
-		{
-			name: "varint signed array",
-			in: append(vhdr(0, sofab.TypeVarintArraySigned),
-				append(vbytes(arrayMaxCount), 0x00, 0x00)...),
-			pull: func(d *sofab.Decoder) error { _, err := sofab.ReadSignedArray[int64](d); return err },
-		},
-		{
-			name: "fixlen blob length",
-			in: append(vhdr(0, sofab.TypeFixlen),
-				append(vbytes((arrayMaxCount<<3)|subBlob), 0x01, 0x02)...),
-			pull: func(d *sofab.Decoder) error { _, err := d.Bytes(); return err },
-		},
-		{
-			name: "fixlen string length",
-			in: append(vhdr(0, sofab.TypeFixlen),
-				append(vbytes((arrayMaxCount<<3)|subStr), 'h', 'i')...),
-			pull: func(d *sofab.Decoder) error { _, err := d.String(); return err },
-		},
+		{"varint unsigned array", append(vhdr(0, sofab.TypeVarintArrayUnsigned),
+			append(vbytes(arrayMaxCount), 0x00, 0x00)...)},
+		{"varint signed array", append(vhdr(0, sofab.TypeVarintArraySigned),
+			append(vbytes(arrayMaxCount), 0x00, 0x00)...)},
+		{"fixlen blob length", append(vhdr(0, sofab.TypeFixlen),
+			append(vbytes((arrayMaxCount<<3)|subBlob), 0x01, 0x02)...)},
+		{"fixlen string length", append(vhdr(0, sofab.TypeFixlen),
+			append(vbytes((arrayMaxCount<<3)|subStr), 'h', 'i')...)},
 	}
 
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			// Visitor path (what a generated Decode<Name> uses).
-			var verr error
-			got := bytesAllocated(func() { verr = sofab.AcceptBytes(c.in, baseV{}) })
-			if !errors.Is(verr, sofab.ErrIncomplete) {
-				t.Fatalf("AcceptBytes = %v, want ErrIncomplete", verr)
-			}
-			if got > allocBudget {
-				t.Fatalf("AcceptBytes allocated %d bytes, want <= %d (eager alloc from wire count?)", got, allocBudget)
-			}
-
-			// Pull path: drive Next then the matching typed reader.
-			var perr error
-			pot := bytesAllocated(func() {
-				d := sofab.NewDecoder(bytes.NewReader(c.in))
-				if _, err := d.Next(); err != nil {
-					perr = err
-					return
+			// A materializing destination on every entry point: recorder binds
+			// every value, so the allocation path under test is the one exercised.
+			for _, surface := range surfaces {
+				var err error
+				got := bytesAllocated(func() { _, err = decodeAll(t, surface, c.in) })
+				if !errors.Is(err, sofab.ErrIncomplete) {
+					t.Fatalf("%s = %v, want ErrIncomplete", surface, err)
 				}
-				perr = c.pull(d)
-			})
-			if !errors.Is(perr, sofab.ErrIncomplete) {
-				t.Fatalf("pull = %v, want ErrIncomplete", perr)
-			}
-			if pot > allocBudget {
-				t.Fatalf("pull allocated %d bytes, want <= %d (eager alloc from wire count?)", pot, allocBudget)
+				if got > allocBudget {
+					t.Fatalf("%s allocated %d bytes, want <= %d (eager alloc from wire count?)",
+						surface, got, allocBudget)
+				}
 			}
 		})
 	}
@@ -112,24 +79,22 @@ func TestPartB_ArrayCountLimit(t *testing.T) {
 	at := encodeUnsignedArray(t, 1, make([]uint64, limit))
 
 	// No limit: the oversize message decodes fine (default = today's behavior).
-	if err := sofab.AcceptBytes(over, baseV{}); err != nil {
+	if err := acceptBytes(over, baseV{}); err != nil {
 		t.Fatalf("no-limit decode = %v, want nil", err)
 	}
 	// With the limit, the same bytes are rejected as ErrLimitExceeded.
-	if err := sofab.AcceptBytes(over, baseV{}, sofab.WithMaxArrayCount(limit)); !errors.Is(err, sofab.ErrLimitExceeded) {
+	if err := acceptBytes(over, baseV{}, sofab.WithMaxArrayCount(limit)); !errors.Is(err, sofab.ErrLimitExceeded) {
 		t.Fatalf("over-limit visitor = %v, want ErrLimitExceeded", err)
 	}
 	// Exactly at the limit is allowed (reject is strictly greater-than).
-	if err := sofab.AcceptBytes(at, baseV{}, sofab.WithMaxArrayCount(limit)); err != nil {
+	if err := acceptBytes(at, baseV{}, sofab.WithMaxArrayCount(limit)); err != nil {
 		t.Fatalf("at-limit visitor = %v, want nil", err)
 	}
-	// Pull path enforces the same limit.
-	d := sofab.NewDecoder(bytes.NewReader(over), sofab.WithMaxArrayCount(limit))
-	if _, err := d.Next(); err != nil {
-		t.Fatalf("pull Next = %v", err)
-	}
-	if _, err := sofab.ReadUnsignedArray[uint64](d); !errors.Is(err, sofab.ErrLimitExceeded) {
-		t.Fatalf("over-limit pull = %v, want ErrLimitExceeded", err)
+	// The chunked feed enforces the same limit on the same bytes: the cap is
+	// judged at the count word, so it does not depend on where a chunk boundary
+	// fell.
+	if err := feedIn(over, 1, baseV{}, sofab.WithMaxArrayCount(limit)); !errors.Is(err, sofab.ErrLimitExceeded) {
+		t.Fatalf("over-limit Feed = %v, want ErrLimitExceeded", err)
 	}
 }
 
@@ -143,35 +108,31 @@ func TestPartB_StringAndBlobLimit(t *testing.T) {
 	blobAt := encodeBlob(t, 1, bytes.Repeat([]byte{0xAB}, limit))
 
 	// String.
-	if err := sofab.AcceptBytes(strOver, baseV{}); err != nil {
+	if err := acceptBytes(strOver, baseV{}); err != nil {
 		t.Fatalf("no-limit string decode = %v, want nil", err)
 	}
-	if err := sofab.AcceptBytes(strOver, baseV{}, sofab.WithMaxStringLen(limit)); !errors.Is(err, sofab.ErrLimitExceeded) {
+	if err := acceptBytes(strOver, baseV{}, sofab.WithMaxStringLen(limit)); !errors.Is(err, sofab.ErrLimitExceeded) {
 		t.Fatalf("over-limit string = %v, want ErrLimitExceeded", err)
 	}
-	if err := sofab.AcceptBytes(strAt, baseV{}, sofab.WithMaxStringLen(limit)); err != nil {
+	if err := acceptBytes(strAt, baseV{}, sofab.WithMaxStringLen(limit)); err != nil {
 		t.Fatalf("at-limit string = %v, want nil", err)
 	}
 	// A blob limit does not restrict a string, and vice versa.
-	if err := sofab.AcceptBytes(strOver, baseV{}, sofab.WithMaxBlobLen(limit)); err != nil {
+	if err := acceptBytes(strOver, baseV{}, sofab.WithMaxBlobLen(limit)); err != nil {
 		t.Fatalf("string under blob-only limit = %v, want nil", err)
 	}
 
 	// Blob.
-	if err := sofab.AcceptBytes(blobOver, baseV{}, sofab.WithMaxBlobLen(limit)); !errors.Is(err, sofab.ErrLimitExceeded) {
+	if err := acceptBytes(blobOver, baseV{}, sofab.WithMaxBlobLen(limit)); !errors.Is(err, sofab.ErrLimitExceeded) {
 		t.Fatalf("over-limit blob = %v, want ErrLimitExceeded", err)
 	}
-	if err := sofab.AcceptBytes(blobAt, baseV{}, sofab.WithMaxBlobLen(limit)); err != nil {
+	if err := acceptBytes(blobAt, baseV{}, sofab.WithMaxBlobLen(limit)); err != nil {
 		t.Fatalf("at-limit blob = %v, want nil", err)
 	}
 
-	// Pull path, blob.
-	d := sofab.NewDecoder(bytes.NewReader(blobOver), sofab.WithMaxBlobLen(limit))
-	if _, err := d.Next(); err != nil {
-		t.Fatalf("pull Next = %v", err)
-	}
-	if _, err := d.Bytes(); !errors.Is(err, sofab.ErrLimitExceeded) {
-		t.Fatalf("over-limit blob pull = %v, want ErrLimitExceeded", err)
+	// The chunked feed, blob.
+	if err := feedIn(blobOver, 1, baseV{}, sofab.WithMaxBlobLen(limit)); !errors.Is(err, sofab.ErrLimitExceeded) {
+		t.Fatalf("over-limit blob Feed = %v, want ErrLimitExceeded", err)
 	}
 }
 
@@ -181,12 +142,12 @@ func TestPartB_StringAndBlobLimit(t *testing.T) {
 func TestPartB_LimitEnforcedBeforePayload(t *testing.T) {
 	// Array header + count, no elements follow.
 	arr := append(vhdr(0, sofab.TypeVarintArrayUnsigned), vbytes(arrayMaxCount)...)
-	if err := sofab.AcceptBytes(arr, baseV{}, sofab.WithMaxArrayCount(1000)); !errors.Is(err, sofab.ErrLimitExceeded) {
+	if err := acceptBytes(arr, baseV{}, sofab.WithMaxArrayCount(1000)); !errors.Is(err, sofab.ErrLimitExceeded) {
 		t.Fatalf("array header-only = %v, want ErrLimitExceeded", err)
 	}
 	// String header claiming 2000 bytes, no payload follows.
 	str := append(vhdr(0, sofab.TypeFixlen), vbytes((2000<<3)|subStr)...)
-	if err := sofab.AcceptBytes(str, baseV{}, sofab.WithMaxStringLen(1000)); !errors.Is(err, sofab.ErrLimitExceeded) {
+	if err := acceptBytes(str, baseV{}, sofab.WithMaxStringLen(1000)); !errors.Is(err, sofab.ErrLimitExceeded) {
 		t.Fatalf("string header-only = %v, want ErrLimitExceeded", err)
 	}
 }
@@ -197,7 +158,7 @@ func TestPartB_LimitEnforcedBeforePayload(t *testing.T) {
 // divergence). A non-positive limit means unlimited.
 func TestPartB_LimitDistinctFromInvalid(t *testing.T) {
 	over := encodeUnsignedArray(t, 1, make([]uint64, 11))
-	err := sofab.AcceptBytes(over, baseV{}, sofab.WithMaxArrayCount(10))
+	err := acceptBytes(over, baseV{}, sofab.WithMaxArrayCount(10))
 	if !errors.Is(err, sofab.ErrLimitExceeded) {
 		t.Fatalf("= %v, want ErrLimitExceeded", err)
 	}
@@ -208,10 +169,10 @@ func TestPartB_LimitDistinctFromInvalid(t *testing.T) {
 		t.Fatal("ErrLimitExceeded must not match ErrIncomplete")
 	}
 	// A non-positive limit is treated as no limit at all.
-	if err := sofab.AcceptBytes(over, baseV{}, sofab.WithMaxArrayCount(0)); err != nil {
+	if err := acceptBytes(over, baseV{}, sofab.WithMaxArrayCount(0)); err != nil {
 		t.Fatalf("zero (unlimited) limit = %v, want nil", err)
 	}
-	if err := sofab.AcceptBytes(over, baseV{}, sofab.WithMaxArrayCount(-1)); err != nil {
+	if err := acceptBytes(over, baseV{}, sofab.WithMaxArrayCount(-1)); err != nil {
 		t.Fatalf("negative (unlimited) limit = %v, want nil", err)
 	}
 }

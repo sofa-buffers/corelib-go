@@ -25,33 +25,47 @@
 // ErrBufferFull), NewEncoderSink takes one plus a flush callback, and both take
 // a start offset that leaves room at the front for a framing header
 // (CORELIB_PLAN §5.1; MinOutputBuffer says how small such a buffer may be).
-// NewEncoder is the io.Writer convenience form, and the only one that allocates
-// a window of its own. The decoder offers three styles:
+// NewEncoder is the io.Writer convenience form; it sizes a fixed scratch window
+// once, at construction, and never grows it.
 //
-//   - Pull: call Decoder.Next to get the next field header, then a typed reader
-//     (or Skip) to consume its value. It streams one field at a time, never
-//     materializing the whole message. Best for hand-written, power-user code.
-//   - Visitor: implement Visitor on the target type and call Decoder.Accept; the
-//     decoder drives, binding each field straight into a struct member. This is
-//     what a generated Decode<Name> uses. See the Decoding example below.
-//   - Visitor over a reader: the same Visitor, driven by Decoder.AcceptStream,
-//     which reads and dispatches each field as the io.Reader delivers it instead
-//     of buffering the message first. This is what a generated
-//     Decode<Name>From(io.Reader) uses.
+// THE VISITOR IS THE ONLY DECODE SURFACE (CORELIB_PLAN §5.3.1): implement
+// Visitor on the target type and let the decoder drive, binding each field
+// straight into a member the caller owns. There is no pull parser, no iterator,
+// no cursor — one surface means one place to be correct, and behind the surface
+// there is one implementation of it: a resumable PUSH state machine.
 //
-// Accept reads the message into one contiguous buffer and parses it by advancing
-// a cursor over it (the protobuf-style decode kernel), so for an in-memory source
-// it is faster than the pull parser but does buffer the whole message.
-// AcceptBytes is the zero-copy form when the message is already a []byte (e.g. a
-// generated Decode<Name>). AcceptStream buffers nothing: peak memory is the
-// largest single field, and — having no shared image to alias — it hands the
-// visitor freshly read storage for strings and blobs alike, where Accept and
-// AcceptBytes hand it blob values that are views into the buffer being parsed.
+// Decoder.Feed is that machine (§5.2, §6.0). Hand it bytes in chunks of any
+// size — one byte included — and it returns the outcome for everything consumed
+// so far: Complete, Incomplete or Invalid. A field header, a varint, a payload
+// or an array may be split across any number of calls; the machine suspends and
+// resumes at any byte boundary. There is no finish or finalize step: the value
+// Feed returns is the answer (§5.2.4).
 //
-// A visitor may implement the optional extensions HeaderVisitor and
-// ElemBoundVisitor (and SchemaBoundVisitor, StringPolicyVisitor) to have a
-// schema bound reach the decoder; each is consulted on every visitor path, and a
-// visitor that implements none decodes exactly as before.
+// Two wrappers sit on it, and neither is a second surface — they hold no state,
+// apply no rule and produce the same events the same Feed calls would:
+//
+//   - AcceptBytes — one Feed of a complete message already in one []byte (what
+//     a generated Decode<Name> uses). §6.7.1 gives the one-shot path no memory
+//     exemption, and it takes none.
+//   - Decoder.FeedFrom — drain an io.Reader, feeding it in chunks of the
+//     CALLER's scratch buffer. This package sizes no buffer from a stream.
+//
+// NOTHING THE DECODER HANDS OVER IS STORAGE (§6.6.3). A string or a blob
+// arrives as FixlenBegin (the total, before any payload byte) and then one or
+// more String / Bytes calls carrying the total, this piece's offset and a window
+// into the caller's own fed bytes. An array arrives as ArrayBegin, one element
+// callback per element, ArrayEnd. Building a value out of that is the
+// destination's business, and its storage is the destination's own — which is
+// what lets the codec allocate nothing at all after construction (§6.6).
+//
+// Whatever a visitor callback receives is valid only until that callback
+// returns; a caller that keeps a value copies it first (§6.7). That holds on the
+// one-shot path exactly as on the streaming one.
+//
+// A visitor may implement the optional extensions SchemaBoundVisitor and
+// StringPolicyVisitor, to tell the decoder which fields the schema already
+// bounds and to receive the decode's UTF-8 policy; a visitor that implements
+// neither decodes exactly as before.
 //
 // # Collectors
 //
@@ -62,10 +76,10 @@
 // generated package: StringSeq, BlobSeq, MessageSeq, NestedSeq, the matrix
 // collectors and PlaceRow, all built on the no-op VisitorBase. The schema
 // travels as arguments — Cap is the count bound, ElemMax the element maxlen,
-// Hi/Lo the declared element width — exactly as NarrowUnsigned/NarrowSigned take
-// the element type as a type parameter, and a generated BeginSequence arm is
-// then one line handing back the collector its field is bound to. PayloadAcc is
-// the same idea for a payload that arrives in chunks.
+// Hi/Lo the declared element width — and a generated BeginSequence arm is then
+// one line handing back the collector its field is bound to. PayloadAcc is the
+// same idea one level down: it assembles a string or blob payload out of the
+// pieces the decoder delivers.
 //
 // # Sequence framing (omitting an all-default sequence)
 //
@@ -108,11 +122,11 @@
 //
 // # Decode outcome (three-valued, finish-less)
 //
-// Decoding reports one of three outcomes (MESSAGE_SPEC §7), on both the pull and
-// visitor paths, and identically for one-shot and streaming use:
+// Decoding reports one of three outcomes (MESSAGE_SPEC §7), identically on all
+// three entry points and for one-shot and streaming use alike:
 //
 //   - COMPLETE — the input ended exactly at a field boundary (a valid message).
-//     Signalled by a nil error (Accept) or io.EOF at the top level (Next).
+//     Signalled by a nil error.
 //   - INCOMPLETE — the input ended *inside* a field (an unterminated varint, a
 //     short fixlen/array payload, or an unclosed sequence). Signalled by
 //     ErrIncomplete. This is NOT a malformed-message error: the bytes so far are
@@ -126,17 +140,17 @@
 // Test the two with errors.Is; they are distinct sentinels, so a truncated
 // stream is never conflated with a malformed one.
 //
-// A further sentinel sits beside them on the pull path: ErrTypeMismatch, returned
-// when a typed reader is bound to a field of another wire type — or, for a
-// fixlen, another subtype. It is not a verdict on the message: MESSAGE_SPEC §7.3
-// skips such a field exactly like one with an unknown id, so the reader consumes
-// the value, leaves the destination untouched, and the decode stays COMPLETE.
-// CORELIB_PLAN §6.3 has no "invalid usage" code; what is left of caller error is
-// ErrArgument — a typed reader called with no field waiting, or after the current
-// value was already consumed. On the encode side it is the same sentinel for the
-// same reason: an argument no valid field can be built from — an id past IDMax, a
-// payload or element count past FIXLEN_MAX/ARRAY_MAX, a sequence opened past
-// MaxDepth or closed with none open — is refused before any byte is written.
+// A field whose wire type contradicts what the destination declares is NOT an
+// error at all (CORELIB_PLAN §6.3): MESSAGE_SPEC §7.3 skips it exactly like one
+// with an unknown id, leaving the destination untouched, and the decode stays
+// COMPLETE. There is no code for it and no sentinel — the visitor's own field
+// switch simply does not bind it.
+//
+// CORELIB_PLAN §6.3 has no "invalid usage" code either; what is left of caller
+// error is ErrArgument — an argument no valid field can be built from: an id past
+// IDMax, a payload or element count past FIXLEN_MAX/ARRAY_MAX, a sequence opened
+// past MaxDepth or closed with none open. All are refused before any byte is
+// written.
 //
 // # Encoding example (what a generated Serialize looks like)
 //
@@ -159,37 +173,52 @@
 //		return buf.Bytes(), nil
 //	}
 //
-// # Decoding example (a hand-written Decode over the pull API)
+// # Decoding example (what a generated Decode looks like)
 //
-// Generated code decodes through the visitor path instead — Decode<Name> runs
-// AcceptBytes over the message and binds each field in the Visitor methods —
-// but both surfaces reach the same verdict on the same bytes.
+//	func (m *SensorReading) Unsigned(id sofab.ID, v uint64) error {
+//		switch id {
+//		case 1:
+//			m.ID = uint32(v)
+//		}
+//		return nil // an id this schema does not declare is simply not bound
+//	}
 //
-//	func (m *SensorReading) Decode(d *sofab.Decoder) error {
-//		for {
-//			f, err := d.Next()
-//			if err == io.EOF {
-//				return nil // end of the top-level message
-//			}
-//			if err != nil {
-//				return err
-//			}
-//			switch {
-//			case f.Type == sofab.TypeSequenceEnd:
-//				return nil // end of this (sub-)message
-//			case f.ID == 1:
-//				v, _ := d.Unsigned()
-//				m.ID = uint32(v)
-//			case f.ID == 2:
-//				v, _ := d.Signed()
-//				m.Temperature = int32(v)
-//			case f.ID == 3:
-//				m.Name, _ = d.String()
-//			case f.ID == 4:
-//				m.Samples, _ = sofab.ReadUnsignedArray[uint16](d)
-//			default:
-//				d.Skip() // unknown field: forward/backward compatible
+//	func (m *SensorReading) Signed(id sofab.ID, v int64) error {
+//		switch id {
+//		case 2:
+//			m.Temperature = int32(v)
+//		}
+//		return nil
+//	}
+//
+//	func (m *SensorReading) String(id sofab.ID, s string) error {
+//		switch id {
+//		case 3:
+//			m.Name = s // Go's string conversion has already copied it
+//		}
+//		return nil
+//	}
+//
+//	func (m *SensorReading) UnsignedArray(id sofab.ID, v []uint64) error {
+//		switch id {
+//		case 4:
+//			m.Samples = make([]uint16, len(v))
+//			for i, x := range v {
+//				if x > math.MaxUint16 {
+//					return sofab.ErrInvalidMsg // the schema's declared width (§7.1)
+//				}
+//				m.Samples[i] = uint16(x)
 //			}
 //		}
+//		return nil
 //	}
+//
+//	func DecodeSensorReading(buf []byte) (*SensorReading, error) {
+//		m := &SensorReading{}
+//		return m, sofab.AcceptBytes(buf, m)
+//	}
+//
+// A sub-sequence the consumer has no destination for is declined whole by
+// returning a nil visitor from BeginSequence: nothing under it is delivered and
+// nothing under it is built, however deep it goes.
 package sofab

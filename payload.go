@@ -9,6 +9,10 @@ package sofab
 // a chunk boundary. The sibling ports emit exactly this by hand today
 // (generator#345).
 
+// accChunk bounds the buffer a fresh accumulation opens with, so an announced
+// length is never an allocation on its own.
+const accChunk = 64 << 10
+
 // PayloadAcc reassembles one payload delivered in chunks, and hands it over
 // whole the moment the last byte of it arrives.
 //
@@ -21,13 +25,13 @@ package sofab
 // how much of it may be accepted from a bound the caller applies BEFORE the
 // first chunk is offered here.
 //
-// Go's own decode paths do not need it. Accept, AcceptBytes and AcceptStream
-// all deliver a string or blob field to Visitor whole (AcceptStream reads the
-// payload out of the reader before dispatching), which is why generated Go code
-// carries no accumulator while several sibling targets do. It is public for the
-// direct-use audience of §6.1: a caller assembling a length-prefixed message
-// off a transport that hands over arbitrary chunks, before passing the result to
-// AcceptBytes, and any future chunk-shaped surface on this side.
+// It is what a destination binds a string or blob field through. Visitor.String
+// and Visitor.Bytes deliver a payload IN PIECES (§6.6.3) — the total, this
+// piece's offset, and a window into the caller's own fed bytes — because a
+// callback carrying the whole value would oblige the CODEC to build it from the
+// wire's size, which §6.6 forbids. The building belongs on this side of the
+// callback, where the storage is the caller's: that is the static helper layer
+// of §6.6.1, and this is it.
 //
 // The zero value is ready to use. It is NOT safe for concurrent use, and one
 // accumulator carries one payload at a time.
@@ -62,10 +66,12 @@ type PayloadAcc struct {
 //     it, so the bytes are the caller's and the next payload starts from a fresh
 //     buffer rather than overwriting them.
 //
-// A hostile total costs no memory up front: the accumulation is opened at
-// readRawChunk at most and grows as bytes actually arrive, so a claimed length
-// near 2^31 that is never delivered allocates in proportion to what did arrive
-// (the same hardening Decoder.readRaw applies, issue #40).
+// A hostile total costs no memory up front: the accumulation opens at
+// accChunk at most and grows as bytes actually arrive, so a claimed length near
+// 2^31 that is never delivered allocates in proportion to what did arrive. That
+// hardening belongs HERE and not in the codec, which is the §6.6.1 division:
+// this is the static helper layer, it allocates on the caller's behalf, and the
+// codec it sits behind sizes nothing at all from the wire.
 func (a *PayloadAcc) Take(total, offset int, chunk []byte) ([]byte, bool) {
 	if total < 0 || offset < 0 {
 		a.Reset()
@@ -84,7 +90,7 @@ func (a *PayloadAcc) Take(total, offset int, chunk []byte) ([]byte, bool) {
 			return chunk[:total], true
 		}
 		if cap(a.buf) == 0 {
-			a.buf = make([]byte, 0, min(total, readRawChunk))
+			a.buf = make([]byte, 0, min(total, accChunk))
 		}
 	} else if total != a.total || offset != len(a.buf) {
 		a.Reset()

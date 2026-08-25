@@ -38,17 +38,15 @@ const (
 // Only the schema knows, so only generated code can answer. It implements this
 // on exactly the destinations that declare a bound, and returns true for exactly
 // the (id, kind) pairs the declaration covers — the same set of fields its
-// HeaderVisitor arms enforce. Answering true is therefore a promise to enforce:
+// ArrayBegin / FixlenBegin arms enforce. Answering true is therefore a promise to enforce:
 // the decoder stops capping that field, and the destination's own ArrayBegin /
-// FixlenHeader arm is what keeps an over-bound header from allocating — as
+// FixlenBegin arm is what keeps an over-bound header from allocating — as
 // INVALID, which is the outcome the spec wants there.
 //
-// SEPARATE from HeaderVisitor and from ElemBoundVisitor, deliberately, and for
-// the reason ElemBoundVisitor spells out: each is reached by a type assertion,
-// so a visitor implementing only part of an interface implements none of it, and
-// adding a method to HeaderVisitor would silently switch its hooks off for every
-// destination generated before this existed. As its own interface it is purely
-// additive — a visitor that does not implement it decodes exactly as before.
+// SEPARATE from Visitor, deliberately: it is reached by a type assertion, so it
+// is purely additive — a visitor that does not implement it decodes exactly as
+// before, and one that does pays for the assertion only where a cap has already
+// fired.
 //
 // Asked at most once per field, and only where the answer can change an outcome:
 // the decoder consults it just after a configured cap is exceeded, never on the
@@ -59,33 +57,27 @@ type SchemaBoundVisitor interface {
 	// id states in this header — `count:` for BoundArrayCount, `maxlen:` for
 	// BoundStringLen/BoundBlobLen. The bound's VALUE stays with the destination;
 	// this only says which rule applies, and the destination enforces it (as
-	// INVALID) through HeaderVisitor.
+	// INVALID) through those callbacks.
 	//
 	// what is the size the WIRE states, so a field arriving under a wire type the
 	// schema does not declare for that id — the MESSAGE_SPEC §7.3 skip — is asked
 	// about a bound the schema never stated and must be answered false: it is
 	// another field's shape, so no schema bound governs it and the receiver cap
-	// still protects the skip. Same rule as HeaderVisitor.ArrayBegin.
+	// still protects the skip. Same rule as Visitor.ArrayBegin.
 	SchemaBound(id ID, what BoundKind) bool
 }
 
-// schemaBound is where one decode surface gets the §6.2.1 answer from. The two
-// visitor surfaces (cursor.accept, Decoder.acceptStream) carry the scope's
-// visitor and ask it; the pull parser has no visitor, so the caller declares the
-// current field itself with Decoder.SchemaBounded and decl carries that. Its zero
-// value — no visitor, nothing declared — is the "unbounded, the cap applies"
-// answer every other caller wants.
+// schemaBound is where a decode gets the §6.2.1 answer from: it carries the
+// scope's visitor and asks it. Its zero value — no visitor — is the "unbounded,
+// the cap applies" answer.
 //
-// It is a plain two-word value with NO cache pointer, unlike hvCache/ebCache/
-// spCache, and that is deliberate: a per-scope cache would have to be addressed,
-// and a pointer to a scope-local struct threaded through the header reads makes
-// that struct escape to the heap — one allocation per scope on the hot decode
-// path, to memoize an answer that is only ever asked on the path where a decode
-// is already being rejected. The type assertion is made there instead, once per
+// It is a plain one-word value carrying no cache, and that is deliberate: the
+// answer is only ever asked on the path where a decode is already being
+// rejected, so memoizing it would cost every decode something to spare the
+// rejected one an assertion. The type assertion is made there instead, once per
 // over-cap header.
 type schemaBound struct {
-	v    Visitor
-	decl bool
+	v Visitor
 }
 
 // bounds reports whether the schema bounds field id's size of kind what. It is
@@ -93,9 +85,6 @@ type schemaBound struct {
 // and checkFixlen), so neither the assertion nor the call is on the path where
 // the header fits or no cap is set.
 func (s schemaBound) bounds(id ID, what BoundKind) bool {
-	if s.decl {
-		return true
-	}
 	sb, ok := s.v.(SchemaBoundVisitor)
 	return ok && sb.SchemaBound(id, what)
 }

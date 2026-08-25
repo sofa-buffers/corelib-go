@@ -102,9 +102,14 @@ func TestReadmeGeneratorExampleRunsAndRoundTrips(t *testing.T) {
 	}
 
 	chunked := &Point{}
-	d := sofab.NewDecoder(bytes.NewReader(wire))
-	if err := d.AcceptStream(chunked); err != nil {
-		t.Fatalf("AcceptStream: %v", err)
+	d := sofab.NewDecoder(chunked)
+	for i := range wire {
+		if _, err := d.Feed(wire[i : i+1]); err != nil {
+			t.Fatalf("Feed: %v", err)
+		}
+	}
+	if d.Status() != sofab.Complete {
+		t.Fatalf("Status = %v, want COMPLETE", d.Status())
 	}
 	if chunked.X != 3 || chunked.Y != 4 {
 		t.Errorf("streamed decode = (%d, %d), want (3, 4)", chunked.X, chunked.Y)

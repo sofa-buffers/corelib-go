@@ -71,7 +71,7 @@ type fp32SlotVisitor struct {
 
 // Structural satisfaction means a stale ArrayBegin signature would silently opt
 // out of the hooks rather than fail to compile. Pin it.
-var _ sofab.HeaderVisitor = fp32SlotVisitor{}
+var _ aggHeader = fp32SlotVisitor{}
 
 func (s fp32SlotVisitor) ArrayBegin(id sofab.ID, kind sofab.ArrayKind, count int) error {
 	if id != 0 {
@@ -112,7 +112,7 @@ type scopeRouter struct {
 	rec   *fp32SlotRec
 }
 
-func (r scopeRouter) BeginSequence(id sofab.ID) (sofab.Visitor, error) {
+func (r scopeRouter) BeginSequence(id sofab.ID) (any, error) {
 	switch {
 	case r.depth == 0 && id == 100:
 		return scopeRouter{depth: 1, rec: r.rec}, nil
@@ -252,14 +252,14 @@ func TestFixlenArrayBoundAfterSubtype(t *testing.T) {
 	for _, c := range cases {
 		c := c
 		t.Run(c.name, func(t *testing.T) {
-			for _, path := range []string{"AcceptBytes", "Accept"} {
+			for _, path := range []string{"AcceptBytes", "Feed"} {
 				rec := &fp32SlotRec{}
 				v := scopeRouter{rec: rec}
 				var err error
 				if path == "AcceptBytes" {
-					err = sofab.AcceptBytes(c.in, v)
+					err = acceptBytes(c.in, v)
 				} else {
-					err = sofab.NewDecoder(bytes.NewReader(c.in)).Accept(v)
+					err = feedIn(c.in, 0, v)
 				}
 				if c.want == nil {
 					if err != nil {
@@ -294,7 +294,7 @@ func TestFixlenArrayRow6RoundTrip(t *testing.T) {
 	in := wire(hdrArr, "\x03\x20", zeros(12))
 
 	rec := &fp32SlotRec{}
-	if err := sofab.AcceptBytes(in, scopeRouter{rec: rec}); err != nil {
+	if err := acceptBytes(in, scopeRouter{rec: rec}); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
 	if !rec.valueSet || len(rec.value) != 3 {
@@ -335,7 +335,7 @@ func TestFixlenArrayHeaderCeilingsStayOnTheCountWord(t *testing.T) {
 	// INVALID rather than INCOMPLETE, and nothing is allocated from the count.
 	over := append([]byte(hdrArrays+hdrNested+hdrArr), vbytes(overArrayMax)...)
 	rec := &fp32SlotRec{}
-	if err := sofab.AcceptBytes(over, scopeRouter{rec: rec}); !errors.Is(err, sofab.ErrInvalidMsg) {
+	if err := acceptBytes(over, scopeRouter{rec: rec}); !errors.Is(err, sofab.ErrInvalidMsg) {
 		t.Errorf("over-arrayMax count: got %v, want ErrInvalidMsg", err)
 	}
 	if len(rec.headers) != 0 {
@@ -346,7 +346,7 @@ func TestFixlenArrayHeaderCeilingsStayOnTheCountWord(t *testing.T) {
 	// reordered: it stays on the count word and stays ErrLimitExceeded.
 	lim := []byte(hdrArrays + hdrNested + hdrArr + "\x08")
 	rec = &fp32SlotRec{}
-	err := sofab.AcceptBytes(lim, scopeRouter{rec: rec}, sofab.WithMaxArrayCount(4))
+	err := acceptBytes(lim, scopeRouter{rec: rec}, sofab.WithMaxArrayCount(4))
 	if !errors.Is(err, sofab.ErrLimitExceeded) {
 		t.Errorf("maxArrayCount: got %v, want ErrLimitExceeded", err)
 	}
@@ -356,21 +356,21 @@ func TestFixlenArrayHeaderCeilingsStayOnTheCountWord(t *testing.T) {
 }
 
 // TestFixlenArrayKindPlainVisitor pins the additive contract for the fixlen
-// path: a visitor that does not implement HeaderVisitor sees no hook at all, so
+// path: a destination that declares no bound sees no header arm at all, so
 // the vectors that a bounded visitor rejects at the header decode on their bytes
 // alone.
 func TestFixlenArrayKindPlainVisitor(t *testing.T) {
 	// Row 3's bytes: no declared bound, so nothing rejects the count.
-	if err := sofab.AcceptBytes(wire(hdrArr, "\x08\x20", zeros(32)), plainVisitor{}); err != nil {
+	if err := acceptBytes(wire(hdrArr, "\x08\x20", zeros(32)), plainVisitor{}); err != nil {
 		t.Errorf("over-count complete: got %v, want accept", err)
 	}
 	// Row 5's bytes: the payload is missing, which is plain truncation here.
 	in := []byte(hdrArrays + hdrNested + hdrArr + "\x08\x20")
-	if err := sofab.AcceptBytes(in, plainVisitor{}); !errors.Is(err, sofab.ErrIncomplete) {
+	if err := acceptBytes(in, plainVisitor{}); !errors.Is(err, sofab.ErrIncomplete) {
 		t.Errorf("over-count no payload: got %v, want ErrIncomplete", err)
 	}
 	// A format-illegal fixlen_word is INVALID with or without the hook.
-	if err := sofab.AcceptBytes(wire(hdrArr, "\x03\x22", zeros(12)), plainVisitor{}); !errors.Is(err, sofab.ErrInvalidMsg) {
+	if err := acceptBytes(wire(hdrArr, "\x03\x22", zeros(12)), plainVisitor{}); !errors.Is(err, sofab.ErrInvalidMsg) {
 		t.Errorf("string subtype: got %v, want ErrInvalidMsg", err)
 	}
 }
@@ -393,7 +393,7 @@ func TestArrayBeginKinds(t *testing.T) {
 		c := c
 		t.Run(c.name, func(t *testing.T) {
 			rec := &fp32SlotRec{}
-			if err := sofab.AcceptBytes(c.in, scopeRouter{rec: rec}); err != nil {
+			if err := acceptBytes(c.in, scopeRouter{rec: rec}); err != nil {
 				t.Fatalf("decode: %v", err)
 			}
 			if got := fmt.Sprint(rec.headers); got != fmt.Sprint([]string{c.want}) {

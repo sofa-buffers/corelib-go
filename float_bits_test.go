@@ -29,7 +29,6 @@ package sofab_test
 import (
 	"bytes"
 	"errors"
-	"io"
 	"math"
 	"testing"
 
@@ -142,7 +141,7 @@ var f32Surfaces = []struct {
 	{"AcceptBytes", func(t *testing.T, raw []byte) (float32, float32) {
 		t.Helper()
 		c := &f32Capture{}
-		if err := sofab.AcceptBytes(raw, c); err != nil {
+		if err := acceptBytes(raw, c); err != nil {
 			t.Fatalf("AcceptBytes: %v", err)
 		}
 		if !c.sawS || !c.sawA {
@@ -150,10 +149,10 @@ var f32Surfaces = []struct {
 		}
 		return c.scalar, c.elem
 	}},
-	{"Accept", func(t *testing.T, raw []byte) (float32, float32) {
+	{"Feed", func(t *testing.T, raw []byte) (float32, float32) {
 		t.Helper()
 		c := &f32Capture{}
-		if err := sofab.NewDecoder(bytes.NewReader(raw)).Accept(c); err != nil {
+		if err := feedIn(raw, 0, c); err != nil {
 			t.Fatalf("Accept: %v", err)
 		}
 		if !c.sawS || !c.sawA {
@@ -161,41 +160,16 @@ var f32Surfaces = []struct {
 		}
 		return c.scalar, c.elem
 	}},
-	{"pull", func(t *testing.T, raw []byte) (float32, float32) {
+	{"Feed/1-byte", func(t *testing.T, raw []byte) (float32, float32) {
 		t.Helper()
-		var scalar, elem float32
-		var sawS, sawA bool
-		d := sofab.NewDecoder(bytes.NewReader(raw))
-		for {
-			f, err := d.Next()
-			if errors.Is(err, io.EOF) {
-				break
-			}
-			if err != nil {
-				t.Fatalf("pull Next: %v", err)
-			}
-			switch f.ID {
-			case 1:
-				v, err := d.Float32()
-				if err != nil {
-					t.Fatalf("pull Float32: %v", err)
-				}
-				scalar, sawS = v, true
-			case 2:
-				a, err := d.ReadFloat32Array()
-				if err != nil {
-					t.Fatalf("pull ReadFloat32Array: %v", err)
-				}
-				if len(a) != 1 {
-					t.Fatalf("pull: array has %d elements, want 1", len(a))
-				}
-				elem, sawA = a[0], true
-			}
+		c := &f32Capture{}
+		if err := feedIn(raw, 1, c); err != nil {
+			t.Fatalf("Feed: %v", err)
 		}
-		if !sawS || !sawA {
-			t.Fatal("pull: scalar or array not delivered")
+		if !c.sawS || !c.sawA {
+			t.Fatal("Feed: scalar or array not delivered")
 		}
-		return scalar, elem
+		return c.scalar, c.elem
 	}},
 }
 
@@ -243,7 +217,7 @@ func TestFloat64BitsSurviveRoundTrip(t *testing.T) {
 			raw := encodeF64Probe(t, in)
 
 			c := &f64Capture{}
-			if err := sofab.AcceptBytes(raw, c); err != nil {
+			if err := acceptBytes(raw, c); err != nil {
 				t.Fatalf("AcceptBytes: %v", err)
 			}
 			if !c.sawS || !c.sawA {
