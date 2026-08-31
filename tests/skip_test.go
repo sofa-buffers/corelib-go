@@ -169,7 +169,7 @@ func (c *cappedSeq) BeginSequence(id sofab.ID) (sofab.Visitor, error) {
 	if id == c.declineID {
 		return nil, nil
 	}
-	return &sofab.StringSeq{Out: &c.out, Cap: -1, ElemMax: -1, RCap: -1, RElemMax: 8}, nil
+	return sofab.NewStringSeq(&c.out, sofab.Bounds{}, capString(8)), nil
 }
 
 // The receiver's caps bound what this consumer is handed. A declined scope hands
@@ -341,10 +341,10 @@ func TestWrapperCollectorSkipsAMistypedElement(t *testing.T) {
 		mk   func(*[]string, *[][]byte) sofab.Visitor
 	}{
 		{"StringSeq", func(s *[]string, _ *[][]byte) sofab.Visitor {
-			return &collectorRoot{child: &sofab.StringSeq{Out: s, Cap: 2, ElemMax: 4}}
+			return &collectorRoot{child: sofab.NewStringSeq(s, sofab.Bounds{Count: 2, ElemLen: 4}, tcaps)}
 		}},
 		{"BlobSeq", func(_ *[]string, b *[][]byte) sofab.Visitor {
-			return &collectorRoot{child: &sofab.BlobSeq{Out: b, Cap: 2, ElemMax: 4}}
+			return &collectorRoot{child: sofab.NewBlobSeq(b, sofab.Bounds{Count: 2, ElemLen: 4}, tcaps)}
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

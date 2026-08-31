@@ -14,31 +14,18 @@ package sofab
 //
 // Three conventions run through the whole file:
 //
-//   - Cap is the schema count bound N, ElemMax the schema maxlen bound, and a
-//     NON-POSITIVE value means the schema declares none — a declared `count:` /
-//     `maxlen:` is at least 1 (MESSAGE_SPEC §7.1/§7.2), so zero and negative
-//     say the same thing and the zero value of a field nobody set is safe. N is
-//     a CAPACITY, not a length (MESSAGE_SPEC §3): it never adds an element the
-//     wire did not carry. All it does here is bound the element id — an id >= N
-//     is a schema-bound violation (INVALID, §7.1) — which is checked BEFORE the
-//     slice grows, so an announced index near 2^31 costs a comparison and not
-//     an allocation.
-//   - Beside every schema bound sits its POLICY sibling, spelled with an R
-//     prefix: RCap beside Cap, RElemMax beside ElemMax, RowCap beside RowCount.
-//     That is the receiver-side technical limit of CORELIB_PLAN §6.2.1 —
-//     max_dyn_array_count / max_dyn_string_len / max_dyn_blob_len — and it is a
-//     PARAMETER, never a number this package chose: generated code knows the
-//     schema and the deployment, and "the codec never invents a limit of its
-//     own". A breach of it is ErrLimitExceeded, a policy category distinct from
-//     INVALID (§6.3), because the same bytes decode under a looser cap.
-//
-//     The two are never both in play: §6.2.1 forbids a cap on a field the
-//     schema already bounds, so the R field is consulted ONLY where its schema
-//     sibling is absent. And there is no unlimited mode (§6.2.1 again): a
-//     non-positive R field falls back to the FORMAT CEILING, ARRAY_MAX, which
-//     is finite. It is not "no bound" — it is the largest bound the wire format
-//     itself admits, and a caller who wants a real one passes it.
-//   - An element is PLACED at Out[id], never appended, after the gap up to it
+//   - Every collector is built by its New* constructor and takes TWO bound
+//     values, Bounds and Caps below: what the SCHEMA declares, and the
+//     §6.2.1 receiver caps the DEPLOYMENT configured. Neither is optional and
+//     neither is a number this package chose. The fields are unexported so the
+//     caps cannot be left off by writing a struct literal — the omission is a
+//     compile error, not a runtime one.
+//   - The two are never both in play on one bound: §6.2.1 forbids a cap on a
+//     field the schema already bounds, so a Caps entry is consulted ONLY where
+//     its Bounds sibling is absent. There is no third case: where the schema
+//     states nothing, the receiver cap governs, and if it too is absent the
+//     call is defective — see overIndex.
+//   - An element is PLACED at out[id], never appended, after the gap up to it
 //     is filled with element defaults. An interior element equal to the element
 //     default is omitted on the wire (§2), so appending would shorten the array
 //     by the size of every such gap, and would decode a REOPENED id as a second
@@ -51,13 +38,40 @@ package sofab
 // never reaches a collector at all, which is the point — validation follows the
 // destination, not the wire.
 
-// ceilingBound is the fallback a receiver cap falls back to when the caller
-// passed none: ARRAY_MAX, the format ceiling on an array's element count and on
-// a fixlen payload's byte length (§6.2). §6.2.1 admits "no unset state and no
-// unlimited mode", so the absent case has to resolve to a NUMBER — and the only
-// number this package may use is one the format already fixes, never one it
-// invented for the occasion.
-const ceilingBound = int(arrayMax)
+// Bounds is what the SCHEMA declares about an array: the `count:` capacity and
+// the `maxlen:` element bound of MESSAGE_SPEC §7.1/§7.2. A NON-POSITIVE field
+// means the schema declares none — a declared bound is at least 1, so zero and
+// negative say the same thing.
+//
+// Count is a CAPACITY, not a length (MESSAGE_SPEC §3): it never adds an element
+// the wire did not carry. All it does here is bound the element id — an id >=
+// Count is a schema-bound violation (INVALID, §7.1) — which is checked BEFORE
+// the slice grows, so an announced index near 2^31 costs a comparison and not
+// an allocation.
+type Bounds struct {
+	Count   int // `count:` — the array's element capacity N
+	ElemLen int // `maxlen:` — an element's byte length, where elements are strings or blobs
+}
+
+// Caps is the receiver-side technical limits of CORELIB_PLAN §6.2.1, under that
+// section's own three names, as generated code configured them for this
+// deployment.
+//
+// These are the CALLER'S numbers, used for one comparison and not retained
+// (§6.2.1, "Passing a limit in is not the codec holding one"). This package
+// holds none, defaults none, and clamps to none. A breach is ErrLimitExceeded —
+// a policy category distinct from INVALID (§6.3), because the same bytes decode
+// under a looser cap.
+//
+// Every entry a collector will actually consult MUST be positive. §6.2.1 admits
+// neither an unset state nor an unlimited mode, so there is nothing sensible for
+// a missing one to mean: see overIndex for what a collector does with it, and
+// why it is not the format ceiling.
+type Caps struct {
+	ArrayCount int // max_dyn_array_count — elements in a schema-unbounded array
+	StringLen  int // max_dyn_string_len — bytes in a schema-unbounded string
+	BlobLen    int // max_dyn_blob_len — bytes in a schema-unbounded blob
+}
 
 // overIndex is THE implementation of the element-index rule, in one place.
 //
@@ -70,8 +84,21 @@ const ceilingBound = int(arrayMax)
 //   - cap > 0 — the schema declared a `count:`. An index at or past it
 //     contradicts the schema both peers agreed on: ErrInvalidMsg (§7.1).
 //   - cap <= 0 — the schema declared none, so the receiver cap governs instead
-//     and a breach is ErrLimitExceeded (§6.2.1, §6.3). rcap <= 0 falls back to
-//     the format ceiling.
+//     and a breach is ErrLimitExceeded (§6.2.1, §6.3).
+//
+// There is NO fallback for a missing rcap, and in particular not the format
+// ceiling ARRAY_MAX. §6.2.1: "A format ceiling (§6.2) reached because no cap was
+// stated is the FORMAT's bound, not a receiver cap, and a port MUST NOT present
+// it as one." Reporting ErrLimitExceeded against a ceiling nobody configured
+// would promise the caller a limit to raise that was never set, which §6.3 gives
+// as the reason that code is wrong for a call defect.
+//
+// So a missing cap is a CALLER DEFECT and answers ErrArgument — §6.3's
+// InvalidArgument, "the only code for a caller mistake". It is not a policy
+// rejection: nothing about the message is at fault, and no number exists to
+// compare it against. Stating the cap stays generated code's duty (§6.2.1), and
+// the constructors below make omitting it a compile error so this guard is
+// reached only by a value built past them.
 //
 // §6.2.1 requires this to have ONE implementation however the bound was stated:
 // "this is exactly where two routes have been observed to drift apart". Every
@@ -85,7 +112,7 @@ func overIndex(id ID, cap, rcap int) error {
 		return nil
 	}
 	if rcap <= 0 {
-		rcap = ceilingBound
+		return ErrArgument
 	}
 	if int(id) >= rcap {
 		return ErrLimitExceeded
@@ -95,8 +122,8 @@ func overIndex(id ID, cap, rcap int) error {
 
 // overLen is overIndex for a COUNT or a LENGTH the wire announces — an element's
 // byte length, a matrix row's element count. Same rule, same exclusivity, same
-// fallback; only the comparison differs, an announced n being a size rather than
-// an index.
+// ErrArgument on a cap that was never stated; only the comparison differs, an
+// announced n being a size rather than an index.
 func overLen(n, max, rmax int) error {
 	if max > 0 {
 		if n > max {
@@ -105,7 +132,7 @@ func overLen(n, max, rmax int) error {
 		return nil
 	}
 	if rmax <= 0 {
-		rmax = ceilingBound
+		return ErrArgument
 	}
 	if n > rmax {
 		return ErrLimitExceeded
@@ -142,13 +169,11 @@ func (VisitorBase) EndSequence() error                       { return nil }
 
 // StringSeq collects the elements of a string array into Out.
 //
-// Cap is the array's schema count bound and ElemMax the element maxlen bound
-// (non-positive: none); a breach of either is INVALID, never a truncation, and
-// both are latched at the length word — see FixlenBegin. RCap and RElemMax are
-// their §6.2.1 receiver-cap siblings — max_dyn_array_count and
-// max_dyn_string_len as generated code configured them — consulted only where
-// the schema states no bound, answering ErrLimitExceeded; non-positive falls
-// back to the format ceiling.
+// b.Count is the array's schema count bound and b.ElemLen the element maxlen
+// bound (non-positive: none); a breach of either is INVALID, never a truncation,
+// and both are latched at the length word — see FixlenBegin. c.ArrayCount and
+// c.StringLen are their §6.2.1 receiver-cap siblings, consulted only where the
+// schema states no bound and answering ErrLimitExceeded.
 //
 // It embeds StringCheck, so the decode's SOFAB_STRICT_UTF8 policy (§6.4) is
 // delivered to it before the scope's first element and WithStrictUTF8(false)
@@ -163,12 +188,20 @@ func (VisitorBase) EndSequence() error                       { return nil }
 type StringSeq struct {
 	VisitorBase
 	StringCheck
-	Out      *[]string
-	Cap      int
-	ElemMax  int
-	RCap     int
-	RElemMax int
-	acc      PayloadAcc
+	out *[]string
+	b   Bounds
+	c   Caps
+	acc PayloadAcc
+}
+
+// NewStringSeq builds a string-array collector writing into out.
+//
+// b and c are both required arguments rather than settable fields, which is what
+// makes a missing receiver cap (§6.2.1) a compile error at the call site instead
+// of a decode that runs uncapped: a struct literal's zero value is exactly the
+// omission this API must not accept.
+func NewStringSeq(out *[]string, b Bounds, c Caps) *StringSeq {
+	return &StringSeq{out: out, b: b, c: c}
 }
 
 // FixlenBegin applies both schema bounds at the element's LENGTH WORD, before a
@@ -185,10 +218,10 @@ func (s *StringSeq) FixlenBegin(id ID, subtype FixlenSubtype, total int) error {
 	if subtype != FixlenStr {
 		return nil
 	}
-	if err := overIndex(id, s.Cap, s.RCap); err != nil {
+	if err := overIndex(id, s.b.Count, s.c.ArrayCount); err != nil {
 		return err
 	}
-	return overLen(total, s.ElemMax, s.RElemMax)
+	return overLen(total, s.b.ElemLen, s.c.StringLen)
 }
 
 // String accumulates one element's pieces and, once the last of them lands,
@@ -197,10 +230,10 @@ func (s *StringSeq) FixlenBegin(id ID, subtype FixlenSubtype, total int) error {
 // collector driven by hand, without the header call, must still refuse an
 // out-of-range id or an over-long element.
 func (s *StringSeq) String(id ID, total, offset int, chunk []byte) error {
-	if err := overIndex(id, s.Cap, s.RCap); err != nil {
+	if err := overIndex(id, s.b.Count, s.c.ArrayCount); err != nil {
 		return err
 	}
-	if err := overLen(total, s.ElemMax, s.RElemMax); err != nil {
+	if err := overLen(total, s.b.ElemLen, s.c.StringLen); err != nil {
 		return err
 	}
 	b, done := s.acc.Take(total, offset, chunk)
@@ -210,10 +243,10 @@ func (s *StringSeq) String(id ID, total, offset int, chunk []byte) error {
 	if !s.UTF8Valid(b) {
 		return ErrInvalidMsg
 	}
-	for len(*s.Out) <= int(id) {
-		*s.Out = append(*s.Out, "")
+	for len(*s.out) <= int(id) {
+		*s.out = append(*s.out, "")
 	}
-	(*s.Out)[id] = string(b)
+	(*s.out)[id] = string(b)
 	return nil
 }
 
@@ -224,12 +257,16 @@ func (s *StringSeq) String(id ID, total, offset int, chunk []byte) error {
 // past the call (§6.7).
 type BlobSeq struct {
 	VisitorBase
-	Out      *[][]byte
-	Cap      int
-	ElemMax  int
-	RCap     int
-	RElemMax int
-	acc      PayloadAcc
+	out *[][]byte
+	b   Bounds
+	c   Caps
+	acc PayloadAcc
+}
+
+// NewBlobSeq builds a blob-array collector writing into out. See NewStringSeq
+// for why b and c are arguments rather than fields.
+func NewBlobSeq(out *[][]byte, b Bounds, c Caps) *BlobSeq {
+	return &BlobSeq{out: out, b: b, c: c}
 }
 
 // FixlenBegin latches both bounds at the length word, gated on the declared
@@ -238,30 +275,30 @@ func (s *BlobSeq) FixlenBegin(id ID, subtype FixlenSubtype, total int) error {
 	if subtype != FixlenBlob {
 		return nil
 	}
-	if err := overIndex(id, s.Cap, s.RCap); err != nil {
+	if err := overIndex(id, s.b.Count, s.c.ArrayCount); err != nil {
 		return err
 	}
-	return overLen(total, s.ElemMax, s.RElemMax)
+	return overLen(total, s.b.ElemLen, s.c.BlobLen)
 }
 
 // Bytes accumulates one element's pieces and places a copy of the finished
 // element at the index its id names, growing Out with nil elements across any
 // gap.
 func (s *BlobSeq) Bytes(id ID, total, offset int, chunk []byte) error {
-	if err := overIndex(id, s.Cap, s.RCap); err != nil {
+	if err := overIndex(id, s.b.Count, s.c.ArrayCount); err != nil {
 		return err
 	}
-	if err := overLen(total, s.ElemMax, s.RElemMax); err != nil {
+	if err := overLen(total, s.b.ElemLen, s.c.BlobLen); err != nil {
 		return err
 	}
 	b, done := s.acc.Take(total, offset, chunk)
 	if !done {
 		return nil
 	}
-	for len(*s.Out) <= int(id) {
-		*s.Out = append(*s.Out, nil)
+	for len(*s.out) <= int(id) {
+		*s.out = append(*s.out, nil)
 	}
-	(*s.Out)[id] = append([]byte(nil), b...)
+	(*s.out)[id] = append([]byte(nil), b...)
 	return nil
 }
 
@@ -271,11 +308,11 @@ func (s *BlobSeq) Bytes(id ID, total, offset int, chunk []byte) error {
 //
 // T is the element type and PT its pointer, constrained to be a Visitor — which
 // is how a corelib that knows no schema reaches a generated type: through a
-// type parameter, never by naming it. Cap is the array's schema count bound
-// (non-positive: none) and RCap its §6.2.1 receiver-cap sibling, consulted only
-// where the schema states none.
+// type parameter, never by naming it. b.Count is the array's schema count bound
+// (non-positive: none) and c.ArrayCount its §6.2.1 receiver-cap sibling,
+// consulted only where the schema states none.
 //
-// The element is decoded IN PLACE at Out[id], after the gap up to it is filled
+// The element is decoded IN PLACE at out[id], after the gap up to it is filled
 // with zero elements. That is also what makes a reopened id (§7.4) continue the
 // element already there instead of starting a second one.
 type MessageSeq[T any, PT interface {
@@ -283,48 +320,68 @@ type MessageSeq[T any, PT interface {
 	Visitor
 }] struct {
 	VisitorBase
-	Out  *[]T
-	Cap  int
-	RCap int
+	out *[]T
+	b   Bounds
+	c   Caps
+}
+
+// NewMessageSeq builds a struct/union-array collector writing into out. See
+// NewStringSeq for why b and c are arguments rather than fields.
+//
+// Both type parameters are written out at the call site — PT cannot be inferred
+// from out alone — exactly as they were on the struct literal this replaces.
+func NewMessageSeq[T any, PT interface {
+	*T
+	Visitor
+}](out *[]T, b Bounds, c Caps) *MessageSeq[T, PT] {
+	return &MessageSeq[T, PT]{out: out, b: b, c: c}
 }
 
 // BeginSequence hands back the element at id as the visitor for its scope.
 func (s *MessageSeq[T, PT]) BeginSequence(id ID) (Visitor, error) {
-	if err := overIndex(id, s.Cap, s.RCap); err != nil {
+	if err := overIndex(id, s.b.Count, s.c.ArrayCount); err != nil {
 		return nil, err
 	}
 	var zero T
-	for len(*s.Out) <= int(id) {
-		*s.Out = append(*s.Out, zero)
+	for len(*s.out) <= int(id) {
+		*s.out = append(*s.out, zero)
 	}
-	return PT(&(*s.Out)[id]), nil
+	return PT(&(*s.out)[id]), nil
 }
 
 // NestedSeq collects an array whose elements are themselves wrapper-sequence
 // arrays ([][]T): each element opens a sequence collected into the inner slice
 // its element id names, by Make.
 //
-// Make builds the inner collector for one row — typically another collector
-// from this file, carrying the INNER array's own bounds. It is called once per
-// row that arrives, after that row's slot exists, and is handed the address of
-// the slot.
+// make builds the inner collector for one row — typically another collector
+// from this file, carrying the INNER array's own bounds AND its own receiver
+// caps. It is called once per row that arrives, after that row's slot exists,
+// and is handed the address of the slot.
 type NestedSeq[T any] struct {
 	VisitorBase
-	Out  *[][]T
-	Cap  int
-	RCap int
-	Make func(*[]T) Visitor
+	out  *[][]T
+	b    Bounds
+	c    Caps
+	make func(*[]T) Visitor
+}
+
+// NewNestedSeq builds a collector for an array of wrapper-sequence arrays,
+// writing into out; b and c bound the OUTER array and make builds each row's
+// inner collector, which carries the inner bounds and caps of its own. See
+// NewStringSeq for why b and c are arguments rather than fields.
+func NewNestedSeq[T any](out *[][]T, b Bounds, c Caps, make func(*[]T) Visitor) *NestedSeq[T] {
+	return &NestedSeq[T]{out: out, b: b, c: c, make: make}
 }
 
 // BeginSequence reserves the row at id and returns the collector for it.
 func (s *NestedSeq[T]) BeginSequence(id ID) (Visitor, error) {
-	if err := overIndex(id, s.Cap, s.RCap); err != nil {
+	if err := overIndex(id, s.b.Count, s.c.ArrayCount); err != nil {
 		return nil, err
 	}
-	for len(*s.Out) <= int(id) {
-		*s.Out = append(*s.Out, nil)
+	for len(*s.out) <= int(id) {
+		*s.out = append(*s.out, nil)
 	}
-	return s.Make(&(*s.Out)[id]), nil
+	return s.make(&(*s.out)[id]), nil
 }
 
 // arrivedRow is the row a matrix collector hands to PlaceRow: never nil, even
@@ -352,18 +409,18 @@ func arrivedRow[T any](row []T) []T {
 // row is guaranteed present — which is what makes the decoded length, highest
 // present id + 1, exact.
 //
-// capacity is the OUTER array's schema count bound N (non-positive: none) and
-// rcapacity its §6.2.1 receiver-cap sibling; together they bound the row id
-// exactly as Cap/RCap bound an element id above, and the bound is applied before
-// the grow, so the id-keyed fill cannot be turned into an amplification. Both
-// are taken as parameters rather than read off a collector because a matrix
+// b.Count is the OUTER array's schema count bound N (non-positive: none) and
+// c.ArrayCount its §6.2.1 receiver-cap sibling; together they bound the row id
+// exactly as they bound an element id above, and the bound is applied before the
+// grow, so the id-keyed fill cannot be turned into an amplification. Both are
+// taken as parameters rather than read off a collector because a matrix
 // collector applies them twice — at ArrayBegin and again here — and §6.2.1
 // requires the two to be one implementation.
 //
 // The row is stored as given, not copied — unlike a blob element, a decoded
 // native array is freshly built by the decoder and has no other owner.
-func PlaceRow[T any](out *[][]T, capacity, rcapacity int, id ID, row []T) error {
-	if err := overIndex(id, capacity, rcapacity); err != nil {
+func PlaceRow[T any](out *[][]T, b Bounds, c Caps, id ID, row []T) error {
+	if err := overIndex(id, b.Count, c.ArrayCount); err != nil {
 		return err
 	}
 	for len(*out) <= int(id) {
@@ -390,9 +447,9 @@ func PlaceRow[T any](out *[][]T, capacity, rcapacity int, id ID, row []T) error 
 //
 // Each carries FOUR bounds, two per axis, because a matrix has two:
 //
-//   - Cap / RCap bound the ROW ID — the outer array's `count:` and its receiver
-//     cap — exactly as on the collectors above.
-//   - RowCount / RowCap bound the row's OWN element count, which the row
+//   - b.Count / c.ArrayCount bound the ROW ID — the outer array's `count:` and
+//     its receiver cap — exactly as on the collectors above.
+//   - row.Count / c.ArrayCount bound the row's OWN element count, which the row
 //     announces as a real count header because a row IS a native array. That
 //     header is the enforcement point §6.2.1 names ("at the count/length header —
 //     before the allocation it is meant to prevent"), and ArrayBegin is where the
@@ -404,22 +461,30 @@ func PlaceRow[T any](out *[][]T, capacity, rcapacity int, id ID, row []T) error 
 // Elements arrive widened to the 64-bit value domain (one callback for every
 // declared width), so each is checked against Hi and then narrowed to T.
 //
-// Hi is the largest value T's DECLARED width allows. The narrowing conversion
-// only masks, so an element above Hi has to be rejected as it goes past or it
+// hi is the largest value T's DECLARED width allows. The narrowing conversion
+// only masks, so an element above hi has to be rejected as it goes past or it
 // would be stored as a different value than the wire carried (§7.1) — and
 // rejecting it AT THE ELEMENT is what keeps it INVALID rather than INCOMPLETE
-// when the row is then truncated (§5.2). Hi == 0 means the declared width spans
+// when the row is then truncated (§5.2). hi == 0 means the declared width spans
 // the whole range this callback can deliver — u64, or a bitfield — and switches
 // the check off rather than running one that can never fire.
 type UnsignedMatrixSeq[T Unsigned] struct {
 	VisitorBase
-	Out      *[][]T
-	Cap      int
-	RCap     int
-	RowCount int
-	RowCap   int
-	Hi       uint64
-	row      []T
+	out *[][]T
+	b   Bounds
+	row Bounds
+	c   Caps
+	hi  uint64
+	cur []T
+}
+
+// NewUnsignedMatrixSeq builds an unsigned-matrix collector writing into out: b
+// bounds the outer array (the row id), row bounds a row's own element count, c
+// carries the §6.2.1 receiver caps for both axes, and hi is the largest value
+// the element's declared width allows (0: no narrowing). See NewStringSeq for
+// why the bounds are arguments rather than fields.
+func NewUnsignedMatrixSeq[T Unsigned](out *[][]T, b, row Bounds, c Caps, hi uint64) *UnsignedMatrixSeq[T] {
+	return &UnsignedMatrixSeq[T]{out: out, b: b, row: row, c: c, hi: hi}
 }
 
 // ArrayBegin bounds the row id and the row's announced element count, then
@@ -428,48 +493,54 @@ func (s *UnsignedMatrixSeq[T]) ArrayBegin(id ID, kind ArrayKind, count int) erro
 	if kind != ArrayUnsigned {
 		return nil
 	}
-	if err := overIndex(id, s.Cap, s.RCap); err != nil {
+	if err := overIndex(id, s.b.Count, s.c.ArrayCount); err != nil {
 		return err
 	}
-	if err := overLen(count, s.RowCount, s.RowCap); err != nil {
+	if err := overLen(count, s.row.Count, s.c.ArrayCount); err != nil {
 		return err
 	}
-	s.row = nil
+	s.cur = nil
 	return nil
 }
 
 // ArrayUnsigned checks one element against the declared width and appends it.
 func (s *UnsignedMatrixSeq[T]) ArrayUnsigned(_ ID, _ int, v uint64) error {
-	if s.Hi != 0 && v > s.Hi {
+	if s.hi != 0 && v > s.hi {
 		return ErrInvalidMsg
 	}
-	s.row = append(s.row, T(v))
+	s.cur = append(s.cur, T(v))
 	return nil
 }
 
 // ArrayEnd places the finished row at its element id.
 func (s *UnsignedMatrixSeq[T]) ArrayEnd(id ID) error {
-	row := s.row
-	s.row = nil
-	return PlaceRow(s.Out, s.Cap, s.RCap, id, arrivedRow(row))
+	row := s.cur
+	s.cur = nil
+	return PlaceRow(s.out, s.b, s.c, id, arrivedRow(row))
 }
 
 // SignedMatrixSeq is UnsignedMatrixSeq for signed element widths: elements
 // arrive as int64 and are checked against [Lo, Hi] before being narrowed to T.
 //
-// Lo == 0 switches the check off, for the same reason Hi == 0 does above: every
-// signed width that narrows anything has a negative Lo, so a zero Lo means i64
+// lo == 0 switches the check off, for the same reason hi == 0 does above: every
+// signed width that narrows anything has a negative lo, so a zero lo means i64
 // (or an enum), whose range is the callback parameter's own.
 type SignedMatrixSeq[T Signed] struct {
 	VisitorBase
-	Out      *[][]T
-	Cap      int
-	RCap     int
-	RowCount int
-	RowCap   int
-	Lo       int64
-	Hi       int64
-	row      []T
+	out *[][]T
+	b   Bounds
+	row Bounds
+	c   Caps
+	lo  int64
+	hi  int64
+	cur []T
+}
+
+// NewSignedMatrixSeq builds a signed-matrix collector writing into out; lo and
+// hi are the declared width's range (lo == 0: no narrowing). See
+// NewUnsignedMatrixSeq for the bound arguments.
+func NewSignedMatrixSeq[T Signed](out *[][]T, b, row Bounds, c Caps, lo, hi int64) *SignedMatrixSeq[T] {
+	return &SignedMatrixSeq[T]{out: out, b: b, row: row, c: c, lo: lo, hi: hi}
 }
 
 // ArrayBegin bounds the row id and the row's announced element count, then
@@ -478,42 +549,47 @@ func (s *SignedMatrixSeq[T]) ArrayBegin(id ID, kind ArrayKind, count int) error 
 	if kind != ArraySigned {
 		return nil
 	}
-	if err := overIndex(id, s.Cap, s.RCap); err != nil {
+	if err := overIndex(id, s.b.Count, s.c.ArrayCount); err != nil {
 		return err
 	}
-	if err := overLen(count, s.RowCount, s.RowCap); err != nil {
+	if err := overLen(count, s.row.Count, s.c.ArrayCount); err != nil {
 		return err
 	}
-	s.row = nil
+	s.cur = nil
 	return nil
 }
 
 // ArraySigned checks one element against the declared width and appends it.
 func (s *SignedMatrixSeq[T]) ArraySigned(_ ID, _ int, v int64) error {
-	if s.Lo != 0 && (v < s.Lo || v > s.Hi) {
+	if s.lo != 0 && (v < s.lo || v > s.hi) {
 		return ErrInvalidMsg
 	}
-	s.row = append(s.row, T(v))
+	s.cur = append(s.cur, T(v))
 	return nil
 }
 
 // ArrayEnd places the finished row at its element id.
 func (s *SignedMatrixSeq[T]) ArrayEnd(id ID) error {
-	row := s.row
-	s.row = nil
-	return PlaceRow(s.Out, s.Cap, s.RCap, id, arrivedRow(row))
+	row := s.cur
+	s.cur = nil
+	return PlaceRow(s.out, s.b, s.c, id, arrivedRow(row))
 }
 
 // Float32MatrixSeq collects the rows of an fp32 matrix. No width check: the
 // callback already delivers the declared element type.
 type Float32MatrixSeq struct {
 	VisitorBase
-	Out      *[][]float32
-	Cap      int
-	RCap     int
-	RowCount int
-	RowCap   int
-	row      []float32
+	out *[][]float32
+	b   Bounds
+	row Bounds
+	c   Caps
+	cur []float32
+}
+
+// NewFloat32MatrixSeq builds an fp32-matrix collector writing into out. See
+// NewUnsignedMatrixSeq for the bound arguments.
+func NewFloat32MatrixSeq(out *[][]float32, b, row Bounds, c Caps) *Float32MatrixSeq {
+	return &Float32MatrixSeq{out: out, b: b, row: row, c: c}
 }
 
 // ArrayBegin bounds the row id and the row's announced element count, then
@@ -522,38 +598,43 @@ func (s *Float32MatrixSeq) ArrayBegin(id ID, kind ArrayKind, count int) error {
 	if kind != ArrayFp32 {
 		return nil
 	}
-	if err := overIndex(id, s.Cap, s.RCap); err != nil {
+	if err := overIndex(id, s.b.Count, s.c.ArrayCount); err != nil {
 		return err
 	}
-	if err := overLen(count, s.RowCount, s.RowCap); err != nil {
+	if err := overLen(count, s.row.Count, s.c.ArrayCount); err != nil {
 		return err
 	}
-	s.row = nil
+	s.cur = nil
 	return nil
 }
 
 // ArrayFloat32 appends one element to the row being built.
 func (s *Float32MatrixSeq) ArrayFloat32(_ ID, _ int, v float32) error {
-	s.row = append(s.row, v)
+	s.cur = append(s.cur, v)
 	return nil
 }
 
 // ArrayEnd places the finished row at its element id.
 func (s *Float32MatrixSeq) ArrayEnd(id ID) error {
-	row := s.row
-	s.row = nil
-	return PlaceRow(s.Out, s.Cap, s.RCap, id, arrivedRow(row))
+	row := s.cur
+	s.cur = nil
+	return PlaceRow(s.out, s.b, s.c, id, arrivedRow(row))
 }
 
 // Float64MatrixSeq is Float32MatrixSeq for fp64 rows.
 type Float64MatrixSeq struct {
 	VisitorBase
-	Out      *[][]float64
-	Cap      int
-	RCap     int
-	RowCount int
-	RowCap   int
-	row      []float64
+	out *[][]float64
+	b   Bounds
+	row Bounds
+	c   Caps
+	cur []float64
+}
+
+// NewFloat64MatrixSeq builds an fp64-matrix collector writing into out. See
+// NewUnsignedMatrixSeq for the bound arguments.
+func NewFloat64MatrixSeq(out *[][]float64, b, row Bounds, c Caps) *Float64MatrixSeq {
+	return &Float64MatrixSeq{out: out, b: b, row: row, c: c}
 }
 
 // ArrayBegin bounds the row id and the row's announced element count, then
@@ -562,27 +643,27 @@ func (s *Float64MatrixSeq) ArrayBegin(id ID, kind ArrayKind, count int) error {
 	if kind != ArrayFp64 {
 		return nil
 	}
-	if err := overIndex(id, s.Cap, s.RCap); err != nil {
+	if err := overIndex(id, s.b.Count, s.c.ArrayCount); err != nil {
 		return err
 	}
-	if err := overLen(count, s.RowCount, s.RowCap); err != nil {
+	if err := overLen(count, s.row.Count, s.c.ArrayCount); err != nil {
 		return err
 	}
-	s.row = nil
+	s.cur = nil
 	return nil
 }
 
 // ArrayFloat64 appends one element to the row being built.
 func (s *Float64MatrixSeq) ArrayFloat64(_ ID, _ int, v float64) error {
-	s.row = append(s.row, v)
+	s.cur = append(s.cur, v)
 	return nil
 }
 
 // ArrayEnd places the finished row at its element id.
 func (s *Float64MatrixSeq) ArrayEnd(id ID) error {
-	row := s.row
-	s.row = nil
-	return PlaceRow(s.Out, s.Cap, s.RCap, id, arrivedRow(row))
+	row := s.cur
+	s.cur = nil
+	return PlaceRow(s.out, s.b, s.c, id, arrivedRow(row))
 }
 
 // BoolMatrixSeq collects the rows of a bool matrix. Bools travel as an unsigned
@@ -591,12 +672,17 @@ func (s *Float64MatrixSeq) ArrayEnd(id ID) error {
 // a bool.
 type BoolMatrixSeq struct {
 	VisitorBase
-	Out      *[][]bool
-	Cap      int
-	RCap     int
-	RowCount int
-	RowCap   int
-	row      []bool
+	out *[][]bool
+	b   Bounds
+	row Bounds
+	c   Caps
+	cur []bool
+}
+
+// NewBoolMatrixSeq builds a bool-matrix collector writing into out. See
+// NewUnsignedMatrixSeq for the bound arguments.
+func NewBoolMatrixSeq(out *[][]bool, b, row Bounds, c Caps) *BoolMatrixSeq {
+	return &BoolMatrixSeq{out: out, b: b, row: row, c: c}
 }
 
 // ArrayBegin bounds the row id and the row's announced element count, then
@@ -605,25 +691,25 @@ func (s *BoolMatrixSeq) ArrayBegin(id ID, kind ArrayKind, count int) error {
 	if kind != ArrayUnsigned {
 		return nil
 	}
-	if err := overIndex(id, s.Cap, s.RCap); err != nil {
+	if err := overIndex(id, s.b.Count, s.c.ArrayCount); err != nil {
 		return err
 	}
-	if err := overLen(count, s.RowCount, s.RowCap); err != nil {
+	if err := overLen(count, s.row.Count, s.c.ArrayCount); err != nil {
 		return err
 	}
-	s.row = nil
+	s.cur = nil
 	return nil
 }
 
 // ArrayUnsigned appends one element to the row being built.
 func (s *BoolMatrixSeq) ArrayUnsigned(_ ID, _ int, v uint64) error {
-	s.row = append(s.row, v != 0)
+	s.cur = append(s.cur, v != 0)
 	return nil
 }
 
 // ArrayEnd places the finished row at its element id.
 func (s *BoolMatrixSeq) ArrayEnd(id ID) error {
-	row := s.row
-	s.row = nil
-	return PlaceRow(s.Out, s.Cap, s.RCap, id, arrivedRow(row))
+	row := s.cur
+	s.cur = nil
+	return PlaceRow(s.out, s.b, s.c, id, arrivedRow(row))
 }

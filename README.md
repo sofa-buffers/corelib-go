@@ -284,20 +284,37 @@ func (m *Msg) ArrayBegin(id sofab.ID, kind sofab.ArrayKind, count int) error {
 }
 ```
 
-For a wrapper array the collector owns the whole thing, so the numbers are
-fields on it: `Cap`/`ElemMax` are the schema bounds and `RCap`/`RElemMax` the
-receiver caps beside them, with the matrix collectors adding `RowCount`/`RowCap`
-for a row's own element count. A schema field is non-positive when the schema
-declares none; the R field beside it is then consulted, and a non-positive R
-field falls back to `ARRAY_MAX` — the format ceiling, never "unlimited".
+For a wrapper array the collector owns the whole thing, so both sets of numbers
+are **constructor arguments**: a `Bounds` for what the schema declares
+(`Count` from `count:`, `ElemLen` from `maxlen:`; non-positive means the schema
+declares none) and a `Caps` for the three §6.2.1 receiver caps under their own
+names. The matrix collectors take a second `Bounds` for a row's own element
+count.
 
 ```go
-&sofab.StringSeq{
-    Out: &m.Tags,
-    Cap: -1, ElemMax: -1, // schema declares neither
-    RCap: maxDynArrayCount, RElemMax: maxDynStringLen,
+caps := sofab.Caps{
+    ArrayCount: maxDynArrayCount,
+    StringLen:  maxDynStringLen,
+    BlobLen:    maxDynBlobLen,
 }
+
+sofab.NewStringSeq(&m.Tags, sofab.Bounds{}, caps)               // schema declares neither
+sofab.NewStringSeq(&m.Names, sofab.Bounds{Count: 4, ElemLen: 8}, caps) // both declared: caps inert
 ```
+
+They are arguments and not settable fields on purpose. A struct literal lets
+Go's zero value slip a missing cap through in silence, and §6.2.1 admits *"no
+unset state and no unlimited mode"* — so leaving one out has to fail, and it
+fails at compile time.
+
+There is deliberately **no fallback** for a cap that is nonetheless missing —
+in particular not `ARRAY_MAX`. §6.2.1: *"a format ceiling reached because no cap
+was stated is the format's bound, not a receiver cap, and a port MUST NOT
+present it as one."* A schema-unbounded field reached with a non-positive cap is
+a defect in the **call**, and answers `ErrArgument` (§6.3's `InvalidArgument`) —
+not `ErrLimitExceeded`, which would promise a limit to raise that was never
+configured. A caller that genuinely wants the ceiling as its policy passes it;
+then the number is the caller's, which is the whole point.
 
 A field the destination never binds — an unknown id, or a wire type that
 contradicts the schema — is capped by nothing, which is the point: it is walked,

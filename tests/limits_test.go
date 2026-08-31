@@ -149,7 +149,7 @@ func TestLimitExceededStaysADistinctCategory(t *testing.T) {
 			_ = e.WriteString(sofab.ID(i), "x")
 		}
 	})
-	err := collect(raw, &sofab.StringSeq{Out: &out, Cap: -1, ElemMax: -1, RCap: 2, RElemMax: -1})
+	err := collect(raw, sofab.NewStringSeq(&out, sofab.Bounds{}, capArray(2)))
 	if !errors.Is(err, sofab.ErrLimitExceeded) {
 		t.Fatalf("= %v, want ErrLimitExceeded", err)
 	}
