@@ -327,9 +327,19 @@ func TestFixlenArrayRow6RoundTrip(t *testing.T) {
 }
 
 // TestFixlenArrayHeaderCeilingsStayOnTheCountWord pins what did NOT move with
-// the hook. Both the format ceiling and the receiver policy limit are judged on
-// the count word, before the fixlen_word is read — so they fire on a message
-// that carries no fixlen_word at all, and they keep their distinct outcomes.
+// the hook: the FORMAT ceiling is judged on the count word, before the
+// fixlen_word is read, so it fires on a message that carries no fixlen_word at
+// all.
+//
+// Its receiver-cap half is gone, and that is the point. A receiver cap is the
+// destination's (§6.2.1), the destination is told about a fixlen array at
+// ArrayBegin, and §4.8.1 defers ArrayBegin until the fixlen_word says what the
+// elements are — so a cap cannot be judged one word earlier without the codec
+// holding it, which is what this change removes. The behavioural consequence is
+// recorded here rather than left to be rediscovered: an over-cap fixlen-array
+// count in a message truncated between the two words is now INCOMPLETE where it
+// was a policy rejection. That is the same shape the schema `count:` bound has
+// always had, so the two categories now agree instead of splitting.
 func TestFixlenArrayHeaderCeilingsStayOnTheCountWord(t *testing.T) {
 	// Count past arrayMax (INT32_MAX), nothing after it: a FORMAT violation, so
 	// INVALID rather than INCOMPLETE, and nothing is allocated from the count.
@@ -342,16 +352,20 @@ func TestFixlenArrayHeaderCeilingsStayOnTheCountWord(t *testing.T) {
 		t.Errorf("over-arrayMax count fired ArrayBegin %v, want no call", rec.headers)
 	}
 
-	// The receiver policy limit is not a schema bound and is deliberately NOT
-	// reordered: it stays on the count word and stays ErrLimitExceeded.
+	// A count within the format ceiling but with the fixlen_word missing: no
+	// verdict is available yet, so it is INCOMPLETE, and no policy category may
+	// appear — the codec holds no cap to reach for.
 	lim := []byte(hdrArrays + hdrNested + hdrArr + "\x08")
 	rec = &fp32SlotRec{}
-	err := acceptBytes(lim, scopeRouter{rec: rec}, sofab.WithMaxArrayCount(4))
-	if !errors.Is(err, sofab.ErrLimitExceeded) {
-		t.Errorf("maxArrayCount: got %v, want ErrLimitExceeded", err)
+	err := acceptBytes(lim, scopeRouter{rec: rec})
+	if !errors.Is(err, sofab.ErrIncomplete) {
+		t.Errorf("count word alone: got %v, want ErrIncomplete", err)
+	}
+	if errors.Is(err, sofab.ErrLimitExceeded) {
+		t.Errorf("count word alone: got %v, but the codec holds no cap (§6.2.1)", err)
 	}
 	if len(rec.headers) != 0 {
-		t.Errorf("maxArrayCount fired ArrayBegin %v, want no call", rec.headers)
+		t.Errorf("count word alone fired ArrayBegin %v, want no call", rec.headers)
 	}
 }
 

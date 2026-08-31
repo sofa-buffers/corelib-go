@@ -29,7 +29,7 @@ func badUTF8Elem() []byte {
 // payload the decoder skips never reaches a collector at all.
 func TestStringSeqRejectsInvalidUTF8(t *testing.T) {
 	var out []string
-	err := collect(badUTF8Elem(), &sofab.StringSeq{Out: &out, Cap: -1, ElemMax: -1})
+	err := collect(badUTF8Elem(), sofab.NewStringSeq(&out, sofab.Bounds{}, tcaps))
 	if !errors.Is(err, sofab.ErrInvalidMsg) {
 		t.Fatalf("decode = %v, want ErrInvalidMsg", err)
 	}
@@ -43,7 +43,7 @@ func TestStringSeqRejectsInvalidUTF8(t *testing.T) {
 // are then kept verbatim rather than replaced or dropped.
 func TestStringSeqHonorsWithStrictUTF8False(t *testing.T) {
 	var out []string
-	if err := collect(badUTF8Elem(), &sofab.StringSeq{Out: &out, Cap: -1, ElemMax: -1}, sofab.WithStrictUTF8(false)); err != nil {
+	if err := collect(badUTF8Elem(), sofab.NewStringSeq(&out, sofab.Bounds{}, tcaps), sofab.WithStrictUTF8(false)); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
 	if len(out) != 1 || out[0] != "\xFF" {
@@ -55,7 +55,7 @@ func TestStringSeqHonorsWithStrictUTF8False(t *testing.T) {
 // of StringCheck is STRICT, so OFF is only ever an explicit waiver.
 func TestStringSeqWithoutAPolicyValidates(t *testing.T) {
 	var out []string
-	s := &sofab.StringSeq{Out: &out, Cap: -1, ElemMax: -1}
+	s := sofab.NewStringSeq(&out, sofab.Bounds{}, tcaps)
 	if err := putString(s, 0, "\xFF"); !errors.Is(err, sofab.ErrInvalidMsg) {
 		t.Fatalf("String = %v, want ErrInvalidMsg", err)
 	}
@@ -69,7 +69,7 @@ func TestBlobSeqDoesNotValidateUTF8(t *testing.T) {
 	in = append(in, vhdr(0, sofab.TypeSequenceEnd)...)
 
 	var out [][]byte
-	if err := collect(in, &sofab.BlobSeq{Out: &out, Cap: -1, ElemMax: -1}); err != nil {
+	if err := collect(in, sofab.NewBlobSeq(&out, sofab.Bounds{}, tcaps)); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
 	if len(out) != 1 || len(out[0]) != 1 || out[0][0] != 0xFF {

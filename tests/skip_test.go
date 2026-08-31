@@ -133,7 +133,8 @@ func TestDecliningIsNotTheSameAsAcceptingAndIgnoring(t *testing.T) {
 	}
 }
 
-// capped rejects nothing itself; the receiver limits are what is on trial.
+// capped rejects nothing itself; what a declined subtree still refuses is what
+// is on trial (the format ceilings below).
 type capped struct{ declineID sofab.ID }
 
 func (capped) Unsigned(sofab.ID, uint64) error        { return nil }
@@ -154,9 +155,31 @@ func (c capped) BeginSequence(id sofab.ID) (any, error) {
 	return c, nil
 }
 
+// cappedSeq is a destination carrying a RECEIVER CAP where a receiver cap now
+// lives (§6.2.1): on the collector the generated arm binds, not on the decoder.
+// It declines the scope at declineID and, for any other, hands back a string
+// collector whose schema bounds are absent and whose element cap is 8 bytes.
+type cappedSeq struct {
+	sofab.VisitorBase
+	declineID sofab.ID
+	out       []string
+}
+
+func (c *cappedSeq) BeginSequence(id sofab.ID) (sofab.Visitor, error) {
+	if id == c.declineID {
+		return nil, nil
+	}
+	return sofab.NewStringSeq(&c.out, sofab.Bounds{}, capString(8)), nil
+}
+
 // The receiver's caps bound what this consumer is handed. A declined scope hands
 // it nothing, so they do not fire there — and they still fire outside it, which
 // is the half that makes the first half a rule rather than a hole.
+//
+// It is structural now: the cap is inside a callback, and a declined subtree
+// fires no callback. The test is kept because the property is what §6.2.1
+// requires ("a decode that steps over an over-cap field it was never going to
+// read stays COMPLETE"), not because the mechanism is interesting.
 func TestReceiverCapsStandDownInsideADeclinedSubtree(t *testing.T) {
 	var out bytes.Buffer
 	e := sofab.NewEncoder(&out)
@@ -166,17 +189,20 @@ func TestReceiverCapsStandDownInsideADeclinedSubtree(t *testing.T) {
 	_ = e.Flush()
 	msg := out.Bytes()
 
-	lim := []sofab.Option{sofab.WithMaxStringLen(8)}
-
-	if err := acceptBytes(msg, capped{declineID: 2}, lim...); err != nil {
+	if err := acceptBytes(msg, &cappedSeq{declineID: 2}); err != nil {
 		t.Fatalf("a cap must not fire on a string inside a declined subtree: %v", err)
 	}
-	if err := feedFrom(bytes.NewReader(msg), 1, capped{declineID: 2}); err != nil {
+	if err := feedFrom(bytes.NewReader(msg), 1, &cappedSeq{declineID: 2}); err != nil {
 		t.Fatalf("stream: same, got %v", err)
 	}
-	// ...and the same bytes with the scope TAKEN are over the cap.
-	if err := acceptBytes(msg, capped{declineID: 99}, lim...); !errors.Is(err, sofab.ErrLimitExceeded) {
+	// ...and the same bytes with the scope TAKEN are over the cap, as policy
+	// rather than as a malformed message.
+	err := acceptBytes(msg, &cappedSeq{declineID: 99})
+	if !errors.Is(err, sofab.ErrLimitExceeded) {
 		t.Fatalf("a taken scope must still be capped, got %v", err)
+	}
+	if errors.Is(err, sofab.ErrInvalidMsg) {
+		t.Fatalf("a receiver cap reported INVALID: %v (§6.3)", err)
 	}
 }
 
@@ -315,10 +341,10 @@ func TestWrapperCollectorSkipsAMistypedElement(t *testing.T) {
 		mk   func(*[]string, *[][]byte) sofab.Visitor
 	}{
 		{"StringSeq", func(s *[]string, _ *[][]byte) sofab.Visitor {
-			return &collectorRoot{child: &sofab.StringSeq{Out: s, Cap: 2, ElemMax: 4}}
+			return &collectorRoot{child: sofab.NewStringSeq(s, sofab.Bounds{Count: 2, ElemLen: 4}, tcaps)}
 		}},
 		{"BlobSeq", func(_ *[]string, b *[][]byte) sofab.Visitor {
-			return &collectorRoot{child: &sofab.BlobSeq{Out: b, Cap: 2, ElemMax: 4}}
+			return &collectorRoot{child: sofab.NewBlobSeq(b, sofab.Bounds{Count: 2, ElemLen: 4}, tcaps)}
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

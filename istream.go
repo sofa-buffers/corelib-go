@@ -132,16 +132,19 @@ type Decoder struct {
 
 	// skipFrom is the depth at which the subtree the visitor declined was
 	// opened, or -1 when nothing is being skipped. While skipping, no callback
-	// fires and the receiver caps stand down — they bound what this consumer is
-	// handed, and it is handed nothing (§6.2.1).
+	// fires — and since a receiver cap now lives behind a callback, nothing in a
+	// declined subtree is capped, which is what §6.2.1 asks for: a cap bounds
+	// what this consumer is handed, and it is handed nothing.
 	skipFrom int
 }
 
 // NewDecoder returns a decoder that reports fields to v.
 //
-// Optional decode limits (WithMaxArrayCount, WithMaxStringLen, WithMaxBlobLen)
-// and the WithStrictUTF8 policy apply to every message it decodes; with none, no
-// caps are enforced.
+// The only option is WithStrictUTF8, the §6.4 string-validity policy; it applies
+// to every message this decoder decodes. Receiver-side caps are not configured
+// here and never were the codec's to hold (§6.2.1): the destination applies them
+// — a generated ArrayBegin / FixlenBegin arm, or a collector from collectors.go
+// carrying the number generated code handed it.
 func NewDecoder(v Visitor, opts ...Option) *Decoder {
 	d := &Decoder{}
 	d.init(v, newLimits(opts))
@@ -190,9 +193,11 @@ func (d *Decoder) Err() error { return d.err }
 // across any number of calls.
 //
 // The error is non-nil exactly when the outcome is Invalid, and names why:
-// ErrInvalidMsg for malformed bytes (§5.2.2), ErrLimitExceeded for a receiver
-// cap (§6.2.1 — a policy category of its own, deliberately not folded into
-// malformed), or the visitor's own error verbatim.
+// ErrInvalidMsg for malformed bytes (§5.2.2), or the visitor's own error
+// verbatim. ErrLimitExceeded arrives that second way — a receiver cap is the
+// destination's (§6.2.1), so the decoder never raises one itself and only
+// carries it back out unchanged, still a policy category of its own and never
+// folded into malformed (§6.3).
 //
 // chunk is borrowed only for the duration of this call (§6.0): once Feed
 // returns, the caller may reuse or overwrite it and the decode is unaffected.
@@ -706,11 +711,6 @@ func (d *Decoder) fixlenWord(w uint64) error {
 		d.width, d.remain, d.nfp = 8, 8, 0
 		d.st = stFixFp
 	case FixlenStr, FixlenBlob:
-		if d.skipFrom < 0 {
-			if err := d.lim.checkFixlen(uint64(sub), n, d.id, schemaBound{v: d.stack[d.depth]}); err != nil {
-				return d.fail(err)
-			}
-		}
 		d.total, d.off, d.remain = n, 0, n
 		d.st = stFixBytes
 	default:
@@ -817,16 +817,14 @@ func (d *Decoder) fpStep(in []byte, i int, out *uint64) (int, bool) {
 // a count past ARRAY_MAX is malformed.
 //
 // A fixlen array is NOT announced here: §4.8.1 puts its fixlen_word next, and
-// only that word says what the elements are. The format ceiling and the receiver
-// cap still fire here, on the count alone, because neither depends on the kind.
+// only that word says what the elements are. The format ceiling still fires
+// here, on the count alone, because it does not depend on the kind. A receiver
+// cap does not fire here at all — it is the destination's, and the destination
+// is not told about an array until ArrayBegin, which for a fixlen array is one
+// word later (§6.2.1).
 func (d *Decoder) arrayCount(n uint64) error {
 	if n > arrayMax {
 		return d.fail(ErrInvalidMsg)
-	}
-	if d.skipFrom < 0 {
-		if err := d.lim.checkArrayCount(n, d.id, schemaBound{v: d.stack[d.depth]}); err != nil {
-			return d.fail(err)
-		}
 	}
 	d.total, d.remain, d.idx = n, n, 0
 	switch d.wire {

@@ -244,18 +244,10 @@ func (a *agg) EndSequence() error {
 	return nil
 }
 
-// SetStringCheck and SchemaBound forward the two optional extensions the
-// corelib still offers, so a destination behind the adapter keeps receiving
-// them.
+// SetStringCheck forwards the one optional extension the corelib offers, so a
+// destination behind the adapter keeps receiving it.
 func (a *agg) SetStringCheck(p sofab.StringCheck) {
 	if h, ok := a.v.(sofab.StringPolicyVisitor); ok {
 		h.SetStringCheck(p)
 	}
-}
-
-func (a *agg) SchemaBound(id sofab.ID, what sofab.BoundKind) bool {
-	if h, ok := a.v.(sofab.SchemaBoundVisitor); ok {
-		return h.SchemaBound(id, what)
-	}
-	return false
 }

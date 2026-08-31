@@ -22,6 +22,24 @@ import (
 	sofab "github.com/sofa-buffers/corelib-go"
 )
 
+// tcaps is a set of §6.2.1 receiver caps generous enough that a test not about
+// the cap reaches the behaviour it IS about.
+//
+// Every collector takes one, always: §6.2.1 admits "no unset state and no
+// unlimited mode", so a test that does not care what the numbers are still has
+// to state them. There is no fallback to the format ceiling to lean on — that
+// is the defect this file's TestMissingReceiverCapIsACallerDefect pins.
+var tcaps = sofab.Caps{ArrayCount: 1 << 20, StringLen: 1 << 20, BlobLen: 1 << 20}
+
+// capArray / capString / capBlob tighten ONE entry of tcaps and leave the rest
+// generous, for a test that pins one cap and is not about the others. Written
+// out as a literal instead, the unstated entries would be zero — which is no
+// longer "no bound" but a caller defect (ErrArgument), and the test would fail
+// on the wrong axis.
+func capArray(n int) sofab.Caps  { c := tcaps; c.ArrayCount = n; return c }
+func capString(n int) sofab.Caps { c := tcaps; c.StringLen = n; return c }
+func capBlob(n int) sofab.Caps   { c := tcaps; c.BlobLen = n; return c }
+
 // tagHolder stands in for a message the generator emits for a schema with one
 // string-array field declared `count: 4, maxlen: 8`.
 type tagHolder struct {
@@ -34,7 +52,7 @@ type tagHolder struct {
 func (m *tagHolder) BeginSequence(id sofab.ID) (sofab.Visitor, error) {
 	if id == 1 {
 		m.Tags = m.Tags[:0]
-		return &sofab.StringSeq{Out: &m.Tags, Cap: 4, ElemMax: 8}, nil
+		return sofab.NewStringSeq(&m.Tags, sofab.Bounds{Count: 4, ElemLen: 8}, tcaps), nil
 	}
 	return sofab.VisitorBase{}, nil
 }
@@ -169,7 +187,7 @@ func TestStringSeqFillsGapsAndKeepsLength(t *testing.T) {
 	})
 
 	var out []string
-	mustCollect(t, raw, &sofab.StringSeq{Out: &out, Cap: -1, ElemMax: -1})
+	mustCollect(t, raw, sofab.NewStringSeq(&out, sofab.Bounds{}, tcaps))
 
 	want := []string{"a", "", "", "d"}
 	if len(out) != len(want) {
@@ -192,7 +210,7 @@ func TestStringSeqReopenedIDReplaces(t *testing.T) {
 	})
 
 	var out []string
-	mustCollect(t, raw, &sofab.StringSeq{Out: &out, Cap: -1, ElemMax: -1})
+	mustCollect(t, raw, sofab.NewStringSeq(&out, sofab.Bounds{}, tcaps))
 
 	if len(out) != 2 || out[0] != "second" || out[1] != "b" {
 		t.Fatalf("out = %q, want [second b]", out)
@@ -205,7 +223,7 @@ func TestStringSeqReopenedIDReplaces(t *testing.T) {
 func TestStringSeqCapacityEdges(t *testing.T) {
 	t.Run("last legal index", func(t *testing.T) {
 		var out []string
-		s := &sofab.StringSeq{Out: &out, Cap: 2, ElemMax: -1}
+		s := sofab.NewStringSeq(&out, sofab.Bounds{Count: 2}, tcaps)
 		if err := putString(s, 1, "x"); err != nil {
 			t.Fatalf("id cap-1: %v", err)
 		}
@@ -216,7 +234,7 @@ func TestStringSeqCapacityEdges(t *testing.T) {
 
 	t.Run("first illegal index", func(t *testing.T) {
 		var out []string
-		s := &sofab.StringSeq{Out: &out, Cap: 2, ElemMax: -1}
+		s := sofab.NewStringSeq(&out, sofab.Bounds{Count: 2}, tcaps)
 		if err := putString(s, 2, "x"); !errors.Is(err, sofab.ErrInvalidMsg) {
 			t.Fatalf("id cap: %v, want ErrInvalidMsg", err)
 		}
@@ -227,7 +245,7 @@ func TestStringSeqCapacityEdges(t *testing.T) {
 
 	t.Run("unbounded accepts any index", func(t *testing.T) {
 		var out []string
-		s := &sofab.StringSeq{Out: &out, Cap: -1, ElemMax: -1}
+		s := sofab.NewStringSeq(&out, sofab.Bounds{}, tcaps)
 		if err := putString(s, 4, "x"); err != nil {
 			t.Fatalf("unbounded: %v", err)
 		}
@@ -242,7 +260,7 @@ func TestStringSeqCapacityEdges(t *testing.T) {
 // allocation an id-keyed fill would otherwise amplify it into.
 func TestStringSeqOverIndexAllocatesNothing(t *testing.T) {
 	var out []string
-	s := &sofab.StringSeq{Out: &out, Cap: 4, ElemMax: -1}
+	s := sofab.NewStringSeq(&out, sofab.Bounds{Count: 4}, tcaps)
 	payload := []byte("x")
 
 	allocs := testing.AllocsPerRun(100, func() {
@@ -266,39 +284,38 @@ func TestStringSeqOverIndexAllocatesNothing(t *testing.T) {
 func TestStringSeqBoundsDecideAtTheHeader(t *testing.T) {
 	for _, tc := range []struct {
 		name string
-		seq  *sofab.StringSeq
+		b    sofab.Bounds
 		in   []byte
 		want error
 	}{
 		{
 			name: "over maxlen, truncated",
-			seq:  &sofab.StringSeq{Cap: -1, ElemMax: 4},
+			b:    sofab.Bounds{ElemLen: 4},
 			in:   append(openSeq(), fixlenElem(0, subStr, 6)...),
 			want: sofab.ErrInvalidMsg,
 		},
 		{
 			name: "at maxlen, truncated",
-			seq:  &sofab.StringSeq{Cap: -1, ElemMax: 4},
+			b:    sofab.Bounds{ElemLen: 4},
 			in:   append(openSeq(), fixlenElem(0, subStr, 4)...),
 			want: sofab.ErrIncomplete,
 		},
 		{
 			name: "over capacity, truncated",
-			seq:  &sofab.StringSeq{Cap: 2, ElemMax: -1},
+			b:    sofab.Bounds{Count: 2},
 			in:   append(openSeq(), fixlenElem(2, subStr, 4)...),
 			want: sofab.ErrInvalidMsg, // the index is judged at the header too
 		},
 		{
 			name: "no bound, truncated",
-			seq:  &sofab.StringSeq{Cap: -1, ElemMax: -1},
+			b:    sofab.Bounds{},
 			in:   append(openSeq(), fixlenElem(0, subStr, 6)...),
 			want: sofab.ErrIncomplete,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var out []string
-			tc.seq.Out = &out
-			if err := collect(tc.in, tc.seq); !errors.Is(err, tc.want) {
+			if err := collect(tc.in, sofab.NewStringSeq(&out, tc.b, tcaps)); !errors.Is(err, tc.want) {
 				t.Fatalf("decode = %v, want %v", err, tc.want)
 			}
 		})
@@ -315,7 +332,7 @@ func TestStringSeqIgnoresAForeignSubtype(t *testing.T) {
 	})
 
 	var out []string
-	if err := collect(raw, &sofab.StringSeq{Out: &out, Cap: 1, ElemMax: 4}); err != nil {
+	if err := collect(raw, sofab.NewStringSeq(&out, sofab.Bounds{Count: 1, ElemLen: 4}, tcaps)); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
 	if len(out) != 0 {
@@ -333,7 +350,7 @@ func TestBlobSeqCopiesAndFillsGaps(t *testing.T) {
 	})
 
 	var out [][]byte
-	mustCollect(t, raw, &sofab.BlobSeq{Out: &out, Cap: -1, ElemMax: -1})
+	mustCollect(t, raw, sofab.NewBlobSeq(&out, sofab.Bounds{}, tcaps))
 
 	if len(out) != 3 {
 		t.Fatalf("length %d, want 3", len(out))
@@ -353,7 +370,7 @@ func TestBlobSeqCopiesAndFillsGaps(t *testing.T) {
 func TestBlobSeqBounds(t *testing.T) {
 	t.Run("over maxlen", func(t *testing.T) {
 		var out [][]byte
-		s := &sofab.BlobSeq{Out: &out, Cap: -1, ElemMax: 2}
+		s := sofab.NewBlobSeq(&out, sofab.Bounds{ElemLen: 2}, tcaps)
 		if err := putBytes(s, 0, []byte{1, 2, 3}); !errors.Is(err, sofab.ErrInvalidMsg) {
 			t.Fatalf("over maxlen: %v, want ErrInvalidMsg", err)
 		}
@@ -365,14 +382,14 @@ func TestBlobSeqBounds(t *testing.T) {
 	t.Run("over maxlen at the header, truncated", func(t *testing.T) {
 		var out [][]byte
 		in := append(openSeq(), fixlenElem(0, subBlob, 6)...)
-		if err := collect(in, &sofab.BlobSeq{Out: &out, Cap: -1, ElemMax: 4}); !errors.Is(err, sofab.ErrInvalidMsg) {
+		if err := collect(in, sofab.NewBlobSeq(&out, sofab.Bounds{ElemLen: 4}, tcaps)); !errors.Is(err, sofab.ErrInvalidMsg) {
 			t.Fatalf("decode = %v, want ErrInvalidMsg", err)
 		}
 	})
 
 	t.Run("over capacity", func(t *testing.T) {
 		var out [][]byte
-		s := &sofab.BlobSeq{Out: &out, Cap: 2, ElemMax: -1}
+		s := sofab.NewBlobSeq(&out, sofab.Bounds{Count: 2}, tcaps)
 		if err := putBytes(s, 2, []byte{1}); !errors.Is(err, sofab.ErrInvalidMsg) {
 			t.Fatalf("id cap: %v, want ErrInvalidMsg", err)
 		}
@@ -381,7 +398,7 @@ func TestBlobSeqBounds(t *testing.T) {
 	t.Run("foreign subtype is not measured", func(t *testing.T) {
 		var out [][]byte
 		raw := wrapperSeq(t, func(e *sofab.Encoder) { e.WriteString(0, "abcdefgh") })
-		if err := collect(raw, &sofab.BlobSeq{Out: &out, Cap: 1, ElemMax: 4}); err != nil {
+		if err := collect(raw, sofab.NewBlobSeq(&out, sofab.Bounds{Count: 1, ElemLen: 4}, tcaps)); err != nil {
 			t.Fatalf("decode: %v", err)
 		}
 		if len(out) != 0 {
@@ -427,7 +444,7 @@ func TestMessageSeqPlacesElementsByID(t *testing.T) {
 	})
 
 	var out []elemMsg
-	mustCollect(t, raw, &sofab.MessageSeq[elemMsg, *elemMsg]{Out: &out, Cap: -1})
+	mustCollect(t, raw, sofab.NewMessageSeq[elemMsg, *elemMsg](&out, sofab.Bounds{}, tcaps))
 
 	if len(out) != 3 {
 		t.Fatalf("length %d, want 3", len(out))
@@ -453,7 +470,7 @@ func TestMessageSeqReopenedIDContinuesTheSameElement(t *testing.T) {
 	})
 
 	var out []elemMsg
-	mustCollect(t, raw, &sofab.MessageSeq[elemMsg, *elemMsg]{Out: &out, Cap: -1})
+	mustCollect(t, raw, sofab.NewMessageSeq[elemMsg, *elemMsg](&out, sofab.Bounds{}, tcaps))
 
 	if len(out) != 1 {
 		t.Fatalf("length %d, want 1", len(out))
@@ -465,7 +482,7 @@ func TestMessageSeqReopenedIDContinuesTheSameElement(t *testing.T) {
 
 func TestMessageSeqCapacityEdges(t *testing.T) {
 	var out []elemMsg
-	s := &sofab.MessageSeq[elemMsg, *elemMsg]{Out: &out, Cap: 2}
+	s := sofab.NewMessageSeq[elemMsg, *elemMsg](&out, sofab.Bounds{Count: 2}, tcaps)
 
 	if _, err := s.BeginSequence(1); err != nil {
 		t.Fatalf("id cap-1: %v", err)
@@ -503,12 +520,10 @@ func TestNestedSeqCollectsRowsByID(t *testing.T) {
 	})
 
 	var out [][]string
-	mustCollect(t, raw, &sofab.NestedSeq[string]{
-		Out: &out, Cap: -1,
-		Make: func(p *[]string) sofab.Visitor {
-			return &sofab.StringSeq{Out: p, Cap: -1, ElemMax: -1}
-		},
-	})
+	mustCollect(t, raw, sofab.NewNestedSeq(&out, sofab.Bounds{}, tcaps,
+		func(p *[]string) sofab.Visitor {
+			return sofab.NewStringSeq(p, sofab.Bounds{}, tcaps)
+		}))
 
 	if len(out) != 3 {
 		t.Fatalf("length %d, want 3", len(out))
@@ -529,12 +544,10 @@ func TestNestedSeqInnerBoundApplies(t *testing.T) {
 	})
 
 	var out [][]string
-	err := collect(raw, &sofab.NestedSeq[string]{
-		Out: &out, Cap: 4,
-		Make: func(p *[]string) sofab.Visitor {
-			return &sofab.StringSeq{Out: p, Cap: 1, ElemMax: -1}
-		},
-	})
+	err := collect(raw, sofab.NewNestedSeq(&out, sofab.Bounds{Count: 4}, tcaps,
+		func(p *[]string) sofab.Visitor {
+			return sofab.NewStringSeq(p, sofab.Bounds{Count: 1}, tcaps)
+		}))
 	if !errors.Is(err, sofab.ErrInvalidMsg) {
 		t.Fatalf("decode = %v, want ErrInvalidMsg", err)
 	}
@@ -543,13 +556,11 @@ func TestNestedSeqInnerBoundApplies(t *testing.T) {
 func TestNestedSeqCapacityEdges(t *testing.T) {
 	var out [][]string
 	made := 0
-	s := &sofab.NestedSeq[string]{
-		Out: &out, Cap: 2,
-		Make: func(p *[]string) sofab.Visitor {
+	s := sofab.NewNestedSeq(&out, sofab.Bounds{Count: 2}, tcaps,
+		func(p *[]string) sofab.Visitor {
 			made++
-			return &sofab.StringSeq{Out: p, Cap: -1, ElemMax: -1}
-		},
-	}
+			return sofab.NewStringSeq(p, sofab.Bounds{}, tcaps)
+		})
 
 	if _, err := s.BeginSequence(1); err != nil {
 		t.Fatalf("id cap-1: %v", err)
@@ -570,17 +581,17 @@ func TestNestedSeqCapacityEdges(t *testing.T) {
 func TestPlaceRowGrowsGapsAndReplaces(t *testing.T) {
 	var out [][]uint32
 
-	if err := sofab.PlaceRow(&out, -1, 0, []uint32{1}); err != nil {
+	if err := sofab.PlaceRow(&out, sofab.Bounds{}, tcaps, 0, []uint32{1}); err != nil {
 		t.Fatalf("first row: %v", err)
 	}
-	if err := sofab.PlaceRow(&out, -1, 2, []uint32{3}); err != nil {
+	if err := sofab.PlaceRow(&out, sofab.Bounds{}, tcaps, 2, []uint32{3}); err != nil {
 		t.Fatalf("row after a gap: %v", err)
 	}
 	if len(out) != 3 || out[1] != nil {
 		t.Fatalf("out = %v, want an empty row in the gap", out)
 	}
 
-	if err := sofab.PlaceRow(&out, -1, 0, []uint32{9}); err != nil {
+	if err := sofab.PlaceRow(&out, sofab.Bounds{}, tcaps, 0, []uint32{9}); err != nil {
 		t.Fatalf("reopened row: %v", err)
 	}
 	if len(out) != 3 || out[0][0] != 9 {
@@ -591,14 +602,14 @@ func TestPlaceRowGrowsGapsAndReplaces(t *testing.T) {
 func TestPlaceRowCapacityEdges(t *testing.T) {
 	var out [][]uint32
 
-	if err := sofab.PlaceRow(&out, 2, 1, []uint32{1}); err != nil {
+	if err := sofab.PlaceRow(&out, sofab.Bounds{Count: 2}, tcaps, 1, []uint32{1}); err != nil {
 		t.Fatalf("id cap-1: %v", err)
 	}
 	if len(out) != 2 {
 		t.Fatalf("length %d, want 2", len(out))
 	}
 
-	if err := sofab.PlaceRow(&out, 2, 2, []uint32{1}); !errors.Is(err, sofab.ErrInvalidMsg) {
+	if err := sofab.PlaceRow(&out, sofab.Bounds{Count: 2}, tcaps, 2, []uint32{1}); !errors.Is(err, sofab.ErrInvalidMsg) {
 		t.Fatalf("id cap: %v, want ErrInvalidMsg", err)
 	}
 	if len(out) != 2 {
@@ -606,12 +617,64 @@ func TestPlaceRowCapacityEdges(t *testing.T) {
 	}
 
 	allocs := testing.AllocsPerRun(100, func() {
-		if err := sofab.PlaceRow(&out, 2, 1<<30, nil); !errors.Is(err, sofab.ErrInvalidMsg) {
+		if err := sofab.PlaceRow(&out, sofab.Bounds{Count: 2}, tcaps, 1<<30, nil); !errors.Is(err, sofab.ErrInvalidMsg) {
 			t.Fatalf("id 2^30: %v, want ErrInvalidMsg", err)
 		}
 	})
 	if allocs != 0 {
 		t.Errorf("%v allocations rejecting an over-range row id, want 0", allocs)
+	}
+}
+
+// The receiver-cap half of the same parameter pair (§6.2.1): with no schema
+// count on the outer array, rcapacity governs the row id instead, and its breach
+// is the POLICY category, never INVALID. The two are mutually exclusive — a
+// declared capacity leaves rcapacity inert, whatever it says.
+func TestPlaceRowReceiverCapacity(t *testing.T) {
+	var out [][]uint32
+
+	if err := sofab.PlaceRow(&out, sofab.Bounds{}, capArray(2), 1, []uint32{1}); err != nil {
+		t.Fatalf("row under the receiver cap: %v", err)
+	}
+	err := sofab.PlaceRow(&out, sofab.Bounds{}, capArray(2), 2, []uint32{1})
+	if !errors.Is(err, sofab.ErrLimitExceeded) {
+		t.Fatalf("row at the receiver cap = %v, want ErrLimitExceeded", err)
+	}
+	if errors.Is(err, sofab.ErrInvalidMsg) {
+		t.Fatal("a receiver cap must not report INVALID (§6.3)")
+	}
+	if len(out) != 2 {
+		t.Fatalf("out grew to %d rows on a rejected id", len(out))
+	}
+
+	// A declared capacity governs alone: the same id that the receiver cap would
+	// have refused as policy is INVALID, and a laxer receiver cap does not
+	// rescue an id the schema forbids.
+	if err := sofab.PlaceRow(&out, sofab.Bounds{Count: 2}, capArray(1<<20), 2, []uint32{1}); !errors.Is(err, sofab.ErrInvalidMsg) {
+		t.Fatalf("schema capacity with a laxer receiver cap = %v, want ErrInvalidMsg", err)
+	}
+	if err := sofab.PlaceRow(&out, sofab.Bounds{Count: 4}, capArray(2), 3, []uint32{1}); err != nil {
+		t.Fatalf("schema capacity with a stricter receiver cap = %v, want nil (the cap is inert)", err)
+	}
+}
+
+// PlaceRow is the same rule from the other entry point: with no schema count on
+// the outer array and no cap either, there is nothing to judge the row id
+// against, and inventing one is what §6.2.1 forbids. ErrArgument, for the same
+// reasons TestMissingReceiverCapIsACallerDefect gives.
+func TestPlaceRowWithNoCapIsACallerDefect(t *testing.T) {
+	for _, rcap := range []int{-1, 0} {
+		var out [][]uint32
+		err := sofab.PlaceRow(&out, sofab.Bounds{}, sofab.Caps{ArrayCount: rcap}, 0, []uint32{1})
+		if !errors.Is(err, sofab.ErrArgument) {
+			t.Fatalf("rcapacity %d = %v, want ErrArgument", rcap, err)
+		}
+		if errors.Is(err, sofab.ErrLimitExceeded) {
+			t.Fatalf("rcapacity %d reported as a limit nobody set", rcap)
+		}
+		if len(out) != 0 {
+			t.Fatalf("rcapacity %d: out grew to %d rows", rcap, len(out))
+		}
 	}
 }
 
@@ -629,7 +692,7 @@ func TestUnsignedMatrixSeqNarrowsAndPlaces(t *testing.T) {
 	})
 
 	var out [][]uint16
-	mustCollect(t, raw, &sofab.UnsignedMatrixSeq[uint16]{Out: &out, Cap: -1, Hi: math.MaxUint16})
+	mustCollect(t, raw, sofab.NewUnsignedMatrixSeq[uint16](&out, sofab.Bounds{}, sofab.Bounds{}, tcaps, math.MaxUint16))
 
 	if len(out) != 3 || len(out[0]) != 2 || out[0][1] != 2 || out[1] != nil || out[2][0] != 3 {
 		t.Fatalf("out = %v, want [[1 2] [] [3]]", out)
@@ -645,7 +708,7 @@ func TestUnsignedMatrixSeqRejectsAnOverWideElement(t *testing.T) {
 	})
 
 	var out [][]uint8
-	err := collect(raw, &sofab.UnsignedMatrixSeq[uint8]{Out: &out, Cap: -1, Hi: math.MaxUint8})
+	err := collect(raw, sofab.NewUnsignedMatrixSeq[uint8](&out, sofab.Bounds{}, sofab.Bounds{}, tcaps, math.MaxUint8))
 	if !errors.Is(err, sofab.ErrInvalidMsg) {
 		t.Fatalf("decode = %v, want ErrInvalidMsg", err)
 	}
@@ -658,7 +721,7 @@ func TestUnsignedMatrixSeqRejectsAnOverWideElement(t *testing.T) {
 // the scan is off and even the largest u64 goes through.
 func TestUnsignedMatrixSeqZeroBoundSkipsTheScan(t *testing.T) {
 	var out [][]uint64
-	s := &sofab.UnsignedMatrixSeq[uint64]{Out: &out, Cap: -1}
+	s := sofab.NewUnsignedMatrixSeq[uint64](&out, sofab.Bounds{}, sofab.Bounds{}, tcaps, 0)
 	if err := putUArray(s, 0, []uint64{math.MaxUint64}); err != nil {
 		t.Fatalf("u64 row: %v", err)
 	}
@@ -673,7 +736,7 @@ func TestSignedMatrixSeqNarrowsAndBounds(t *testing.T) {
 	})
 
 	var out [][]int8
-	mustCollect(t, raw, &sofab.SignedMatrixSeq[int8]{Out: &out, Cap: -1, Lo: math.MinInt8, Hi: math.MaxInt8})
+	mustCollect(t, raw, sofab.NewSignedMatrixSeq[int8](&out, sofab.Bounds{}, sofab.Bounds{}, tcaps, math.MinInt8, math.MaxInt8))
 	if len(out) != 1 || out[0][0] != -128 || out[0][1] != 127 {
 		t.Fatalf("out = %v, want [[-128 127]]", out)
 	}
@@ -683,7 +746,7 @@ func TestSignedMatrixSeqNarrowsAndBounds(t *testing.T) {
 			sofab.WriteSignedArray(e, 0, []int32{x})
 		})
 		var out [][]int8
-		err := collect(raw, &sofab.SignedMatrixSeq[int8]{Out: &out, Cap: -1, Lo: math.MinInt8, Hi: math.MaxInt8})
+		err := collect(raw, sofab.NewSignedMatrixSeq[int8](&out, sofab.Bounds{}, sofab.Bounds{}, tcaps, math.MinInt8, math.MaxInt8))
 		if !errors.Is(err, sofab.ErrInvalidMsg) {
 			t.Fatalf("element %d: %v, want ErrInvalidMsg", x, err)
 		}
@@ -692,7 +755,7 @@ func TestSignedMatrixSeqNarrowsAndBounds(t *testing.T) {
 
 func TestSignedMatrixSeqZeroBoundSkipsTheScan(t *testing.T) {
 	var out [][]int64
-	s := &sofab.SignedMatrixSeq[int64]{Out: &out, Cap: -1}
+	s := sofab.NewSignedMatrixSeq[int64](&out, sofab.Bounds{}, sofab.Bounds{}, tcaps, 0, 0)
 	if err := putSArray(s, 0, []int64{math.MinInt64}); err != nil {
 		t.Fatalf("i64 row: %v", err)
 	}
@@ -708,7 +771,7 @@ func TestFloatMatrixSeqPlacesRows(t *testing.T) {
 			e.WriteFloat32Array(2, []float32{2.5, 3.5})
 		})
 		var out [][]float32
-		mustCollect(t, raw, &sofab.Float32MatrixSeq{Out: &out, Cap: -1})
+		mustCollect(t, raw, sofab.NewFloat32MatrixSeq(&out, sofab.Bounds{}, sofab.Bounds{}, tcaps))
 		if len(out) != 3 || out[0][0] != 1.5 || out[1] != nil || out[2][1] != 3.5 {
 			t.Fatalf("out = %v, want [[1.5] [] [2.5 3.5]]", out)
 		}
@@ -719,7 +782,7 @@ func TestFloatMatrixSeqPlacesRows(t *testing.T) {
 			e.WriteFloat64Array(1, []float64{2.5})
 		})
 		var out [][]float64
-		mustCollect(t, raw, &sofab.Float64MatrixSeq{Out: &out, Cap: -1})
+		mustCollect(t, raw, sofab.NewFloat64MatrixSeq(&out, sofab.Bounds{}, sofab.Bounds{}, tcaps))
 		if len(out) != 2 || out[0] != nil || out[1][0] != 2.5 {
 			t.Fatalf("out = %v, want [[] [2.5]]", out)
 		}
@@ -727,7 +790,7 @@ func TestFloatMatrixSeqPlacesRows(t *testing.T) {
 
 	t.Run("capacity", func(t *testing.T) {
 		var out [][]float32
-		s := &sofab.Float32MatrixSeq{Out: &out, Cap: 1}
+		s := sofab.NewFloat32MatrixSeq(&out, sofab.Bounds{Count: 1}, sofab.Bounds{}, tcaps)
 		if err := putF32Array(s, 1, []float32{1}); !errors.Is(err, sofab.ErrInvalidMsg) {
 			t.Fatalf("row id cap: %v, want ErrInvalidMsg", err)
 		}
@@ -742,7 +805,7 @@ func TestBoolMatrixSeqMapsRows(t *testing.T) {
 	})
 
 	var out [][]bool
-	mustCollect(t, raw, &sofab.BoolMatrixSeq{Out: &out, Cap: -1})
+	mustCollect(t, raw, sofab.NewBoolMatrixSeq(&out, sofab.Bounds{}, sofab.Bounds{}, tcaps))
 
 	want := []bool{false, true, true, true}
 	if len(out) != 1 || len(out[0]) != len(want) {
@@ -757,7 +820,7 @@ func TestBoolMatrixSeqMapsRows(t *testing.T) {
 
 func TestBoolMatrixSeqCapacity(t *testing.T) {
 	var out [][]bool
-	s := &sofab.BoolMatrixSeq{Out: &out, Cap: 2}
+	s := sofab.NewBoolMatrixSeq(&out, sofab.Bounds{Count: 2}, sofab.Bounds{}, tcaps)
 	if err := putUArray(s, 2, []uint64{1}); !errors.Is(err, sofab.ErrInvalidMsg) {
 		t.Fatalf("row id cap: %v, want ErrInvalidMsg", err)
 	}
@@ -794,7 +857,7 @@ func TestSequenceGrowthIsGeometric(t *testing.T) {
 	place := func(n int) float64 {
 		return testing.AllocsPerRun(20, func() {
 			out := make([]string, 0)
-			s := &sofab.StringSeq{Out: &out, Cap: -1, ElemMax: -1}
+			s := sofab.NewStringSeq(&out, sofab.Bounds{}, tcaps)
 			for i := 0; i < n; i++ {
 				if err := putPayload(s, sofab.ID(i), payload); err != nil {
 					t.Fatalf("place %d: %v", i, err)
@@ -821,7 +884,7 @@ func TestSequenceGrowthIsGeometric(t *testing.T) {
 	// extends the container to id+1 in geometric steps, not one step per slot.
 	sparse := testing.AllocsPerRun(20, func() {
 		out := make([]string, 0)
-		s := &sofab.StringSeq{Out: &out, Cap: -1, ElemMax: -1}
+		s := sofab.NewStringSeq(&out, sofab.Bounds{}, tcaps)
 		if err := putPayload(s, 1000, payload); err != nil {
 			t.Fatalf("sparse place: %v", err)
 		}
@@ -908,4 +971,430 @@ func putF64Array(v sofab.Visitor, id sofab.ID, xs []float64) error {
 		}
 	}
 	return v.ArrayEnd(id)
+}
+
+// --- receiver caps on the collector layer ------------------------------------
+//
+// CORELIB_PLAN §6.2.1 puts the max_dyn_* numbers with the layer that knows the
+// schema and the deployment: "The numbers and the allocation are not the
+// codec's ... The codec never invents a limit of its own and never clamps to
+// one." For a WRAPPER array that layer is here — the collector owns the whole
+// array, so no generated arm ever sees these headers — and the numbers arrive as
+// the R-prefixed fields beside the schema bounds.
+//
+// Four properties are worth pinning, and every one of them used to be pinned
+// against the decoder instead:
+//
+//   - the cap fires, and it fires as POLICY (ErrLimitExceeded), never INVALID;
+//   - it is consulted ONLY where the schema declares no bound, the two never
+//     both in play;
+//   - an absent cap resolves to the FORMAT CEILING, not to "unlimited";
+//   - the rejection costs a comparison, not the allocation it exists to prevent.
+
+// The element INDEX of every wrapper array, capped by the receiver rather than
+// by the schema. A wrapper array announces no count, so §6.2.1 makes the index
+// the enforcement point: "checked before the container it indexes into is
+// extended".
+func TestSeqReceiverCapBoundsTheElementIndex(t *testing.T) {
+	t.Run("StringSeq", func(t *testing.T) {
+		var out []string
+		s := sofab.NewStringSeq(&out, sofab.Bounds{}, capArray(2))
+		if err := putString(s, 1, "x"); err != nil {
+			t.Fatalf("id under the cap: %v", err)
+		}
+		wantPolicy(t, putString(s, 2, "x"))
+		if len(out) != 2 {
+			t.Fatalf("out grew to %d elements on a rejected id", len(out))
+		}
+	})
+
+	t.Run("BlobSeq", func(t *testing.T) {
+		var out [][]byte
+		s := sofab.NewBlobSeq(&out, sofab.Bounds{}, capArray(2))
+		if err := putBytes(s, 1, []byte{1}); err != nil {
+			t.Fatalf("id under the cap: %v", err)
+		}
+		wantPolicy(t, putBytes(s, 2, []byte{1}))
+		if len(out) != 2 {
+			t.Fatalf("out grew to %d elements on a rejected id", len(out))
+		}
+	})
+
+	t.Run("MessageSeq", func(t *testing.T) {
+		var out []elemMsg
+		s := sofab.NewMessageSeq[elemMsg, *elemMsg](&out, sofab.Bounds{}, capArray(2))
+		if _, err := s.BeginSequence(1); err != nil {
+			t.Fatalf("id under the cap: %v", err)
+		}
+		v, err := s.BeginSequence(2)
+		wantPolicy(t, err)
+		if v != nil {
+			t.Errorf("rejected id returned visitor %v, want nil", v)
+		}
+		if len(out) != 2 {
+			t.Fatalf("out grew to %d elements on a rejected id", len(out))
+		}
+	})
+
+	t.Run("NestedSeq", func(t *testing.T) {
+		var out [][]string
+		made := 0
+		s := sofab.NewNestedSeq(&out, sofab.Bounds{}, capArray(2),
+			func(p *[]string) sofab.Visitor {
+				made++
+				return sofab.NewStringSeq(p, sofab.Bounds{}, tcaps)
+			})
+		if _, err := s.BeginSequence(1); err != nil {
+			t.Fatalf("id under the cap: %v", err)
+		}
+		v, err := s.BeginSequence(2)
+		wantPolicyOnly(t, v, err)
+		if made != 1 {
+			t.Errorf("Make called %d times, want 1: a rejected row must not build a collector", made)
+		}
+		if len(out) != 2 {
+			t.Fatalf("out grew to %d rows on a rejected id", len(out))
+		}
+	})
+}
+
+// The element LENGTH half — max_dyn_string_len / max_dyn_blob_len. This is the
+// one that genuinely MOVED out of the codec: every element of a wrapper array is
+// an ordinary fixlen field, so the decoder's checkFixlen used to see each one.
+//
+// It is applied twice, exactly as its schema sibling is: at the length word, so
+// §5.2.3 keeps the policy verdict dominant over the truncation that follows it,
+// and again in the payload callback, which is the backstop for a collector
+// driven by hand.
+func TestSeqReceiverElemMaxBoundsTheElementLength(t *testing.T) {
+	t.Run("StringSeq header latch", func(t *testing.T) {
+		var out []string
+		s := sofab.NewStringSeq(&out, sofab.Bounds{}, capString(4))
+		wantPolicy(t, s.FixlenBegin(0, sofab.FixlenStr, 5))
+		if err := s.FixlenBegin(0, sofab.FixlenStr, 4); err != nil {
+			t.Fatalf("at the cap: %v, want nil", err)
+		}
+		// A subtype this array never declared is another field's shape (§7.3):
+		// neither its id nor its length may be measured against these bounds.
+		if err := s.FixlenBegin(0, sofab.FixlenBlob, 1<<20); err != nil {
+			t.Fatalf("mistyped element measured against the cap: %v", err)
+		}
+	})
+
+	t.Run("StringSeq payload backstop", func(t *testing.T) {
+		var out []string
+		s := sofab.NewStringSeq(&out, sofab.Bounds{}, capString(4))
+		wantPolicy(t, s.String(0, 5, 0, []byte("hello")))
+		if len(out) != 0 {
+			t.Fatalf("out grew to %d elements on a rejected element", len(out))
+		}
+	})
+
+	t.Run("BlobSeq header latch", func(t *testing.T) {
+		var out [][]byte
+		s := sofab.NewBlobSeq(&out, sofab.Bounds{}, capBlob(4))
+		wantPolicy(t, s.FixlenBegin(0, sofab.FixlenBlob, 5))
+		if err := s.FixlenBegin(0, sofab.FixlenStr, 1<<20); err != nil {
+			t.Fatalf("mistyped element measured against the cap: %v", err)
+		}
+	})
+
+	t.Run("BlobSeq payload backstop", func(t *testing.T) {
+		var out [][]byte
+		s := sofab.NewBlobSeq(&out, sofab.Bounds{}, capBlob(4))
+		wantPolicy(t, s.Bytes(0, 5, 0, []byte{1, 2, 3, 4, 5}))
+		if len(out) != 0 {
+			t.Fatalf("out grew to %d elements on a rejected element", len(out))
+		}
+	})
+
+	t.Run("over the wire", func(t *testing.T) {
+		// The header latch is what makes a message truncated right behind the
+		// violating length word a POLICY rejection rather than INCOMPLETE.
+		raw := append(openSeq(), fixlenElem(0, subStr, 9)...)
+		var out []string
+		wantPolicy(t, collect(raw, sofab.NewStringSeq(&out, sofab.Bounds{}, capString(4))))
+		// The same bytes with no cap at all are merely INCOMPLETE, which is what
+		// makes this a property of the collector and not of the truncation.
+		out = nil
+		if err := collect(raw, sofab.NewStringSeq(&out, sofab.Bounds{}, tcaps)); !errors.Is(err, sofab.ErrIncomplete) {
+			t.Fatalf("uncapped = %v, want ErrIncomplete", err)
+		}
+	})
+}
+
+// §6.2.1: a receiver cap "MUST NOT be applied to a field the schema already
+// bounds. There the schema bound governs and its violation is INVALID". The two
+// are mutually exclusive by construction here, which is what replaced the
+// SchemaBoundVisitor hook: where the schema states a bound, the R field beside
+// it is inert, whichever of the two numbers is smaller.
+func TestSeqSchemaBoundLeavesTheReceiverCapInert(t *testing.T) {
+	t.Run("index, schema stricter", func(t *testing.T) {
+		var out []string
+		// Cap 2 governs; RCap 1000 cannot rescue an id the schema forbids.
+		s := sofab.NewStringSeq(&out, sofab.Bounds{Count: 2}, capArray(1000))
+		err := putString(s, 2, "x")
+		if !errors.Is(err, sofab.ErrInvalidMsg) {
+			t.Fatalf("= %v, want ErrInvalidMsg", err)
+		}
+		if errors.Is(err, sofab.ErrLimitExceeded) {
+			t.Fatal("a schema-bounded field reported the policy category (§6.3)")
+		}
+	})
+
+	t.Run("index, cap stricter", func(t *testing.T) {
+		var out []string
+		// RCap 1 would refuse id 3; the schema's Cap 8 governs, so it decodes.
+		s := sofab.NewStringSeq(&out, sofab.Bounds{Count: 8}, capArray(1))
+		if err := putString(s, 3, "x"); err != nil {
+			t.Fatalf("= %v, want nil: a declared count leaves the cap inert", err)
+		}
+	})
+
+	t.Run("length, both stated", func(t *testing.T) {
+		var out []string
+		// ElemMax 8 governs; RElemMax 2 is inert, and the breach of ElemMax is
+		// INVALID rather than policy.
+		s := sofab.NewStringSeq(&out, sofab.Bounds{ElemLen: 8}, capString(2))
+		if err := putString(s, 0, "12345"); err != nil {
+			t.Fatalf("under the schema maxlen = %v, want nil", err)
+		}
+		err := putString(s, 1, "123456789")
+		if !errors.Is(err, sofab.ErrInvalidMsg) || errors.Is(err, sofab.ErrLimitExceeded) {
+			t.Fatalf("over the schema maxlen = %v, want ErrInvalidMsg alone", err)
+		}
+	})
+
+	t.Run("matrix row count", func(t *testing.T) {
+		var out [][]uint8
+		s := sofab.NewUnsignedMatrixSeq[uint8](&out, sofab.Bounds{}, sofab.Bounds{Count: 2}, capArray(1000), math.MaxUint8)
+		err := s.ArrayBegin(0, sofab.ArrayUnsigned, 3)
+		if !errors.Is(err, sofab.ErrInvalidMsg) || errors.Is(err, sofab.ErrLimitExceeded) {
+			t.Fatalf("row over its schema count = %v, want ErrInvalidMsg alone", err)
+		}
+	})
+}
+
+// A cap that was never stated is a CALLER DEFECT, and the collectors say so.
+//
+// §6.2.1: a codec "MUST NOT supply a default for one it was not given, MUST NOT
+// read an omitted argument as unlimited, and MUST NOT clamp to one. A format
+// ceiling (§6.2) reached because no cap was stated is the FORMAT's bound, not a
+// receiver cap, and a port MUST NOT present it as one." This package used to do
+// exactly that — a non-positive cap fell back to ARRAY_MAX and its breach was
+// reported as ErrLimitExceeded, promising the caller a limit to raise that was
+// never configured. That is gone.
+//
+// What is left is ErrArgument, §6.3's InvalidArgument, "the only code for a
+// caller mistake": nothing about the message is at fault and no number exists to
+// judge it against, so the first element of a schema-unbounded field is refused
+// on the CALL, not on the data. It is deliberately not ErrLimitExceeded and
+// deliberately not ErrInvalidMsg.
+//
+// A value built through the constructors cannot reach this state by omission —
+// Caps is a required argument — so this is the guard behind the compile error,
+// for a caller who states sofab.Caps{} on purpose.
+func TestMissingReceiverCapIsACallerDefect(t *testing.T) {
+	for _, rcap := range []int{-1, 0} {
+		t.Run(fmt.Sprintf("rcap=%d", rcap), func(t *testing.T) {
+			var out []string
+			s := sofab.NewStringSeq(&out, sofab.Bounds{}, sofab.Caps{ArrayCount: rcap, StringLen: rcap})
+
+			// Not a size the format could not carry, not an adversarial index —
+			// an ordinary element, which the collector has no number to admit.
+			err := putString(s, 3, "x")
+			if !errors.Is(err, sofab.ErrArgument) {
+				t.Fatalf("index with no cap = %v, want ErrArgument", err)
+			}
+			if errors.Is(err, sofab.ErrLimitExceeded) {
+				t.Fatal("a cap nobody configured must not be reported as LimitExceeded (§6.2.1)")
+			}
+			if errors.Is(err, sofab.ErrInvalidMsg) {
+				t.Fatal("a missing cap says nothing about the message (§6.3)")
+			}
+			if len(out) != 0 {
+				t.Fatalf("out grew to %d elements on a defective call", len(out))
+			}
+
+			// The LENGTH half, reached with the index cap in place so the
+			// element cap is what is missing.
+			s = sofab.NewStringSeq(&out, sofab.Bounds{}, sofab.Caps{ArrayCount: 8, StringLen: rcap})
+			if err := s.FixlenBegin(0, sofab.FixlenStr, 1); !errors.Is(err, sofab.ErrArgument) {
+				t.Fatalf("length with no cap = %v, want ErrArgument", err)
+			}
+		})
+	}
+}
+
+// The zero value cannot be reached through the constructors, but Go lets anyone
+// write &sofab.StringSeq{} — every field is unexported, so it compiles and sets
+// nothing. That value must fail on the CAP, before it dereferences the
+// destination it also does not have: the guard is what keeps a collector built
+// past the constructor from decoding uncapped (or panicking).
+func TestZeroValueCollectorFailsOnTheCapNotOnTheDestination(t *testing.T) {
+	s := &sofab.StringSeq{}
+	if err := s.FixlenBegin(0, sofab.FixlenStr, 1); !errors.Is(err, sofab.ErrArgument) {
+		t.Fatalf("zero-value header latch = %v, want ErrArgument", err)
+	}
+	if err := putString(s, 0, "x"); !errors.Is(err, sofab.ErrArgument) {
+		t.Fatalf("zero-value payload backstop = %v, want ErrArgument", err)
+	}
+}
+
+// The other side of it: a caller who genuinely wants the format ceiling as its
+// policy may still pass ARRAY_MAX. Then the number is the CALLER'S, which is the
+// whole distinction §6.2.1 draws — the same comparison, with a provenance the
+// codec is not inventing.
+func TestTheFormatCeilingIsAvailableAsACapTheCallerPasses(t *testing.T) {
+	const arrayMax = 0x7FFF_FFFF
+	var out []string
+	s := sofab.NewStringSeq(&out, sofab.Bounds{},
+		sofab.Caps{ArrayCount: arrayMax, StringLen: arrayMax})
+
+	if err := putString(s, 3, "x"); err != nil {
+		t.Fatalf("ordinary element: %v", err)
+	}
+	// An index whose implied length ARRAY_MAX cannot express is refused, and
+	// refused as policy — the caller's cap, breached.
+	wantPolicy(t, s.FixlenBegin(arrayMax, sofab.FixlenStr, 1))
+	// The ceiling is inclusive on a LENGTH: ARRAY_MAX bytes is a length the
+	// format can express, so the collector's job is only not to refuse the
+	// largest legal one.
+	if err := s.FixlenBegin(0, sofab.FixlenStr, arrayMax); err != nil {
+		t.Fatalf("length at ARRAY_MAX: %v, want nil", err)
+	}
+}
+
+// The adversarial case every one of these bounds exists for: the rejection must
+// cost a comparison, not the id-keyed fill the announced index would otherwise
+// be amplified into (§6.2.1: "before the allocation it is meant to prevent").
+func TestSeqReceiverCapAllocatesNothing(t *testing.T) {
+	var out []string
+	s := sofab.NewStringSeq(&out, sofab.Bounds{}, capArray(4))
+	payload := []byte("x")
+
+	allocs := testing.AllocsPerRun(100, func() {
+		if err := putPayload(s, 1<<30, payload); !errors.Is(err, sofab.ErrLimitExceeded) {
+			t.Fatalf("id 2^30: %v, want ErrLimitExceeded", err)
+		}
+	})
+	if allocs != 0 {
+		t.Errorf("%v allocations rejecting an over-cap id, want 0", allocs)
+	}
+	if len(out) != 0 {
+		t.Fatalf("out grew to %d elements", len(out))
+	}
+}
+
+// The matrix row's OWN element count. A row is a real native array with a real
+// count header, so §6.2.1's enforcement point applies to it literally — and
+// until now NOTHING here bounded it: the collectors discarded the count
+// parameter and the decoder's cap was the row's only protection. Both halves
+// land at ArrayBegin: the row Bounds carries the row's schema `count:` (INVALID)
+// and Caps.ArrayCount the receiver cap beside it (policy).
+func TestMatrixSeqBoundsTheRowElementCount(t *testing.T) {
+	t.Run("unsigned", func(t *testing.T) {
+		var out [][]uint8
+		s := sofab.NewUnsignedMatrixSeq[uint8](&out, sofab.Bounds{}, sofab.Bounds{}, capArray(2), math.MaxUint8)
+		wantPolicy(t, putUArray(s, 0, []uint64{1, 2, 3}))
+		if err := putUArray(s, 0, []uint64{1, 2}); err != nil {
+			t.Fatalf("row at the cap: %v", err)
+		}
+	})
+
+	t.Run("signed", func(t *testing.T) {
+		var out [][]int8
+		s := sofab.NewSignedMatrixSeq[int8](&out, sofab.Bounds{}, sofab.Bounds{}, capArray(2), math.MinInt8, math.MaxInt8)
+		wantPolicy(t, putSArray(s, 0, []int64{1, 2, 3}))
+	})
+
+	t.Run("fp32", func(t *testing.T) {
+		var out [][]float32
+		s := sofab.NewFloat32MatrixSeq(&out, sofab.Bounds{}, sofab.Bounds{}, capArray(2))
+		wantPolicy(t, putF32Array(s, 0, []float32{1, 2, 3}))
+	})
+
+	t.Run("fp64", func(t *testing.T) {
+		var out [][]float64
+		s := sofab.NewFloat64MatrixSeq(&out, sofab.Bounds{}, sofab.Bounds{}, capArray(2))
+		wantPolicy(t, putF64Array(s, 0, []float64{1, 2, 3}))
+	})
+
+	t.Run("bool", func(t *testing.T) {
+		var out [][]bool
+		s := sofab.NewBoolMatrixSeq(&out, sofab.Bounds{}, sofab.Bounds{}, capArray(2))
+		wantPolicy(t, putUArray(s, 0, []uint64{1, 0, 1}))
+	})
+
+	t.Run("schema count, over the wire", func(t *testing.T) {
+		// The gap this closes: a row longer than its declared `count:` is a
+		// schema-bound violation (MESSAGE_SPEC §7.1) and was decoding cleanly.
+		raw := matrixBytes(t, func(e *sofab.Encoder) {
+			sofab.WriteUnsignedArray(e, 0, []uint64{1, 2, 3})
+		})
+		var out [][]uint8
+		err := collect(raw, sofab.NewUnsignedMatrixSeq[uint8](&out, sofab.Bounds{}, sofab.Bounds{Count: 2}, tcaps, math.MaxUint8))
+		if !errors.Is(err, sofab.ErrInvalidMsg) {
+			t.Fatalf("= %v, want ErrInvalidMsg", err)
+		}
+		if len(out) != 0 {
+			t.Fatalf("out grew to %d rows on a rejected row", len(out))
+		}
+	})
+
+	t.Run("a mistyped row is not measured", func(t *testing.T) {
+		// §7.3: an array arriving under a wire type this field never declared is
+		// another field's shape, so neither its id nor its count may be judged
+		// against these bounds.
+		var out [][]uint8
+		s := sofab.NewUnsignedMatrixSeq[uint8](&out, sofab.Bounds{}, sofab.Bounds{}, capArray(1), 0)
+		if err := s.ArrayBegin(1<<20, sofab.ArraySigned, 1<<20); err != nil {
+			t.Fatalf("mistyped row measured against the bounds: %v", err)
+		}
+	})
+}
+
+// The row ID's receiver cap, which a matrix applies TWICE — at ArrayBegin and
+// again in PlaceRow at ArrayEnd. §6.2.1 requires the rule to have one
+// implementation however it is reached, so the two must agree; the ArrayEnd path
+// is reachable on its own by a hand-driven caller.
+func TestMatrixSeqReceiverCapBoundsTheRowID(t *testing.T) {
+	var out [][]uint8
+	s := sofab.NewUnsignedMatrixSeq[uint8](&out, sofab.Bounds{}, sofab.Bounds{}, capArray(2), math.MaxUint8)
+
+	if err := putUArray(s, 1, []uint64{1}); err != nil {
+		t.Fatalf("row id under the cap: %v", err)
+	}
+	wantPolicy(t, s.ArrayBegin(2, sofab.ArrayUnsigned, 1))
+	// ArrayEnd alone reaches the same rule through PlaceRow.
+	wantPolicy(t, s.ArrayEnd(2))
+	if len(out) != 2 {
+		t.Fatalf("out grew to %d rows on a rejected row id", len(out))
+	}
+}
+
+// wantPolicy asserts the §6.3 category split at a single site: ErrLimitExceeded
+// and nothing else. A receiver cap that reported INVALID would tell a peer its
+// well-formed message is malformed, which §6.2.1 forbids in terms.
+func wantPolicy(t *testing.T, err error) {
+	t.Helper()
+	if !errors.Is(err, sofab.ErrLimitExceeded) {
+		t.Fatalf("= %v, want ErrLimitExceeded", err)
+	}
+	if errors.Is(err, sofab.ErrInvalidMsg) {
+		t.Fatal("a receiver cap must not also report ErrInvalidMsg (§6.3)")
+	}
+	if errors.Is(err, sofab.ErrIncomplete) {
+		t.Fatal("a receiver cap must not also report ErrIncomplete")
+	}
+}
+
+// wantPolicyOnly is wantPolicy for a BeginSequence pair, which must also hand
+// back no visitor.
+func wantPolicyOnly(t *testing.T, v sofab.Visitor, err error) {
+	t.Helper()
+	wantPolicy(t, err)
+	if v != nil {
+		t.Errorf("rejected id returned visitor %v, want nil", v)
+	}
 }

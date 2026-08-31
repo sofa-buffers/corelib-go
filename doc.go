@@ -62,10 +62,8 @@
 // returns; a caller that keeps a value copies it first (§6.7). That holds on the
 // one-shot path exactly as on the streaming one.
 //
-// A visitor may implement the optional extensions SchemaBoundVisitor and
-// StringPolicyVisitor, to tell the decoder which fields the schema already
-// bounds and to receive the decode's UTF-8 policy; a visitor that implements
-// neither decodes exactly as before.
+// A visitor may implement the optional extension StringPolicyVisitor, to receive
+// the decode's UTF-8 policy; a visitor that does not decodes exactly as before.
 //
 // # Collectors
 //
@@ -74,12 +72,13 @@
 // ids are the array indices (MESSAGE_SPEC §5.1). Turning that back into a slice
 // is the same code for every schema, so it lives here rather than in every
 // generated package: StringSeq, BlobSeq, MessageSeq, NestedSeq, the matrix
-// collectors and PlaceRow, all built on the no-op VisitorBase. The schema
-// travels as arguments — Cap is the count bound, ElemMax the element maxlen,
-// Hi/Lo the declared element width — and a generated BeginSequence arm is then
-// one line handing back the collector its field is bound to. PayloadAcc is the
-// same idea one level down: it assembles a string or blob payload out of the
-// pieces the decoder delivers.
+// collectors and PlaceRow, all built on the no-op VisitorBase. Every bound
+// travels as a CONSTRUCTOR ARGUMENT — a Bounds for what the schema declares, a
+// Caps for the §6.2.1 receiver caps, plus the declared element width — so a
+// generated BeginSequence arm is one line handing back the collector its field
+// is bound to, and a receiver cap left out is a compile error rather than a
+// decode that runs uncapped. PayloadAcc is the same idea one level down: it
+// assembles a string or blob payload out of the pieces the decoder delivers.
 //
 // # Sequence framing (omitting an all-default sequence)
 //

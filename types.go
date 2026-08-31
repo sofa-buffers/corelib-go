@@ -130,15 +130,21 @@ var (
 	// distinct from ErrInvalidMsg so a truncated stream is never conflated with a
 	// malformed one.
 	ErrIncomplete = errors.New("sofab: incomplete message")
-	// ErrLimitExceeded is returned when a decoded field exceeds a limit configured
-	// on the decoder via WithMaxArrayCount, WithMaxStringLen, or WithMaxBlobLen. It
-	// is a *receiver-side policy* decision, not a property of the wire format: the
-	// bytes may be perfectly well-formed, but a locally configured cap rejects
-	// them. It is therefore a distinct sentinel from ErrInvalidMsg — a message
-	// turned away only because it exceeds a locally chosen limit must never be
-	// conflated with a malformed one (e.g. differential fuzzing must not read a
-	// limit rejection as a conformance divergence). Test for it with errors.Is.
-	// With no limits configured (the default) it is never returned.
+	// ErrLimitExceeded is the receiver-side technical limit of CORELIB_PLAN
+	// §6.2.1: max_dyn_array_count, max_dyn_string_len, max_dyn_blob_len. It is a
+	// *policy* decision, not a property of the wire format — the bytes may be
+	// perfectly well-formed and decode under a looser cap — so it is a distinct
+	// sentinel from ErrInvalidMsg and must never be conflated with a malformed
+	// message (differential fuzzing, for one, must not read a limit rejection as
+	// a conformance divergence). Test for it with errors.Is.
+	//
+	// The DECODER never raises it. §6.2.1 puts the numbers with the layer that
+	// knows the schema and the deployment: "The codec never invents a limit of
+	// its own and never clamps to one." It is raised by a destination — a
+	// generated ArrayBegin / FixlenBegin arm, or one of the collectors in
+	// collectors.go, from the R-prefixed cap generated code handed it — and the
+	// decoder carries it back out through the ordinary visitor-error path,
+	// unchanged and still distinguishable (§6.3).
 	ErrLimitExceeded = errors.New("sofab: decode limit exceeded")
 )
 

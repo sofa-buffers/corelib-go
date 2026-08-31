@@ -33,8 +33,10 @@ type malformedCase struct {
 // the streaming path.
 //
 // Receiver-side limits are deliberately absent: those are ErrLimitExceeded and
-// not a wire-format verdict (§6.2.1, limits_test.go). Oversized counts/lengths
-// live here only in their structural form (over ID_MAX / over arrayMax).
+// not a wire-format verdict (§6.2.1), they are the destination's rather than the
+// codec's, and they are exercised in collectors_test.go. Oversized
+// counts/lengths live here only in their structural form (over ID_MAX / over
+// arrayMax).
 var malformedCases = map[string]malformedCase{
 	"truncated unsigned":    {append(vhdr(1, sofab.TypeVarintUnsigned), 0x80), sofab.ErrIncomplete},
 	"truncated fixlen":      {append(vhdr(1, sofab.TypeFixlen), 0x80), sofab.ErrIncomplete},
@@ -105,11 +107,11 @@ func runMalformedCases(t *testing.T, decode func(in []byte, v any) error) {
 // category (CORELIB_PLAN §7): a fixlen length or an array element count strictly
 // greater than arrayMax (INT32_MAX) is a structural wire-format violation and is
 // rejected as ErrInvalidMsg on both the visitor and pull paths. This is distinct
-// from the receiver-side WithMax* limits (ErrLimitExceeded, exercised by the
-// TestPartB_* tests, which cap an otherwise-valid value) and from truncation
-// (ErrIncomplete): the range check fires on the header varint alone, before any
-// payload, so these inputs deliberately carry none. Complements the at-limit
-// value 0x7FFF_FFFF exercised in limits_test.go, which passes the check.
+// from a receiver-side cap (ErrLimitExceeded, which the destination raises and
+// collectors_test.go exercises) and from truncation (ErrIncomplete): the range
+// check fires on the header varint alone, before any payload, so these inputs
+// deliberately carry none. Complements the at-limit value 0x7FFF_FFFF exercised
+// in limits_test.go, which passes the check.
 //
 // The count check lives in arrayCount (decoder.go / cursor.go), and every skip
 // path routes its count through it too, so a skipped array is held to the same
@@ -574,26 +576,37 @@ func TestSkipIntegerArrayCountChecked(t *testing.T) {
 	}
 }
 
-// TestSkipIntegerArrayHonoursArrayCountLimit pins the receiver-side half of the
-// same count word (§6.2.1): a skipped integer array goes through the configured
-// WithMaxArrayCount cap, reported as ErrLimitExceeded and never conflated with
-// ErrInvalidMsg — matching what the visitor path already did with the identical
-// bytes and options. The fixlen-array twin is
-// TestSkipFixlenArrayHonoursArrayCountLimit.
-func TestSkipIntegerArrayHonoursArrayCountLimit(t *testing.T) {
-	in := append(append(vhdr(0, sofab.TypeVarintArrayUnsigned), vbytes(2)...), 0x01, 0x02)
-
-	// Under a cap of 1 the two-element array is refused on every surface.
-	for _, surface := range surfaces {
-		if _, err := drainSkipping(surface, in, sofab.WithMaxArrayCount(1)); !errors.Is(err, sofab.ErrLimitExceeded) {
-			t.Fatalf("%s = %v, want ErrLimitExceeded", surface, err)
-		} else if errors.Is(err, sofab.ErrInvalidMsg) {
-			t.Fatalf("%s = %v, must not also match ErrInvalidMsg", surface, err)
-		}
-		// At the cap it decodes cleanly.
-		if _, err := drainSkipping(surface, in, sofab.WithMaxArrayCount(2)); err != nil {
-			t.Fatalf("%s at the cap = %v, want clean decode", surface, err)
-		}
+// TestSkippedFieldIsNeverCapped is the inversion of the two tests that used to
+// stand here (TestSkipIntegerArrayHonoursArrayCountLimit and its fixlen twin).
+// They asserted that a SKIPPED array went through the decoder's configured cap —
+// which CORELIB_PLAN §6.2.1 forbids in terms: "A skipped field is never capped. A
+// limit bounds an allocation, and a field the handler skips allocates nothing —
+// it is walked, not materialized ... so a decode that steps over an over-cap
+// field it was never going to read stays COMPLETE."
+//
+// It holds structurally now — a cap lives in a destination callback and a
+// skipped field reaches no callback — so what is left to pin is the outcome: a
+// walk over an integer array, a fixlen array, a string and a blob, none of them
+// bound to anything, is a CLEAN decode on every surface.
+func TestSkippedFieldIsNeverCapped(t *testing.T) {
+	cases := map[string][]byte{
+		"integer array": append(append(vhdr(0, sofab.TypeVarintArrayUnsigned), vbytes(64)...),
+			bytes.Repeat([]byte{0x01}, 64)...),
+		"fixlen array": append(append(vhdr(0, sofab.TypeFixlenArray), vbytes(8)...),
+			append(vbytes((4<<3)|subFP32), make([]byte, 32)...)...),
+		"string": append(append(vhdr(0, sofab.TypeFixlen), vbytes((64<<3)|subStr)...),
+			bytes.Repeat([]byte{'x'}, 64)...),
+		"blob": append(append(vhdr(0, sofab.TypeFixlen), vbytes((64<<3)|subBlob)...),
+			bytes.Repeat([]byte{0xAB}, 64)...),
+	}
+	for name, in := range cases {
+		t.Run(name, func(t *testing.T) {
+			for _, surface := range surfaces {
+				if _, err := drainSkipping(surface, in); err != nil {
+					t.Fatalf("%s = %v, want a clean decode (§6.2.1)", surface, err)
+				}
+			}
+		})
 	}
 }
 
@@ -751,29 +764,6 @@ func TestSkipFixlenHeaderChecked(t *testing.T) {
 				t.Fatalf("Feed = %v, want %v (pull and visitor must agree)", serr, c.want)
 			}
 		})
-	}
-}
-
-// TestSkipFixlenArrayHonoursArrayCountLimit pins the receiver-side half of the
-// same header (§6.2.1): the count word of a skipped fixlen array goes through the
-// configured WithMaxArrayCount cap, reported as ErrLimitExceeded and never
-// conflated with ErrInvalidMsg — matching what the visitor path already did with
-// the identical bytes and options.
-func TestSkipFixlenArrayHonoursArrayCountLimit(t *testing.T) {
-	in := append(append(vhdr(0, sofab.TypeFixlenArray), vbytes(2)...),
-		append(vbytes((4<<3)|subFP32), 0, 0, 0, 0, 0, 0, 0, 0)...)
-
-	// Under a cap of 1 the two-element array is refused on every surface.
-	for _, surface := range surfaces {
-		if _, err := drainSkipping(surface, in, sofab.WithMaxArrayCount(1)); !errors.Is(err, sofab.ErrLimitExceeded) {
-			t.Fatalf("%s = %v, want ErrLimitExceeded", surface, err)
-		} else if errors.Is(err, sofab.ErrInvalidMsg) {
-			t.Fatalf("%s = %v, must not also match ErrInvalidMsg", surface, err)
-		}
-		// At the cap it decodes cleanly.
-		if _, err := drainSkipping(surface, in, sofab.WithMaxArrayCount(2)); err != nil {
-			t.Fatalf("%s at the cap = %v, want clean decode", surface, err)
-		}
 	}
 }
 

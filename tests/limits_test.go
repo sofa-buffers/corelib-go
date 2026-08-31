@@ -69,96 +69,87 @@ func TestPartA_NoEagerAllocFromWireCount(t *testing.T) {
 	}
 }
 
-// TestPartB_ArrayCountLimit is the Part B acceptance test for WithMaxArrayCount:
-// with the limit set, an otherwise-valid message whose array exceeds it fails
-// with ErrLimitExceeded; the identical message decodes cleanly with no limit,
-// and a message exactly at the limit is accepted.
-func TestPartB_ArrayCountLimit(t *testing.T) {
-	const limit = 65536
-	over := encodeUnsignedArray(t, 1, make([]uint64, limit+1))
-	at := encodeUnsignedArray(t, 1, make([]uint64, limit))
+// The Part B acceptance tests that lived here — TestPartB_ArrayCountLimit,
+// _StringAndBlobLimit, _LimitEnforcedBeforePayload, _LimitDistinctFromInvalid —
+// drove WithMaxArrayCount / WithMaxStringLen / WithMaxBlobLen, which no longer
+// exist. CORELIB_PLAN §6.2.1 puts the numbers with the layer that knows the
+// schema and the target — "The codec never invents a limit of its own and never
+// clamps to one" — so what they asserted now belongs to the destination and is
+// asserted in collectors_test.go (TestSeqReceiverCapIsPolicyNotInvalid and the
+// tests around it), for the collectors, and to the generated visitor arms for a
+// scalar or a native array.
+//
+// What is left to assert HERE is the negative: the codec applies no cap of its
+// own, whatever the wire announces.
 
-	// No limit: the oversize message decodes fine (default = today's behavior).
-	if err := acceptBytes(over, baseV{}); err != nil {
-		t.Fatalf("no-limit decode = %v, want nil", err)
+// TestCodecInventsNoLimit is the §6.2.1 negative on every entry point: a header
+// announcing a size no deployment would accept — up to ARRAY_MAX itself — is the
+// codec's business only as far as the format ceiling goes. The bytes are
+// truncated, so the verdict is ErrIncomplete, and it must be ErrIncomplete
+// rather than ErrLimitExceeded: nothing here holds a number to compare against,
+// and a decoder that invented one would be deciding a policy that is not its to
+// decide.
+func TestCodecInventsNoLimit(t *testing.T) {
+	cases := []struct {
+		name string
+		in   []byte
+	}{
+		// Array header + a count at ARRAY_MAX, no elements follow.
+		{"array count", append(vhdr(0, sofab.TypeVarintArrayUnsigned), vbytes(arrayMaxCount)...)},
+		// A string header claiming 2000 bytes, no payload follows.
+		{"string length", append(vhdr(0, sofab.TypeFixlen), vbytes((2000<<3)|subStr)...)},
+		// The blob twin.
+		{"blob length", append(vhdr(0, sofab.TypeFixlen), vbytes((2000<<3)|subBlob)...)},
 	}
-	// With the limit, the same bytes are rejected as ErrLimitExceeded.
-	if err := acceptBytes(over, baseV{}, sofab.WithMaxArrayCount(limit)); !errors.Is(err, sofab.ErrLimitExceeded) {
-		t.Fatalf("over-limit visitor = %v, want ErrLimitExceeded", err)
-	}
-	// Exactly at the limit is allowed (reject is strictly greater-than).
-	if err := acceptBytes(at, baseV{}, sofab.WithMaxArrayCount(limit)); err != nil {
-		t.Fatalf("at-limit visitor = %v, want nil", err)
-	}
-	// The chunked feed enforces the same limit on the same bytes: the cap is
-	// judged at the count word, so it does not depend on where a chunk boundary
-	// fell.
-	if err := feedIn(over, 1, baseV{}, sofab.WithMaxArrayCount(limit)); !errors.Is(err, sofab.ErrLimitExceeded) {
-		t.Fatalf("over-limit Feed = %v, want ErrLimitExceeded", err)
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			for _, surface := range surfaces {
+				_, err := decodeAll(t, surface, c.in)
+				if !errors.Is(err, sofab.ErrIncomplete) {
+					t.Fatalf("%s = %v, want ErrIncomplete", surface, err)
+				}
+				if errors.Is(err, sofab.ErrLimitExceeded) {
+					t.Fatalf("%s = %v: the codec must hold no cap of its own (§6.2.1)", surface, err)
+				}
+			}
+		})
 	}
 }
 
-// TestPartB_StringAndBlobLimit checks WithMaxStringLen / WithMaxBlobLen the same
-// way: over the limit rejects with ErrLimitExceeded, no limit and at-limit pass.
-func TestPartB_StringAndBlobLimit(t *testing.T) {
-	const limit = 1024
-	strOver := encodeString(t, 1, strings.Repeat("a", limit+1))
-	strAt := encodeString(t, 1, strings.Repeat("a", limit))
-	blobOver := encodeBlob(t, 1, bytes.Repeat([]byte{0xAB}, limit+1))
-	blobAt := encodeBlob(t, 1, bytes.Repeat([]byte{0xAB}, limit))
-
-	// String.
-	if err := acceptBytes(strOver, baseV{}); err != nil {
-		t.Fatalf("no-limit string decode = %v, want nil", err)
+// TestCodecDecodesAWholeOversizeField is the same rule with the payload actually
+// present: a 4096-byte string and a 4096-element array are sizes a deployment
+// might well refuse, and every one of them decodes here, because the refusal
+// belongs to a destination that was handed a number and this one was not.
+func TestCodecDecodesAWholeOversizeField(t *testing.T) {
+	msgs := [][]byte{
+		encodeUnsignedArray(t, 1, make([]uint64, 4096)),
+		encodeString(t, 1, strings.Repeat("a", 4096)),
+		encodeBlob(t, 1, bytes.Repeat([]byte{0xAB}, 4096)),
 	}
-	if err := acceptBytes(strOver, baseV{}, sofab.WithMaxStringLen(limit)); !errors.Is(err, sofab.ErrLimitExceeded) {
-		t.Fatalf("over-limit string = %v, want ErrLimitExceeded", err)
-	}
-	if err := acceptBytes(strAt, baseV{}, sofab.WithMaxStringLen(limit)); err != nil {
-		t.Fatalf("at-limit string = %v, want nil", err)
-	}
-	// A blob limit does not restrict a string, and vice versa.
-	if err := acceptBytes(strOver, baseV{}, sofab.WithMaxBlobLen(limit)); err != nil {
-		t.Fatalf("string under blob-only limit = %v, want nil", err)
-	}
-
-	// Blob.
-	if err := acceptBytes(blobOver, baseV{}, sofab.WithMaxBlobLen(limit)); !errors.Is(err, sofab.ErrLimitExceeded) {
-		t.Fatalf("over-limit blob = %v, want ErrLimitExceeded", err)
-	}
-	if err := acceptBytes(blobAt, baseV{}, sofab.WithMaxBlobLen(limit)); err != nil {
-		t.Fatalf("at-limit blob = %v, want nil", err)
-	}
-
-	// The chunked feed, blob.
-	if err := feedIn(blobOver, 1, baseV{}, sofab.WithMaxBlobLen(limit)); !errors.Is(err, sofab.ErrLimitExceeded) {
-		t.Fatalf("over-limit blob Feed = %v, want ErrLimitExceeded", err)
+	for i, msg := range msgs {
+		if err := acceptBytes(msg, baseV{}); err != nil {
+			t.Fatalf("case %d: AcceptBytes = %v, want nil", i, err)
+		}
+		if err := feedIn(msg, 1, baseV{}); err != nil {
+			t.Fatalf("case %d: byte-at-a-time Feed = %v, want nil", i, err)
+		}
 	}
 }
 
-// TestPartB_LimitEnforcedBeforePayload proves the limit is applied at the header,
-// before any payload is buffered: a header claiming an oversize count/length with
-// NO payload bytes at all still fails with ErrLimitExceeded (not ErrIncomplete).
-func TestPartB_LimitEnforcedBeforePayload(t *testing.T) {
-	// Array header + count, no elements follow.
-	arr := append(vhdr(0, sofab.TypeVarintArrayUnsigned), vbytes(arrayMaxCount)...)
-	if err := acceptBytes(arr, baseV{}, sofab.WithMaxArrayCount(1000)); !errors.Is(err, sofab.ErrLimitExceeded) {
-		t.Fatalf("array header-only = %v, want ErrLimitExceeded", err)
-	}
-	// String header claiming 2000 bytes, no payload follows.
-	str := append(vhdr(0, sofab.TypeFixlen), vbytes((2000<<3)|subStr)...)
-	if err := acceptBytes(str, baseV{}, sofab.WithMaxStringLen(1000)); !errors.Is(err, sofab.ErrLimitExceeded) {
-		t.Fatalf("string header-only = %v, want ErrLimitExceeded", err)
-	}
-}
-
-// TestPartB_LimitDistinctFromInvalid locks the sentinel semantics: a limit
-// rejection is ErrLimitExceeded and is NOT confused with ErrInvalidMsg or
-// ErrIncomplete (differential fuzzing must not read it as a conformance
-// divergence). A non-positive limit means unlimited.
-func TestPartB_LimitDistinctFromInvalid(t *testing.T) {
-	over := encodeUnsignedArray(t, 1, make([]uint64, 11))
-	err := acceptBytes(over, baseV{}, sofab.WithMaxArrayCount(10))
+// TestLimitExceededStaysADistinctCategory keeps the §6.3 sentinel property that
+// TestPartB_LimitDistinctFromInvalid used to hold: whoever raises it, a policy
+// rejection is never conflated with a malformed message or a truncated one. The
+// raiser is now a collector — the receiver cap is its RCap — and the decoder
+// carries the error back out through the ordinary visitor path unchanged.
+func TestLimitExceededStaysADistinctCategory(t *testing.T) {
+	var out []string
+	// Three elements, a receiver cap of two, and no schema bound in sight.
+	raw := wrapperSeq(t, func(e *sofab.Encoder) {
+		for i := 0; i < 3; i++ {
+			_ = e.WriteString(sofab.ID(i), "x")
+		}
+	})
+	err := collect(raw, sofab.NewStringSeq(&out, sofab.Bounds{}, capArray(2)))
 	if !errors.Is(err, sofab.ErrLimitExceeded) {
 		t.Fatalf("= %v, want ErrLimitExceeded", err)
 	}
@@ -167,13 +158,6 @@ func TestPartB_LimitDistinctFromInvalid(t *testing.T) {
 	}
 	if errors.Is(err, sofab.ErrIncomplete) {
 		t.Fatal("ErrLimitExceeded must not match ErrIncomplete")
-	}
-	// A non-positive limit is treated as no limit at all.
-	if err := acceptBytes(over, baseV{}, sofab.WithMaxArrayCount(0)); err != nil {
-		t.Fatalf("zero (unlimited) limit = %v, want nil", err)
-	}
-	if err := acceptBytes(over, baseV{}, sofab.WithMaxArrayCount(-1)); err != nil {
-		t.Fatalf("negative (unlimited) limit = %v, want nil", err)
 	}
 }
 
