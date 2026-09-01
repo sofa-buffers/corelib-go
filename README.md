@@ -503,6 +503,12 @@ go test ./... -cover     # with coverage
 
 # The documented footprint build, with the validator compiled out. CI runs it too.
 go test -tags sofab_no_strict_utf8 ./...
+
+# The shared vector suite on its own. Run this way it prints how many vectors
+# and how many checks each scenario executed; `go test ./...` buffers a passing
+# package's output away, so the counts only appear per package.
+go test ./tests/
+SOFAB_VECTOR_SUMMARY=/tmp/vectors.txt go test ./tests/   # same, also written to a file
 ```
 
 Tests cover the shared conformance suite (`vectors_test.go`), chunked and
@@ -514,6 +520,26 @@ truncated inputs are declared once as `malformedCases` in `malformed_test.go`
 and driven at every chunking, so a new case holds them all by construction. `alloc_conformance_test.go` carries the
 allocation measurement, and `readme_example_test.go` compiles and runs the
 generated-code example in this README so the docs cannot drift from the API.
+
+`assets/test_vectors.json` is copied verbatim from `corelib-c-cpp`, which owns
+it, along with the format description
+([`test_vectors_README.md`](https://github.com/sofa-buffers/corelib-c-cpp/blob/main/assets/test_vectors_README.md)).
+Every vector that carries `skip_ids` is also replayed with those ids left
+unread — at every nesting level, and one byte at a time — so a field the
+receiver declines is proven to be walked to exactly its last byte whatever its
+wire type. `vectors_report_test.go` states what ran and guards the corpus
+against silently shrinking, including that the skip matrix really covers all 100
+(read, skipped) construct pairs. Where the shared corpus stops,
+`skip_count_width_test.go` continues: it skips arrays and payloads whose element
+count or length crosses each varint width boundary (127/128, 16383/16384), which
+the shared vectors reach only at 130. `sequence_growth_test.go` runs the file's third block (CORELIB_PLAN §7.2
+item 8): a wrapper array carries no element count, so its length is *highest
+present id + 1* and the container grows as elements arrive — in the collector
+layer, never in the codec. Two ports that grow differently emit identical bytes,
+so those cases are keyed by a delivery sequence of element ids instead, and the
+port builds the message itself and asserts the resulting container length and
+outcome. Growth geometry is pinned separately, by
+`TestSequenceGrowthIsGeometric` in `collectors_test.go`.
 
 ## Benchmarks
 
