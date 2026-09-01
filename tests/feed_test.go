@@ -78,6 +78,7 @@ func TestFeedIsChunkInvariant(t *testing.T) {
 			t.Fatalf("hex: %v", err)
 		}
 		want := strings.Join(expectLog(t, v.Fields), "|")
+		checks := 0
 		for _, chunk := range []int{0, 1, 2, len(raw)/2 + 1} {
 			t.Run(fmt.Sprintf("%s/chunk-%d", v.Name, chunk), func(t *testing.T) {
 				var got []string
@@ -87,6 +88,7 @@ func TestFeedIsChunkInvariant(t *testing.T) {
 				if strings.Join(got, "|") != want {
 					t.Fatalf("event mismatch\n got: %v\nwant: %v", got, want)
 				}
+				checks++
 			})
 		}
 		t.Run(v.Name+"/reader", func(t *testing.T) {
@@ -98,7 +100,9 @@ func TestFeedIsChunkInvariant(t *testing.T) {
 			if strings.Join(got, "|") != want {
 				t.Fatalf("event mismatch\n got: %v\nwant: %v", got, want)
 			}
+			checks++
 		})
+		vecRan("decode/chunked", checks)
 	}
 }
 

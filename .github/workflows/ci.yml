@@ -1,5 +1,17 @@
 name: CI
 
+# Which refs CI runs on, and why that satisfies "on push and PR".
+#
+# `push` is filtered to main and `pull_request` to PRs targeting main -- the
+# repo-wide convention, kept here deliberately. Between them every commit is
+# covered twice over: once as the PR that proposes it and once as the push that
+# lands it. Dropping the filter would ALSO run the whole matrix on every push to
+# a branch that already has a PR open, doubling the load on an account with 20
+# Actions slots for no extra signal.
+#
+# The consequence, worth knowing before you push: a commit on a feature branch
+# with no PR open runs nothing. Open the PR (or use workflow_dispatch) to get a
+# run. Everything below, the `vectors` job included, follows this rule.
 on:
   push:
     branches: [main]
@@ -86,6 +98,51 @@ jobs:
 
       - name: Test (race)
         run: go test -race ./...
+
+  vectors:
+    # The shared conformance corpus (assets/test_vectors.json, copied verbatim
+    # from corelib-c-cpp -- CORELIB_PLAN §7.1/§8) gets its own job so the run
+    # output STATES what it executed: how many vectors each scenario replayed
+    # and how many assertions it made, including the skip-ids scenario and its
+    # byte-at-a-time variant (§7.2 items 4 and 7).
+    #
+    # It is not extra testing -- build-test already runs these tests as part of
+    # `go test ./...`. It is the reporting: `go test ./...` buffers a passing
+    # package's output and throws it away, so the counts would never reach the
+    # log. Running the one package writes them out, and SOFAB_VECTOR_SUMMARY
+    # captures them independently of how `go test` chooses to buffer.
+    #
+    # Triggers are the repo-wide ones (see the note on `on:` at the top): the
+    # skip cases run on every PR into main and on every commit that lands there.
+    name: shared vector suite
+    needs: [lint]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: stable
+          check-latest: true
+
+      - name: Download modules
+        run: go mod download
+
+      - name: Run the vector suite
+        env:
+          # Absolute: `go test` runs the binary with the package directory as
+          # its working directory.
+          SOFAB_VECTOR_SUMMARY: ${{ github.workspace }}/vector-summary.txt
+        run: go test -race -count=1 ./tests/
+
+      - name: Report vectors and checks executed
+        run: |
+          echo "::group::shared vector suite"
+          cat "${{ github.workspace }}/vector-summary.txt"
+          echo "::endgroup::"
+          cat "${{ github.workspace }}/vector-summary.txt" >> "$GITHUB_STEP_SUMMARY"
 
   no-strict-utf8:
     # CORELIB_PLAN §6.4 lets a footprint profile "compile the check out

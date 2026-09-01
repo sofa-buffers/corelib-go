@@ -64,6 +64,13 @@ type vectorFile struct {
 	Version     int          `json:"version"`
 	Vectors     []vector     `json:"vectors"`
 	InvalidUTF8 []utf8Vector `json:"invalid_utf8"`
+
+	// sequence_growth is the corpus for CORELIB_PLAN §7.2 item 8, which this
+	// port does not run yet (tracked as #137). It is declared so the block is
+	// explicitly TOLERATED and reportable rather than silently discarded by the
+	// JSON decoder -- the shared file is copied verbatim (§7.1/§8), so a block
+	// this port has no scenario for must not make the load fail or warn.
+	SequenceGrowth json.RawMessage `json:"sequence_growth"`
 }
 
 // loadVectors reads the shared vector file.
@@ -94,6 +101,24 @@ func loadVectors(t *testing.T) vectorFile {
 	if vf.Format != "sofabuffers-test-vectors" || vf.Version != sofab.APIVersion {
 		t.Fatalf("unexpected vector file: format=%q version=%d (APIVersion=%d)",
 			vf.Format, vf.Version, sofab.APIVersion)
+	}
+	if len(vf.Vectors) == 0 {
+		t.Fatal("vector file carries no vectors")
+	}
+	// Nothing above imposes a size limit: ids, skip_ids, element counts and
+	// payloads all decode into Go values that grow (an id too wide for uint32
+	// would fail the unmarshal, loudly, rather than wrap). What CAN still go
+	// unnoticed is a vector whose declared length and hex disagree, so check
+	// that here -- the corpus is machine-generated, and a mismatch means the
+	// file was hand-edited, which §7.1 forbids.
+	for _, v := range vf.Vectors {
+		if len(v.Serialized.Hex)%2 != 0 {
+			t.Fatalf("%s: serialized.hex has an odd length (%d)", v.Name, len(v.Serialized.Hex))
+		}
+		if got := len(v.Serialized.Hex) / 2; got != v.Serialized.Length {
+			t.Fatalf("%s: serialized.hex is %d bytes but serialized.length says %d",
+				v.Name, got, v.Serialized.Length)
+		}
 	}
 	return vf
 }
@@ -278,6 +303,7 @@ func TestVectorEncode(t *testing.T) {
 			if buf.Len() != v.Serialized.Length {
 				t.Fatalf("length = %d, want %d", buf.Len(), v.Serialized.Length)
 			}
+			vecRan("encode", 2) // bytes, length
 		})
 	}
 }
@@ -328,6 +354,7 @@ func TestVectorEncodeOverCallerBuffer(t *testing.T) {
 			if got := hex.EncodeToString(out.Bytes()); got != v.Serialized.Hex {
 				t.Fatalf("min-buffer encode mismatch\n got: %s\nwant: %s", got, v.Serialized.Hex)
 			}
+			vecRan("encode/caller-buffer", 2) // no-sink bytes, min-buffer bytes
 		})
 	}
 }
@@ -404,6 +431,143 @@ func (v skipIDsV) EndSequence() error {
 	return nil
 }
 
+// skipUnreadV is the second, stronger skip destination: it sits on the
+// corelib's OWN decode surface (§5.3.1), with the aggregate adapter behind it,
+// and drops a skipped id BEFORE any assembly happens — no FixlenBegin, no
+// payload piece appended, no array element accumulated, no begin/end forwarded.
+// The field is genuinely left unread, which is what `skip_ids` means on a push
+// API where a destination "skips" by having nothing bound to the id.
+//
+// skipIDsV above filters the recorded log instead, which is the weaker half:
+// the adapter still assembles the skipped value. Running both matters because
+// only this one leaves the decoder to locate the next field from the wire
+// alone — so a skip that consumes one byte too many or too few surfaces as a
+// wrong anchor value rather than being papered over by the destination.
+//
+// A skipped SEQUENCE id is declined outright (BeginSequence returns nil), which
+// is the decoder's own skip path: the sub-tree is walked to its end marker at
+// any depth and nothing inside it is delivered.
+type skipUnreadV struct {
+	skip map[uint32]bool
+	in   sofab.Visitor // assembles the fields that are kept
+}
+
+func (v *skipUnreadV) drop(id sofab.ID) bool { return v.skip[uint32(id)] }
+
+func (v *skipUnreadV) Unsigned(id sofab.ID, x uint64) error {
+	if v.drop(id) {
+		return nil
+	}
+	return v.in.Unsigned(id, x)
+}
+
+func (v *skipUnreadV) Signed(id sofab.ID, x int64) error {
+	if v.drop(id) {
+		return nil
+	}
+	return v.in.Signed(id, x)
+}
+
+func (v *skipUnreadV) Float32(id sofab.ID, x float32) error {
+	if v.drop(id) {
+		return nil
+	}
+	return v.in.Float32(id, x)
+}
+
+func (v *skipUnreadV) Float64(id sofab.ID, x float64) error {
+	if v.drop(id) {
+		return nil
+	}
+	return v.in.Float64(id, x)
+}
+
+func (v *skipUnreadV) FixlenBegin(id sofab.ID, sub sofab.FixlenSubtype, total int) error {
+	if v.drop(id) {
+		return nil
+	}
+	return v.in.FixlenBegin(id, sub, total)
+}
+
+func (v *skipUnreadV) String(id sofab.ID, total, offset int, chunk []byte) error {
+	if v.drop(id) {
+		return nil
+	}
+	return v.in.String(id, total, offset, chunk)
+}
+
+func (v *skipUnreadV) Bytes(id sofab.ID, total, offset int, chunk []byte) error {
+	if v.drop(id) {
+		return nil
+	}
+	return v.in.Bytes(id, total, offset, chunk)
+}
+
+func (v *skipUnreadV) ArrayBegin(id sofab.ID, kind sofab.ArrayKind, count int) error {
+	if v.drop(id) {
+		return nil
+	}
+	return v.in.ArrayBegin(id, kind, count)
+}
+
+func (v *skipUnreadV) ArrayUnsigned(id sofab.ID, i int, x uint64) error {
+	if v.drop(id) {
+		return nil
+	}
+	return v.in.ArrayUnsigned(id, i, x)
+}
+
+func (v *skipUnreadV) ArraySigned(id sofab.ID, i int, x int64) error {
+	if v.drop(id) {
+		return nil
+	}
+	return v.in.ArraySigned(id, i, x)
+}
+
+func (v *skipUnreadV) ArrayFloat32(id sofab.ID, i int, x float32) error {
+	if v.drop(id) {
+		return nil
+	}
+	return v.in.ArrayFloat32(id, i, x)
+}
+
+func (v *skipUnreadV) ArrayFloat64(id sofab.ID, i int, x float64) error {
+	if v.drop(id) {
+		return nil
+	}
+	return v.in.ArrayFloat64(id, i, x)
+}
+
+func (v *skipUnreadV) ArrayEnd(id sofab.ID) error {
+	if v.drop(id) {
+		return nil
+	}
+	return v.in.ArrayEnd(id)
+}
+
+func (v *skipUnreadV) BeginSequence(id sofab.ID) (sofab.Visitor, error) {
+	if v.drop(id) {
+		return nil, nil // the decoder walks the whole sub-tree and delivers none of it
+	}
+	child, err := v.in.BeginSequence(id)
+	if err != nil || child == nil {
+		return child, err
+	}
+	// The same ids are skipped at every nesting level, so the child is filtered
+	// exactly like its parent.
+	return &skipUnreadV{skip: v.skip, in: child}, nil
+}
+
+func (v *skipUnreadV) EndSequence() error { return v.in.EndSequence() }
+
+// SetStringCheck forwards the decode's UTF-8 policy to the destination behind
+// the filter, which is where §6.4 has it applied.
+func (v *skipUnreadV) SetStringCheck(p sofab.StringCheck) {
+	if sp, ok := v.in.(sofab.StringPolicyVisitor); ok {
+		sp.SetStringCheck(p)
+	}
+}
+
 // expectSkipped is expectLog with the skipped ids — and, for a skipped
 // sequence, its whole sub-tree — removed.
 func expectSkipped(t *testing.T, fields []vecField, skip map[uint32]bool) []string {
@@ -425,10 +589,20 @@ func expectSkipped(t *testing.T, fields []vecField, skip map[uint32]bool) []stri
 	return expectLog(t, kept)
 }
 
+// skipEntryPoints is how many decode entry points the skip-ids scenario replays
+// each vector through (see `runs` below). Three of them feed one byte at a
+// time, which is where a resync bug that a single-buffer feed hides shows up;
+// two use the destination that leaves a skipped field entirely unread.
+const skipEntryPoints = 6
+
 // TestVectorSkipIDs drives the skip-ids decode scenario: for every vector that
-// carries skip_ids, the listed field ids are skipped (at every nesting level)
-// while the rest decode normally. Run all-at-once and one-byte-at-a-time to prove
-// skipping resumes across any read boundary (the chunked variant).
+// carries skip_ids -- 58 of them since corelib-c-cpp#160 was adopted here, up
+// from 8 -- the listed field ids are left unread at every nesting level, so the
+// decoder auto-skips the field whatever its wire type, and the whole sub-tree
+// when the id names a sequence. Everything else must still decode to its exact
+// value and the message must be fully consumed. Run all-at-once AND
+// one-byte-at-a-time, so every skip is also exercised across chunk boundaries
+// (CORELIB_PLAN §7.2 items 4 and 7).
 func TestVectorSkipIDs(t *testing.T) {
 	vf := loadVectors(t)
 	ran := 0
@@ -459,21 +633,42 @@ func TestVectorSkipIDs(t *testing.T) {
 				return feedFrom(iotest.OneByteReader(bytes.NewReader(raw)), 1, vis)
 			},
 		}
+		// The same two chunkings again, but through the destination that leaves
+		// a skipped field genuinely unread (skipUnreadV) instead of filtering it
+		// out of the log afterwards.
+		unread := func(vis any) sofab.Visitor {
+			return &skipUnreadV{skip: skip, in: asVisitor(vis)}
+		}
+		runs["AcceptBytes/unread"] = func(vis any) error {
+			return acceptBytes(raw, unread(vis))
+		}
+		runs["Feed/1-byte/unread"] = func(vis any) error {
+			return feedIn(raw, 1, unread(vis))
+		}
+		if len(runs) != skipEntryPoints {
+			t.Fatalf("skipEntryPoints = %d, but %d entry points are wired up", skipEntryPoints, len(runs))
+		}
+		checks := 0
 		for name, run := range runs {
 			t.Run(v.Name+"/"+name, func(t *testing.T) {
 				var log []string
 				if err := run(skipIDsV{skip: skip, log: &log}); err != nil {
 					t.Fatalf("%s = %v, want COMPLETE", name, err)
 				}
+				checks++ // the message was fully consumed (COMPLETE)
 				if got := strings.Join(log, "|"); got != want {
 					t.Fatalf("%s events =\n %s\nwant\n %s", name, got, want)
 				}
+				checks++ // every surviving field decoded to its exact value
 			})
 		}
+		vecRan("decode/skip-ids", checks)
 	}
 	if ran == 0 {
 		t.Fatal("no vectors carried skip_ids; expected the suite to exercise the skip-ids scenario")
 	}
+	t.Logf("skip-ids scenario: %d of %d vectors x %d entry points (three of them byte-at-a-time)",
+		ran, len(vf.Vectors), skipEntryPoints)
 }
 
 // --- requires (capability tags) ----------------------------------------------
@@ -593,6 +788,7 @@ func TestVectorRequires(t *testing.T) {
 			if got := deriveRequires(t, v); !sameCaps(got, want) {
 				t.Fatalf("requires mismatch: declared %v, derived from fields %v", want, got)
 			}
+			vecRan("requires", len(v.Requires)+1)
 		})
 	}
 	if withRequires == 0 {
@@ -660,6 +856,7 @@ func TestVectorInvalidUTF8(t *testing.T) {
 			if err := acceptBytes(wire, &bindStrV{id: id + 1}); err != nil {
 				t.Fatalf("skipped payload = %v, want nil", err)
 			}
+			vecRan("invalid-utf8", 4) // outcomes, encode verdict, decode verdict, skipped payload
 		})
 	}
 }

@@ -196,6 +196,7 @@ func TestVisitorDecodesAllVectors(t *testing.T) {
 			if strings.Join(got, "|") != strings.Join(want, "|") {
 				t.Fatalf("event mismatch\n got: %v\nwant: %v", got, want)
 			}
+			vecRan("decode/visitor", 1)
 		})
 	}
 }
