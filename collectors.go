@@ -430,6 +430,37 @@ func PlaceRow[T any](out *[][]T, b Bounds, c Caps, id ID, row []T) error {
 	return nil
 }
 
+// rowGate is the MESSAGE_SPEC §7.3 latch every matrix collector carries, and
+// the reason it exists is that a row's verdict and a row's placement are two
+// different callbacks.
+//
+// ArrayBegin is where the decision is made — the wire kind either matches the
+// declared element type or it names another field's shape — but ArrayEnd is
+// where the row would be bounds-checked and PLACED, and the codec pairs every
+// ArrayBegin with an ArrayEnd whatever the destination said about the first
+// (istream.go delivers both, including for an empty array). Without a latch,
+// ArrayEnd cannot tell a row this collector DECLINED from one it accepted, so a
+// skipped field is judged against bounds it was never subject to and stored at
+// a slot it never claimed. §7.3 gives it neither: a skipped field is walked, and
+// that is all it does.
+//
+// One bool with one implementation, embedded by all five matrix collectors,
+// because the rule is the same rule five times and a half-applied fix here is
+// invisible — the declined row and the gap row print identically.
+type rowGate struct{ declined bool }
+
+// mine records the ArrayBegin verdict for the ArrayEnd that will follow, and
+// reports it: true when the row is this array's value, false when §7.3 declined
+// it and the collector must return without measuring or opening anything.
+func (g *rowGate) mine(ok bool) bool { g.declined = !ok; return ok }
+
+// ended reports whether the row now closing was the declined one, clearing the
+// latch for the next row either way. A hand-driven ArrayEnd with no ArrayBegin
+// before it reads false, which is what keeps the standalone PlaceRow path — the
+// second half of §6.2.1's "one implementation however the bound was stated" —
+// reachable.
+func (g *rowGate) ended() bool { d := g.declined; g.declined = false; return d }
+
 // The matrix collectors: an array whose elements are themselves NATIVE arrays.
 //
 // Each row arrives as ArrayBegin, one element callback per element, ArrayEnd —
@@ -443,7 +474,8 @@ func PlaceRow[T any](out *[][]T, b Bounds, c Caps, id ID, row []T) error {
 // The finished row is handed to PlaceRow at ArrayEnd and the collector drops it,
 // so the next row starts from a fresh slice and no placed row is written over.
 // An array the message truncates never reaches ArrayEnd, so no partial row is
-// ever placed.
+// ever placed — and a row DECLINED at ArrayBegin under §7.3 does not reach
+// PlaceRow either, which is what rowGate below is for.
 //
 // Each carries FOUR bounds, two per axis, because a matrix has two:
 //
@@ -470,6 +502,7 @@ func PlaceRow[T any](out *[][]T, b Bounds, c Caps, id ID, row []T) error {
 // the check off rather than running one that can never fire.
 type UnsignedMatrixSeq[T Unsigned] struct {
 	VisitorBase
+	rowGate
 	out *[][]T
 	b   Bounds
 	row Bounds
@@ -487,10 +520,12 @@ func NewUnsignedMatrixSeq[T Unsigned](out *[][]T, b, row Bounds, c Caps, hi uint
 	return &UnsignedMatrixSeq[T]{out: out, b: b, row: row, c: c, hi: hi}
 }
 
-// ArrayBegin bounds the row id and the row's announced element count, then
-// opens a fresh row.
+// ArrayBegin declines a row whose wire kind is not this array's (§7.3), and
+// otherwise bounds the row id and the row's announced element count and opens a
+// fresh row. The decline is latched for ArrayEnd: neither bound is a declined
+// row's to answer to.
 func (s *UnsignedMatrixSeq[T]) ArrayBegin(id ID, kind ArrayKind, count int) error {
-	if kind != ArrayUnsigned {
+	if !s.mine(kind == ArrayUnsigned) {
 		return nil
 	}
 	if err := overIndex(id, s.b.Count, s.c.ArrayCount); err != nil {
@@ -512,8 +547,13 @@ func (s *UnsignedMatrixSeq[T]) ArrayUnsigned(_ ID, _ int, v uint64) error {
 	return nil
 }
 
-// ArrayEnd places the finished row at its element id.
+// ArrayEnd places the finished row at its element id, unless ArrayBegin
+// declined the row under §7.3 — in which case nothing is measured and nothing
+// is placed.
 func (s *UnsignedMatrixSeq[T]) ArrayEnd(id ID) error {
+	if s.ended() {
+		return nil
+	}
 	row := s.cur
 	s.cur = nil
 	return PlaceRow(s.out, s.b, s.c, id, arrivedRow(row))
@@ -527,6 +567,7 @@ func (s *UnsignedMatrixSeq[T]) ArrayEnd(id ID) error {
 // (or an enum), whose range is the callback parameter's own.
 type SignedMatrixSeq[T Signed] struct {
 	VisitorBase
+	rowGate
 	out *[][]T
 	b   Bounds
 	row Bounds
@@ -543,10 +584,12 @@ func NewSignedMatrixSeq[T Signed](out *[][]T, b, row Bounds, c Caps, lo, hi int6
 	return &SignedMatrixSeq[T]{out: out, b: b, row: row, c: c, lo: lo, hi: hi}
 }
 
-// ArrayBegin bounds the row id and the row's announced element count, then
-// opens a fresh row.
+// ArrayBegin declines a row whose wire kind is not this array's (§7.3), and
+// otherwise bounds the row id and the row's announced element count and opens a
+// fresh row. The decline is latched for ArrayEnd: neither bound is a declined
+// row's to answer to.
 func (s *SignedMatrixSeq[T]) ArrayBegin(id ID, kind ArrayKind, count int) error {
-	if kind != ArraySigned {
+	if !s.mine(kind == ArraySigned) {
 		return nil
 	}
 	if err := overIndex(id, s.b.Count, s.c.ArrayCount); err != nil {
@@ -568,8 +611,13 @@ func (s *SignedMatrixSeq[T]) ArraySigned(_ ID, _ int, v int64) error {
 	return nil
 }
 
-// ArrayEnd places the finished row at its element id.
+// ArrayEnd places the finished row at its element id, unless ArrayBegin
+// declined the row under §7.3 — in which case nothing is measured and nothing
+// is placed.
 func (s *SignedMatrixSeq[T]) ArrayEnd(id ID) error {
+	if s.ended() {
+		return nil
+	}
 	row := s.cur
 	s.cur = nil
 	return PlaceRow(s.out, s.b, s.c, id, arrivedRow(row))
@@ -579,6 +627,7 @@ func (s *SignedMatrixSeq[T]) ArrayEnd(id ID) error {
 // callback already delivers the declared element type.
 type Float32MatrixSeq struct {
 	VisitorBase
+	rowGate
 	out *[][]float32
 	b   Bounds
 	row Bounds
@@ -592,10 +641,12 @@ func NewFloat32MatrixSeq(out *[][]float32, b, row Bounds, c Caps) *Float32Matrix
 	return &Float32MatrixSeq{out: out, b: b, row: row, c: c}
 }
 
-// ArrayBegin bounds the row id and the row's announced element count, then
-// opens a fresh row.
+// ArrayBegin declines a row whose wire kind is not this array's (§7.3), and
+// otherwise bounds the row id and the row's announced element count and opens a
+// fresh row. The decline is latched for ArrayEnd: neither bound is a declined
+// row's to answer to.
 func (s *Float32MatrixSeq) ArrayBegin(id ID, kind ArrayKind, count int) error {
-	if kind != ArrayFp32 {
+	if !s.mine(kind == ArrayFp32) {
 		return nil
 	}
 	if err := overIndex(id, s.b.Count, s.c.ArrayCount); err != nil {
@@ -614,8 +665,13 @@ func (s *Float32MatrixSeq) ArrayFloat32(_ ID, _ int, v float32) error {
 	return nil
 }
 
-// ArrayEnd places the finished row at its element id.
+// ArrayEnd places the finished row at its element id, unless ArrayBegin
+// declined the row under §7.3 — in which case nothing is measured and nothing
+// is placed.
 func (s *Float32MatrixSeq) ArrayEnd(id ID) error {
+	if s.ended() {
+		return nil
+	}
 	row := s.cur
 	s.cur = nil
 	return PlaceRow(s.out, s.b, s.c, id, arrivedRow(row))
@@ -624,6 +680,7 @@ func (s *Float32MatrixSeq) ArrayEnd(id ID) error {
 // Float64MatrixSeq is Float32MatrixSeq for fp64 rows.
 type Float64MatrixSeq struct {
 	VisitorBase
+	rowGate
 	out *[][]float64
 	b   Bounds
 	row Bounds
@@ -637,10 +694,12 @@ func NewFloat64MatrixSeq(out *[][]float64, b, row Bounds, c Caps) *Float64Matrix
 	return &Float64MatrixSeq{out: out, b: b, row: row, c: c}
 }
 
-// ArrayBegin bounds the row id and the row's announced element count, then
-// opens a fresh row.
+// ArrayBegin declines a row whose wire kind is not this array's (§7.3), and
+// otherwise bounds the row id and the row's announced element count and opens a
+// fresh row. The decline is latched for ArrayEnd: neither bound is a declined
+// row's to answer to.
 func (s *Float64MatrixSeq) ArrayBegin(id ID, kind ArrayKind, count int) error {
-	if kind != ArrayFp64 {
+	if !s.mine(kind == ArrayFp64) {
 		return nil
 	}
 	if err := overIndex(id, s.b.Count, s.c.ArrayCount); err != nil {
@@ -659,8 +718,13 @@ func (s *Float64MatrixSeq) ArrayFloat64(_ ID, _ int, v float64) error {
 	return nil
 }
 
-// ArrayEnd places the finished row at its element id.
+// ArrayEnd places the finished row at its element id, unless ArrayBegin
+// declined the row under §7.3 — in which case nothing is measured and nothing
+// is placed.
 func (s *Float64MatrixSeq) ArrayEnd(id ID) error {
+	if s.ended() {
+		return nil
+	}
 	row := s.cur
 	s.cur = nil
 	return PlaceRow(s.out, s.b, s.c, id, arrivedRow(row))
@@ -672,6 +736,7 @@ func (s *Float64MatrixSeq) ArrayEnd(id ID) error {
 // a bool.
 type BoolMatrixSeq struct {
 	VisitorBase
+	rowGate
 	out *[][]bool
 	b   Bounds
 	row Bounds
@@ -685,10 +750,12 @@ func NewBoolMatrixSeq(out *[][]bool, b, row Bounds, c Caps) *BoolMatrixSeq {
 	return &BoolMatrixSeq{out: out, b: b, row: row, c: c}
 }
 
-// ArrayBegin bounds the row id and the row's announced element count, then
-// opens a fresh row.
+// ArrayBegin declines a row whose wire kind is not this array's (§7.3), and
+// otherwise bounds the row id and the row's announced element count and opens a
+// fresh row. The decline is latched for ArrayEnd: neither bound is a declined
+// row's to answer to.
 func (s *BoolMatrixSeq) ArrayBegin(id ID, kind ArrayKind, count int) error {
-	if kind != ArrayUnsigned {
+	if !s.mine(kind == ArrayUnsigned) {
 		return nil
 	}
 	if err := overIndex(id, s.b.Count, s.c.ArrayCount); err != nil {
@@ -707,8 +774,13 @@ func (s *BoolMatrixSeq) ArrayUnsigned(_ ID, _ int, v uint64) error {
 	return nil
 }
 
-// ArrayEnd places the finished row at its element id.
+// ArrayEnd places the finished row at its element id, unless ArrayBegin
+// declined the row under §7.3 — in which case nothing is measured and nothing
+// is placed.
 func (s *BoolMatrixSeq) ArrayEnd(id ID) error {
+	if s.ended() {
+		return nil
+	}
 	row := s.cur
 	s.cur = nil
 	return PlaceRow(s.out, s.b, s.c, id, arrivedRow(row))
