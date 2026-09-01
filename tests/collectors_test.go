@@ -1346,10 +1346,18 @@ func TestMatrixSeqBoundsTheRowElementCount(t *testing.T) {
 		// §7.3: an array arriving under a wire type this field never declared is
 		// another field's shape, so neither its id nor its count may be judged
 		// against these bounds.
+		//
+		// The row is driven to its END, not just begun. ArrayBegin was always the
+		// half that declined correctly; ArrayEnd was the half that measured the
+		// declined row's id anyway, and stopping at ArrayBegin here is what let
+		// that pass — see TestMatrixSeqDeclinedRowIsSkippedWhole.
 		var out [][]uint8
 		s := sofab.NewUnsignedMatrixSeq[uint8](&out, sofab.Bounds{}, sofab.Bounds{}, capArray(1), 0)
-		if err := s.ArrayBegin(1<<20, sofab.ArraySigned, 1<<20); err != nil {
+		if err := putSArray(s, 1<<20, []int64{1, 2, 3}); err != nil {
 			t.Fatalf("mistyped row measured against the bounds: %v", err)
+		}
+		if len(out) != 0 {
+			t.Fatalf("out = %v (%d rows), want none: a declined row was placed", out, len(out))
 		}
 	})
 }
@@ -1396,5 +1404,207 @@ func wantPolicyOnly(t *testing.T, v sofab.Visitor, err error) {
 	wantPolicy(t, err)
 	if v != nil {
 		t.Errorf("rejected id returned visitor %v, want nil", v)
+	}
+}
+
+// --- a §7.3-declined matrix row ---------------------------------------------
+
+// matrixKeepRoot is the destination for a schema with TWO fields — a matrix at
+// id 1 and a plain scalar at id 4 — which is what makes a skipped row's effect
+// on its NEIGHBOUR visible. A test that binds only the matrix can watch the
+// decode fail but cannot see the row's cost to the field after it.
+type matrixKeepRoot struct {
+	sofab.VisitorBase
+	n    [][]uint32
+	keep uint64
+	b    sofab.Bounds
+	row  sofab.Bounds
+	c    sofab.Caps
+}
+
+func (r *matrixKeepRoot) BeginSequence(id sofab.ID) (sofab.Visitor, error) {
+	if id == 1 {
+		return sofab.NewUnsignedMatrixSeq(&r.n, r.b, r.row, r.c, math.MaxUint32), nil
+	}
+	return sofab.VisitorBase{}, nil
+}
+
+func (r *matrixKeepRoot) Unsigned(id sofab.ID, v uint64) error {
+	if id == 4 {
+		r.keep = v
+	}
+	return nil
+}
+
+// declinedRowWire is the exact image the defect report measured: a SIGNED row
+// (wire type 0b100) at row id idx inside the matrix field's wrapper sequence,
+// then the sequence end, then `keep = 7` at id 4.
+//
+//	0e  <idx<<3|4>  01 02  07  20 07
+//
+// The row is one element, so the whole field is well-formed: a decoder that
+// walks it lands exactly on `keep`.
+func declinedRowWire(idx sofab.ID) []byte {
+	var b []byte
+	b = append(b, vhdr(1, sofab.TypeSequenceStart)...)
+	b = append(b, vhdr(idx, sofab.TypeVarintArraySigned)...)
+	b = append(b, vbytes(1)...) // count
+	b = append(b, vbytes(2)...) // one zigzag element (= 1)
+	b = append(b, vhdr(0, sofab.TypeSequenceEnd)...)
+	b = append(b, vhdr(4, sofab.TypeVarintUnsigned)...)
+	b = append(b, vbytes(7)...)
+	return b
+}
+
+// A row whose wire type contradicts the declared element type is another
+// field's shape (MESSAGE_SPEC §7.3): it is walked over, and that is ALL it does.
+// It is not judged against either axis' bound, it does not reach the
+// destination, and it does not disturb the field after it — the decode stays
+// COMPLETE.
+//
+// Two defects lived here, and neither is visible from a test that binds the
+// matrix alone and asserts only on the error:
+//
+//   - ArrayBegin declined the row correctly, but ArrayEnd called PlaceRow
+//     unconditionally, so the id of a row the collector had already declined was
+//     still bounds-checked. The same bytes therefore decoded COMPLETE at row id
+//     0 and answered ErrLimitExceeded at row id 5 — and with a schema `count:`
+//     on the outer axis, ErrInvalidMsg: a well-formed message called malformed.
+//   - PlaceRow then STORED the row, so a declined field grew the destination.
+//     The signed row at index 3 decoded to `[[] [] [] []]`, four rows fabricated
+//     out of a field the collector refused, where the correct result is an
+//     untouched empty matrix.
+//
+// Hence the assertions: the row id is swept across the interesting positions
+// (under a cap, at it, far past it), and each case checks the VALUE of `keep`
+// and the LENGTH of `n`, not merely that the decode returned nil.
+func TestMatrixSeqDeclinedRowIsSkippedWhole(t *testing.T) {
+	// Caps as the report measured them; ArrayCount 4 is what row ids 5 and
+	// 2_000_000 are past.
+	caps := sofab.Caps{ArrayCount: 4, StringLen: 16, BlobLen: 16}
+
+	for _, bounds := range []struct {
+		name   string
+		b, row sofab.Bounds
+	}{
+		// Schema-unbounded on both axes: the receiver cap governs the row id,
+		// so a declined row that reached it would answer ErrLimitExceeded.
+		{"schema unbounded", sofab.Bounds{}, sofab.Bounds{}},
+		// `count: 4` on both axes: the schema governs instead, so the same
+		// declined row that reached it would answer ErrInvalidMsg.
+		{"count 4", sofab.Bounds{Count: 4}, sofab.Bounds{Count: 4}},
+	} {
+		for _, idx := range []sofab.ID{0, 3, 5, 2_000_000} {
+			t.Run(fmt.Sprintf("%s/id=%d", bounds.name, idx), func(t *testing.T) {
+				r := &matrixKeepRoot{b: bounds.b, row: bounds.row, c: caps}
+				if err := acceptBytes(declinedRowWire(idx), r); err != nil {
+					t.Fatalf("decode = %v, want nil: a §7.3 skip is not a rejection", err)
+				}
+				if r.keep != 7 {
+					t.Errorf("keep = %d, want 7: the skipped row disturbed the field after it", r.keep)
+				}
+				if len(r.n) != 0 {
+					t.Errorf("n = %v (%d rows), want none: a declined row must not grow the destination (§6.6)", r.n, len(r.n))
+				}
+			})
+		}
+	}
+}
+
+// The same rule at every collector's own surface, driven by hand through the
+// FULL ArrayBegin -> element -> ArrayEnd cycle the decoder makes.
+//
+// All five are swept because the latch is five separate call sites and a
+// half-applied fix is invisible from the wire: the collectors that still
+// measured a declined row would keep decoding the same bytes to the same
+// printed matrix, differing only in the verdict at an id nobody's test reached.
+// The id here is 1<<20, far past the stated cap of 1, and the row's announced
+// count is over the row cap too, so BOTH bounds would fire if either were
+// applied.
+func TestMatrixSeqDeclinedRowEndsWithoutPlacing(t *testing.T) {
+	const far = sofab.ID(1 << 20)
+
+	t.Run("unsigned", func(t *testing.T) {
+		var out [][]uint8
+		s := sofab.NewUnsignedMatrixSeq[uint8](&out, sofab.Bounds{}, sofab.Bounds{}, capArray(1), 0)
+		wantDeclined(t, putSArray(s, far, []int64{1, 2, 3}), len(out))
+	})
+
+	t.Run("signed", func(t *testing.T) {
+		var out [][]int8
+		s := sofab.NewSignedMatrixSeq[int8](&out, sofab.Bounds{}, sofab.Bounds{}, capArray(1), 0, 0)
+		wantDeclined(t, putUArray(s, far, []uint64{1, 2, 3}), len(out))
+	})
+
+	t.Run("fp32", func(t *testing.T) {
+		var out [][]float32
+		s := sofab.NewFloat32MatrixSeq(&out, sofab.Bounds{}, sofab.Bounds{}, capArray(1))
+		wantDeclined(t, putF64Array(s, far, []float64{1, 2, 3}), len(out))
+	})
+
+	t.Run("fp64", func(t *testing.T) {
+		var out [][]float64
+		s := sofab.NewFloat64MatrixSeq(&out, sofab.Bounds{}, sofab.Bounds{}, capArray(1))
+		wantDeclined(t, putF32Array(s, far, []float32{1, 2, 3}), len(out))
+	})
+
+	t.Run("bool", func(t *testing.T) {
+		var out [][]bool
+		s := sofab.NewBoolMatrixSeq(&out, sofab.Bounds{}, sofab.Bounds{}, capArray(1))
+		wantDeclined(t, putSArray(s, far, []int64{1, 0, 1}), len(out))
+	})
+
+	// §6.6: a skipped field costs nothing, so the growth is COUNTED and not just
+	// looked at. len(out) alone would pass a fix that placed the row and then
+	// truncated the slice back; a zero allocation count is the claim the section
+	// actually makes.
+	t.Run("allocates nothing", func(t *testing.T) {
+		var out [][]uint8
+		s := sofab.NewUnsignedMatrixSeq[uint8](&out, sofab.Bounds{}, sofab.Bounds{}, capArray(1), 0)
+		row := []int64{1, 2, 3}
+		mustNotAllocate(t, func() { _ = putSArray(s, far, row) })
+		if len(out) != 0 {
+			t.Fatalf("out = %v, want none placed", out)
+		}
+	})
+}
+
+// wantDeclined asserts the two halves of a §7.3 skip at once: no verdict, and no
+// growth.
+func wantDeclined(t *testing.T, err error, rows int) {
+	t.Helper()
+	if err != nil {
+		t.Fatalf("declined row = %v, want nil through the whole cycle", err)
+	}
+	if rows != 0 {
+		t.Fatalf("out grew to %d rows on a declined row, want none (§6.6)", rows)
+	}
+}
+
+// A declined row must not disturb the row BEFORE it either: the collector's
+// in-progress row is dropped at ArrayEnd, so a declined row arriving between two
+// accepted ones must neither steal the previous row's elements nor leave state
+// behind for the next.
+func TestMatrixSeqDeclinedRowBetweenTwoGoodRows(t *testing.T) {
+	var out [][]uint8
+	s := sofab.NewUnsignedMatrixSeq[uint8](&out, sofab.Bounds{}, sofab.Bounds{}, tcaps, math.MaxUint8)
+	if err := putUArray(s, 0, []uint64{1, 2}); err != nil {
+		t.Fatalf("row 0: %v", err)
+	}
+	if err := putSArray(s, 1, []int64{9}); err != nil {
+		t.Fatalf("declined row 1: %v", err)
+	}
+	if err := putUArray(s, 2, []uint64{3}); err != nil {
+		t.Fatalf("row 2: %v", err)
+	}
+	if len(out) != 3 || len(out[0]) != 2 || out[0][1] != 2 || len(out[2]) != 1 || out[2][0] != 3 {
+		t.Fatalf("out = %v, want [[1 2] [] [3]]", out)
+	}
+	// The discrimination the printed value cannot make: PlaceRow leaves a row
+	// the message never carried as the NIL slice, while a row this collector
+	// declined and stored anyway arrives as the empty one. Both print as `[]`,
+	// so a test comparing the formatted matrix passes with the defect present.
+	if out[1] != nil {
+		t.Fatalf("row 1 = %#v, want nil: a declined row was materialized as an empty one", out[1])
 	}
 }

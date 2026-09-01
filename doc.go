@@ -145,6 +145,13 @@
 // COMPLETE. There is no code for it and no sentinel — the visitor's own field
 // switch simply does not bind it.
 //
+// "Untouched" is the whole of it, and it binds the collectors in collectors.go
+// as much as a generated field switch: a declined field is neither measured
+// against this field's bounds nor written to this field's destination. A
+// collector that declines an element at its header must therefore stay declined
+// for the rest of that element's callbacks — see rowGate, which is what carries
+// a matrix row's verdict from ArrayBegin to the ArrayEnd that would place it.
+//
 // CORELIB_PLAN §6.3 has no "invalid usage" code either; what is left of caller
 // error is ErrArgument — an argument no valid field can be built from: an id past
 // IDMax, a payload or element count past FIXLEN_MAX/ARRAY_MAX, a sequence opened
