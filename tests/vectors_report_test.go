@@ -253,12 +253,15 @@ func TestVectorFileInventory(t *testing.T) {
 		len(vf.Vectors), withSkipIDs, groups, longestSkipList, maxID, maxElements, maxPayload,
 		maxSkippedID, maxSkippedElements)
 
-	// §7.2 item 8 (sequence growth) is NOT run by this port. The block is
-	// tolerated by the loader -- that is all this asserts -- and implementing it
-	// is tracked as #137, not folded into the §7.1 re-copy.
-	if len(vf.SequenceGrowth) > 0 {
-		t.Logf("top-level sequence_growth block present (%d bytes) and tolerated; "+
-			"§7.2 item 8 is not implemented in this port (see #137)", len(vf.SequenceGrowth))
+	// §7.2 item 8 (sequence growth) is run by sequence_growth_test.go. Assert
+	// the block is present rather than merely logging it: the shared file is
+	// copied verbatim (§7.1/§8), so a copy that lost the block would silently
+	// reduce this port's coverage to items 1-7 again.
+	if len(vf.SequenceGrowth) == 0 {
+		t.Error("top-level sequence_growth block missing; §7.2 item 8 has no corpus to run")
+	} else {
+		t.Logf("top-level sequence_growth block present (%d bytes) and run by "+
+			"sequence_growth_test.go (§7.2 item 8)", len(vf.SequenceGrowth))
 	}
 }
 

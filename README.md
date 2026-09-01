@@ -532,10 +532,14 @@ against silently shrinking, including that the skip matrix really covers all 100
 (read, skipped) construct pairs. Where the shared corpus stops,
 `skip_count_width_test.go` continues: it skips arrays and payloads whose element
 count or length crosses each varint width boundary (127/128, 16383/16384), which
-the shared vectors reach only at 130. The one shared scenario this port does not run yet
-is the `sequence_growth` block (CORELIB_PLAN §7.2 item 8); the file carries it,
-the loader tolerates it, and running it is tracked in
-[#137](https://github.com/sofa-buffers/corelib-go/issues/137).
+the shared vectors reach only at 130. `sequence_growth_test.go` runs the file's third block (CORELIB_PLAN §7.2
+item 8): a wrapper array carries no element count, so its length is *highest
+present id + 1* and the container grows as elements arrive — in the collector
+layer, never in the codec. Two ports that grow differently emit identical bytes,
+so those cases are keyed by a delivery sequence of element ids instead, and the
+port builds the message itself and asserts the resulting container length and
+outcome. Growth geometry is pinned separately, by
+`TestSequenceGrowthIsGeometric` in `collectors_test.go`.
 
 ## Benchmarks
 

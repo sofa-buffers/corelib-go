@@ -65,11 +65,10 @@ type vectorFile struct {
 	Vectors     []vector     `json:"vectors"`
 	InvalidUTF8 []utf8Vector `json:"invalid_utf8"`
 
-	// sequence_growth is the corpus for CORELIB_PLAN §7.2 item 8, which this
-	// port does not run yet (tracked as #137). It is declared so the block is
-	// explicitly TOLERATED and reportable rather than silently discarded by the
-	// JSON decoder -- the shared file is copied verbatim (§7.1/§8), so a block
-	// this port has no scenario for must not make the load fail or warn.
+	// sequence_growth is the corpus for CORELIB_PLAN §7.2 item 8, run by
+	// sequence_growth_test.go. It stays a RawMessage here because its cases are
+	// keyed by a delivery sequence of element ids rather than by bytes, so they
+	// share no shape with a vector and are decoded where they are replayed.
 	SequenceGrowth json.RawMessage `json:"sequence_growth"`
 }
 
