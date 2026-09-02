@@ -507,22 +507,24 @@ func TestDecoderResetDecodesManyMessages(t *testing.T) {
 	d := sofab.NewDecoder(aggOf(recorder{&log}))
 
 	// A truncated message, then a malformed one, then a good one.
-	if _, err := d.Feed(good[:1]); err != nil {
+	out, err := d.Feed(good[:1])
+	if err != nil {
 		t.Fatalf("Feed truncated: %v", err)
 	}
-	if d.Status() != sofab.Incomplete {
-		t.Fatalf("Status = %v, want INCOMPLETE", d.Status())
+	if out != sofab.Incomplete {
+		t.Fatalf("Feed truncated = %v, want INCOMPLETE", out)
 	}
 
 	d.Reset(aggOf(recorder{&log}))
-	if _, err := d.Feed([]byte{0x07}); err == nil { // dangling sequence end
+	out, err = d.Feed([]byte{0x07}) // dangling sequence end
+	if err == nil {
 		t.Fatal("Feed dangling end = nil, want INVALID")
 	}
-	if d.Status() != sofab.Invalid {
-		t.Fatalf("Status = %v, want INVALID", d.Status())
+	if out != sofab.Invalid {
+		t.Fatalf("Feed dangling end = %v, want INVALID", out)
 	}
-	if !errors.Is(d.Err(), sofab.ErrInvalidMsg) {
-		t.Fatalf("Err = %v, want ErrInvalidMsg", d.Err())
+	if !errors.Is(err, sofab.ErrInvalidMsg) {
+		t.Fatalf("Feed dangling end err = %v, want ErrInvalidMsg", err)
 	}
 	// INVALID is terminal: feeding on must not resume the decode (§5.2.3).
 	if out, _ := d.Feed(good); out != sofab.Invalid {
@@ -531,11 +533,12 @@ func TestDecoderResetDecodesManyMessages(t *testing.T) {
 
 	log = log[:0]
 	d.Reset(aggOf(recorder{&log}))
-	if _, err := d.Feed(good); err != nil {
+	out, err = d.Feed(good)
+	if err != nil {
 		t.Fatalf("Feed after Reset: %v", err)
 	}
-	if d.Status() != sofab.Complete {
-		t.Fatalf("Status after Reset = %v, want COMPLETE", d.Status())
+	if out != sofab.Complete {
+		t.Fatalf("Feed after Reset = %v, want COMPLETE", out)
 	}
 	if len(log) != 1 || log[0] != evU(1, 7) {
 		t.Fatalf("events after Reset = %v, want %v", log, []string{evU(1, 7)})

@@ -171,10 +171,11 @@ func (d *Decoder) init(v Visitor, lim limits) {
 // through one Decoder the §6.6 shape: construct once, Reset per message.
 func (d *Decoder) Reset(v Visitor) { d.init(v, d.lim) }
 
-// Status reports the outcome the last Feed returned, without feeding anything.
-// It is not a finalize step (§5.2.4) — it reclassifies nothing, it only answers
-// the same question again.
-func (d *Decoder) Status() Outcome {
+// outcome computes the three-valued verdict for the bytes consumed so far,
+// from the decoder's own state (§5.2.4). It is internal on purpose: the
+// verdict reaches the caller through the Feed that produced it and nowhere
+// else, so there is no second surface to drift out of step with the first.
+func (d *Decoder) outcome() Outcome {
 	if d.err != nil {
 		return Invalid
 	}
@@ -210,7 +211,7 @@ func (d *Decoder) Feed(chunk []byte) (Outcome, error) {
 	if err := d.run(chunk); err != nil {
 		return Invalid, err
 	}
-	return d.Status(), nil
+	return d.outcome(), nil
 }
 
 // FeedFrom drains r into the decoder, feeding it in chunks of scratch, and
@@ -226,7 +227,7 @@ func (d *Decoder) Feed(chunk []byte) (Outcome, error) {
 // far had reached.
 func (d *Decoder) FeedFrom(r io.Reader, scratch []byte) (Outcome, error) {
 	if len(scratch) == 0 {
-		return d.Status(), ErrArgument
+		return d.outcome(), ErrArgument
 	}
 	for {
 		n, rerr := r.Read(scratch[:])
@@ -238,9 +239,9 @@ func (d *Decoder) FeedFrom(r io.Reader, scratch []byte) (Outcome, error) {
 		}
 		if rerr != nil {
 			if rerr == io.EOF {
-				return d.Status(), nil
+				return d.outcome(), nil
 			}
-			return d.Status(), rerr
+			return d.outcome(), rerr
 		}
 	}
 }

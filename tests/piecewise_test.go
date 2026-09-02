@@ -98,13 +98,15 @@ func TestPayloadArrivesInPieces(t *testing.T) {
 	t.Run("one byte at a time", func(t *testing.T) {
 		var p pieceLog
 		d := sofab.NewDecoder(&p)
+		var out sofab.Outcome
 		for i := range msg {
-			if _, err := d.Feed(msg[i : i+1]); err != nil {
+			var err error
+			if out, err = d.Feed(msg[i : i+1]); err != nil {
 				t.Fatalf("Feed: %v", err)
 			}
 		}
-		if d.Status() != sofab.Complete {
-			t.Fatalf("status = %v, want COMPLETE", d.Status())
+		if out != sofab.Complete {
+			t.Fatalf("last Feed = %v, want COMPLETE", out)
 		}
 		// One piece per byte of payload, offsets contiguous, totals constant —
 		// and the string still spells the same word.
@@ -281,11 +283,12 @@ func TestFloatSplitAcrossChunksIsBitExact(t *testing.T) {
 		if _, err := d.Feed(msg[:cut]); err != nil {
 			t.Fatalf("cut %d: %v", cut, err)
 		}
-		if _, err := d.Feed(msg[cut:]); err != nil {
+		out, err := d.Feed(msg[cut:])
+		if err != nil {
 			t.Fatalf("cut %d: %v", cut, err)
 		}
-		if d.Status() != sofab.Complete {
-			t.Fatalf("cut %d: status %v, want COMPLETE", cut, d.Status())
+		if out != sofab.Complete {
+			t.Fatalf("cut %d: last Feed = %v, want COMPLETE", cut, out)
 		}
 		if strings.Join(b.ev, "|") != strings.Join(want, "|") {
 			t.Fatalf("cut %d: events = %v, want %v", cut, b.ev, want)
@@ -347,13 +350,15 @@ func TestEveryChunkIsScrubbedAfterFeed(t *testing.T) {
 			var v copyingV
 			d := sofab.NewDecoder(&v)
 			scratch := make([]byte, chunk)
+			var out sofab.Outcome
 			for i := 0; i < len(msg); i += chunk {
 				end := i + chunk
 				if end > len(msg) {
 					end = len(msg)
 				}
 				n := copy(scratch, msg[i:end])
-				if _, err := d.Feed(scratch[:n]); err != nil {
+				var err error
+				if out, err = d.Feed(scratch[:n]); err != nil {
 					t.Fatalf("Feed: %v", err)
 				}
 				// The caller reuses its receive buffer the instant Feed returns.
@@ -361,8 +366,8 @@ func TestEveryChunkIsScrubbedAfterFeed(t *testing.T) {
 					scratch[k] = 0xFF
 				}
 			}
-			if d.Status() != sofab.Complete {
-				t.Fatalf("status = %v, want COMPLETE", d.Status())
+			if out != sofab.Complete {
+				t.Fatalf("last Feed = %v, want COMPLETE", out)
 			}
 			if v.str != str {
 				t.Errorf("string = %q after every chunk was scrubbed, want %q", v.str, str)
