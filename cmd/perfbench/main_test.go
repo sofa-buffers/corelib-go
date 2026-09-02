@@ -645,17 +645,19 @@ func TestChunkedFeedResumesAtAnyBoundary(t *testing.T) {
 	for _, chunk := range []int{1, 3, 7, blobChunk, len(buf)} {
 		d := sofab.NewDecoder(foldVisitor{})
 		before := sink
+		var out sofab.Outcome
 		for off := 0; off < len(buf); off += chunk {
 			end := off + chunk
 			if end > len(buf) {
 				end = len(buf)
 			}
-			if _, err := d.Feed(buf[off:end]); err != nil {
+			var err error
+			if out, err = d.Feed(buf[off:end]); err != nil {
 				t.Fatalf("chunk %d: Feed: %v", chunk, err)
 			}
 		}
-		if d.Status() != sofab.Complete {
-			t.Fatalf("chunk %d: status = %v, want COMPLETE", chunk, d.Status())
+		if out != sofab.Complete {
+			t.Fatalf("chunk %d: last Feed = %v, want COMPLETE", chunk, out)
 		}
 		if sink == before {
 			t.Errorf("chunk %d: the decode folded nothing", chunk)

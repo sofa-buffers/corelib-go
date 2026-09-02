@@ -476,10 +476,11 @@ var dec *sofab.Decoder
 // with the bytes already in memory does.
 func feedWhole(msg []byte, v sofab.Visitor) {
 	dec.Reset(v)
-	if _, err := dec.Feed(msg); err != nil {
+	out, err := dec.Feed(msg)
+	if err != nil {
 		must(err)
 	}
-	if dec.Status() != sofab.Complete {
+	if out != sofab.Complete {
 		panic("perfbench: decode did not reach COMPLETE")
 	}
 }
@@ -498,16 +499,18 @@ func do_decode_typical() {
 // payload.
 func do_decode_blob() {
 	dec.Reset(foldVisitor{})
+	var out sofab.Outcome
 	for off := 0; off < len(decBuf); off += blobChunk {
 		end := off + blobChunk
 		if end > len(decBuf) {
 			end = len(decBuf)
 		}
-		if _, err := dec.Feed(decBuf[off:end]); err != nil {
+		var err error
+		if out, err = dec.Feed(decBuf[off:end]); err != nil {
 			must(err)
 		}
 	}
-	if dec.Status() != sofab.Complete {
+	if out != sofab.Complete {
 		panic("perfbench: chunked decode did not reach COMPLETE")
 	}
 }

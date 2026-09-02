@@ -183,17 +183,19 @@ func TestDecodeAllocatesNothingAfterConstruction(t *testing.T) {
 	feed := func(msg []byte, chunk int) func() {
 		return func() {
 			d.Reset(sofab.VisitorBase{})
+			var out sofab.Outcome
 			for i := 0; i < len(msg); i += chunk {
 				end := i + chunk
 				if end > len(msg) {
 					end = len(msg)
 				}
-				if _, err := d.Feed(msg[i:end]); err != nil {
+				var err error
+				if out, err = d.Feed(msg[i:end]); err != nil {
 					t.Fatalf("Feed: %v", err)
 				}
 			}
-			if d.Status() != sofab.Complete {
-				t.Fatalf("Status = %v, want COMPLETE", d.Status())
+			if out != sofab.Complete {
+				t.Fatalf("last Feed = %v, want COMPLETE", out)
 			}
 		}
 	}

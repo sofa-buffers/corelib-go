@@ -35,19 +35,20 @@ func feedIn(in []byte, chunk int, dest any, opts ...sofab.Option) error {
 			chunk = 1
 		}
 	}
+	// Nothing fed at all is the valid empty message, so COMPLETE is where the
+	// fold starts; every iteration overwrites it with what Feed just answered.
+	out := sofab.Complete
 	for i := 0; i < len(in); i += chunk {
 		end := min(i+chunk, len(in))
-		if _, err := d.Feed(in[i:end]); err != nil {
-			return err
+		var err error
+		if out, err = d.Feed(in[i:end]); err != nil {
+			return err // INVALID travels as the error Feed returned
 		}
 	}
-	switch d.Status() {
-	case sofab.Complete:
-		return nil
-	case sofab.Incomplete:
+	if out == sofab.Incomplete {
 		return sofab.ErrIncomplete
 	}
-	return d.Err()
+	return nil
 }
 
 // feedFrom is feedIn through the io.Reader wrapper, with a caller-supplied
