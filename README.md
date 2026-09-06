@@ -539,7 +539,17 @@ layer, never in the codec. Two ports that grow differently emit identical bytes,
 so those cases are keyed by a delivery sequence of element ids instead, and the
 port builds the message itself and asserts the resulting container length and
 outcome. Growth geometry is pinned separately, by
-`TestSequenceGrowthIsGeometric` in `collectors_test.go`.
+`TestSequenceGrowthIsGeometric` in `collectors_test.go`. `header_limits_test.go`
+runs the file's fourth block (CORELIB_PLAN §6.2.1/§6.3): bytes that *declare* a
+length or a count and then end, with no payload behind them. The ceiling is
+decided at that word, before the payload is asked for, so the answer is the
+ceiling's and it is terminal — a further feed re-raises it rather than resuming.
+Which ceiling speaks is the subject: a schema `maxlen` makes the breach
+`ErrInvalidMsg`, a §6.2.1 receiver cap makes it `ErrLimitExceeded`, and two cases
+carry identical bytes under the two ceilings to keep them apart. Every rejection
+is paired with an in-cap control that must still answer INCOMPLETE, and
+`TestHeaderLimitsNegativeControl` replays the rejections with the ceilings lifted
+to show the verdicts come from the guard.
 
 ## Benchmarks
 

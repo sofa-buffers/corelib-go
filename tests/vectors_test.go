@@ -70,6 +70,12 @@ type vectorFile struct {
 	// keyed by a delivery sequence of element ids rather than by bytes, so they
 	// share no shape with a vector and are decoded where they are replayed.
 	SequenceGrowth json.RawMessage `json:"sequence_growth"`
+
+	// header_limits is the corpus for CORELIB_PLAN §6.2.1/§6.3, run by
+	// header_limits_test.go. It stays a RawMessage for the same reason: its
+	// cases are keyed by a PARTIAL byte string carrying a required VERDICT and
+	// the ceiling to configure for it, which a vector has no field for at all.
+	HeaderLimits json.RawMessage `json:"header_limits"`
 }
 
 // loadVectors reads the shared vector file.
