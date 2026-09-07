@@ -523,7 +523,8 @@ generated-code example in this README so the docs cannot drift from the API.
 
 `assets/test_vectors.json` is copied verbatim from `corelib-c-cpp`, which owns
 it, along with the format description
-([`test_vectors_README. A daily CI job (`.github/workflows/shared-vectors.yml`) compares the sha256 of this copy against that file on `corelib-c-cpp@main`, so a copy left behind by an upstream change shows up here rather than going unnoticed.md`](https://github.com/sofa-buffers/corelib-c-cpp/blob/main/assets/test_vectors_README.md)).
+([`test_vectors_README.md`](https://github.com/sofa-buffers/corelib-c-cpp/blob/main/assets/test_vectors_README.md)).
+A daily CI job (`.github/workflows/shared-vectors.yml`) compares this copy's sha256 against that file on `corelib-c-cpp@main`, so a copy left behind by an upstream change is reported rather than going unnoticed.
 Every vector that carries `skip_ids` is also replayed with those ids left
 unread — at every nesting level, and one byte at a time — so a field the
 receiver declines is proven to be walked to exactly its last byte whatever its
