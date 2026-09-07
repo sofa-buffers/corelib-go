@@ -263,6 +263,17 @@ func TestVectorFileInventory(t *testing.T) {
 		t.Logf("top-level sequence_growth block present (%d bytes) and run by "+
 			"sequence_growth_test.go (§7.2 item 8)", len(vf.SequenceGrowth))
 	}
+
+	// §6.2.1/§6.3 (the header ceiling) is run by header_limits_test.go, and the
+	// block is asserted present for the same reason: the file is copied verbatim
+	// (§7.1/§8), so a copy that lost the block would silently stop testing that
+	// a declared-but-unpaid-for length is answered at the word.
+	if len(vf.HeaderLimits) == 0 {
+		t.Error("top-level header_limits block missing; §6.2.1/§6.3 has no corpus to run")
+	} else {
+		t.Logf("top-level header_limits block present (%d bytes) and run by "+
+			"header_limits_test.go (§6.2.1/§6.3)", len(vf.HeaderLimits))
+	}
 }
 
 // vecConstruct names the skippable construct a field sits on -- the granularity
