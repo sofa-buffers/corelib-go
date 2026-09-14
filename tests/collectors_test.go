@@ -533,6 +533,52 @@ func TestNestedSeqCollectsRowsByID(t *testing.T) {
 	}
 }
 
+// A repeated ROW id REPLACES the row, it does not merge into it (MESSAGE_SPEC
+// §7.4, generator#523).
+//
+// §7.4 makes an array wrapper the exception to scope merging: a re-opened
+// sequence normally continues its scope -- which is what gives a struct element
+// its merge, and MessageSeq must keep it -- but an array wrapper *is* the value of
+// its field, so a later occurrence replaces it whole. A row here is an array, so
+// it is the replacing kind.
+//
+// BeginSequence only appended empty rows UP TO the index, so a repeated element id
+// found the previous occurrence's elements still in place and wrote on top of
+// them. The second occurrence below is deliberately SHORTER than the first, so a
+// merge is caught by the row's LENGTH and not only by its values: ["a","z"] then
+// ["y"] merged to ["y","z"], where §7.4 wants ["y"].
+//
+// The row is reached through a generated decoder in the generator's conformance
+// suite (tests/conformance/lib/check_repeated_id.py drives all eleven backends on
+// the same forged bytes); this is the same rule at the collector, where it is
+// implemented.
+//
+// The OTHER half of §7.4 is TestMessageSeqReopenedIDContinuesTheSameElement above,
+// and the two belong read together: the failure mode of this reset is breaking
+// that merge, so a collector that reset every re-opened element id would pass here
+// and fail there.
+func TestNestedSeqRepeatedRowIDReplaces(t *testing.T) {
+	raw := wrapperSeq(t, func(e *sofab.Encoder) {
+		e.WriteSequenceBeginLazy(0)
+		e.WriteString(0, "a")
+		e.WriteString(1, "z")
+		e.WriteSequenceEndKeep()
+		e.WriteSequenceBeginLazy(0) // the SAME row id, a second time
+		e.WriteString(0, "y")
+		e.WriteSequenceEndKeep()
+	})
+
+	var out [][]string
+	mustCollect(t, raw, sofab.NewNestedSeq(&out, sofab.Bounds{}, tcaps,
+		func(p *[]string) sofab.Visitor {
+			return sofab.NewStringSeq(p, sofab.Bounds{}, tcaps)
+		}))
+
+	if len(out) != 1 || len(out[0]) != 1 || out[0][0] != "y" {
+		t.Fatalf("out = %q, want [[y]] -- a repeated row id must replace the row (§7.4)", out)
+	}
+}
+
 // The inner collector carries the INNER array's bounds, so a breach inside a row
 // fails the decode even though the outer array is within its own capacity.
 func TestNestedSeqInnerBoundApplies(t *testing.T) {

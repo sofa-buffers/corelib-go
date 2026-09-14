@@ -373,7 +373,29 @@ func NewNestedSeq[T any](out *[][]T, b Bounds, c Caps, make func(*[]T) Visitor) 
 	return &NestedSeq[T]{out: out, b: b, c: c, make: make}
 }
 
-// BeginSequence reserves the row at id and returns the collector for it.
+// BeginSequence reserves the row at id, TRUNCATES it, and returns the collector
+// for it.
+//
+// The truncation is MESSAGE_SPEC §7.4 (generator#523). A row here is itself an
+// array field, and §7.4 makes an array wrapper the exception to scope merging:
+// the wrapper *is* the value of its field, so a later occurrence of the element
+// id REPLACES it whole, where a re-opened struct/union element continues its
+// scope and merges. The growth loop above only appends empty rows UP TO the
+// index, so a repeated element id used to find the previous occurrence's
+// elements still in place and write on top of them -- measured on a generated
+// `matstr: array<array<string>>` carrying element id 0 twice, ["a","z"] then
+// ["y"]: [["y", "z"]] before, [["y"]] after.
+//
+// It is a truncation rather than a nil assignment so the row keeps its backing
+// array, which matches the reset generated code emits for a wrapper array's own
+// field id (`m.Field = m.Field[:0]`). MessageSeq does NOT do this, and must not:
+// the merging half of §7.4 is exactly its case.
+//
+// Order is load-bearing: overIndex returns FIRST, so a refused element index
+// cannot wipe a valid earlier row -- the §7.3 interaction where a destructive
+// reset placed in front of the decision turns a loud failure into silent data
+// loss. And BeginSequence is reached only for an actual sequence header, so an
+// element arriving as some other wire type never reaches the reset at all.
 func (s *NestedSeq[T]) BeginSequence(id ID) (Visitor, error) {
 	if err := overIndex(id, s.b.Count, s.c.ArrayCount); err != nil {
 		return nil, err
@@ -381,6 +403,7 @@ func (s *NestedSeq[T]) BeginSequence(id ID) (Visitor, error) {
 	for len(*s.out) <= int(id) {
 		*s.out = append(*s.out, nil)
 	}
+	(*s.out)[id] = (*s.out)[id][:0]
 	return s.make(&(*s.out)[id]), nil
 }
 
