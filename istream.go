@@ -136,6 +136,12 @@ type Decoder struct {
 	// declined subtree is capped, which is what §6.2.1 asks for: a cap bounds
 	// what this consumer is handed, and it is handed nothing.
 	skipFrom int
+
+	// top caches cur(): the visitor of the innermost open scope, or nil while a
+	// declined subtree is consumed. It is read once per field (every delivery
+	// asks for it), so it is kept as one field load instead of a skip test plus
+	// a bounds-checked stack index; openSequence/closeSequence keep it in step.
+	top Visitor
 }
 
 // NewDecoder returns a decoder that reports fields to v.
@@ -163,6 +169,7 @@ func (d *Decoder) init(v Visitor, lim limits) {
 	d.stack[0] = v
 	d.spDone[0] = false
 	d.skipFrom = -1
+	d.top = v
 }
 
 // Reset rebinds the decoder to v and discards every trace of the message before
@@ -285,12 +292,7 @@ func (d *Decoder) fail(err error) error {
 
 // cur is the visitor fields are being reported to, or nil while a declined
 // subtree is being consumed.
-func (d *Decoder) cur() Visitor {
-	if d.skipFrom >= 0 {
-		return nil
-	}
-	return d.stack[d.depth]
-}
+func (d *Decoder) cur() Visitor { return d.top }
 
 // beginVarint arms the accumulator for the next varint.
 func (d *Decoder) beginVarint() { d.acc, d.shift, d.nb = 0, 0, 0 }
@@ -668,6 +670,7 @@ func (d *Decoder) openSequence() error {
 	d.depth++
 	d.stack[d.depth] = child
 	d.spDone[d.depth] = false
+	d.top = child // nil exactly when this scope is declined or inside one
 	return nil
 }
 
@@ -683,9 +686,11 @@ func (d *Decoder) closeSequence() error {
 	if d.skipFrom >= 0 {
 		if d.depth == d.skipFrom {
 			d.skipFrom = -1 // the declined subtree ends here
+			d.top = d.stack[d.depth]
 		}
 		return nil
 	}
+	d.top = d.stack[d.depth]
 	if child == nil {
 		return nil
 	}
