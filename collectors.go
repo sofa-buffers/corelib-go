@@ -243,6 +243,7 @@ func (s *StringSeq) String(id ID, total, offset int, chunk []byte) error {
 	if !s.UTF8Valid(b) {
 		return ErrInvalidMsg
 	}
+	reserveRows(s.out, id, s.b.Count)
 	for len(*s.out) <= int(id) {
 		*s.out = append(*s.out, "")
 	}
@@ -295,6 +296,7 @@ func (s *BlobSeq) Bytes(id ID, total, offset int, chunk []byte) error {
 	if !done {
 		return nil
 	}
+	reserveRows(s.out, id, s.b.Count)
 	for len(*s.out) <= int(id) {
 		*s.out = append(*s.out, nil)
 	}
@@ -343,6 +345,7 @@ func (s *MessageSeq[T, PT]) BeginSequence(id ID) (Visitor, error) {
 		return nil, err
 	}
 	var zero T
+	reserveRows(s.out, id, s.b.Count)
 	for len(*s.out) <= int(id) {
 		*s.out = append(*s.out, zero)
 	}
@@ -400,6 +403,7 @@ func (s *NestedSeq[T]) BeginSequence(id ID) (Visitor, error) {
 	if err := overIndex(id, s.b.Count, s.c.ArrayCount); err != nil {
 		return nil, err
 	}
+	reserveRows(s.out, id, s.b.Count)
 	for len(*s.out) <= int(id) {
 		*s.out = append(*s.out, nil)
 	}
@@ -446,6 +450,7 @@ func PlaceRow[T any](out *[][]T, b Bounds, c Caps, id ID, row []T) error {
 	if err := overIndex(id, b.Count, c.ArrayCount); err != nil {
 		return err
 	}
+	reserveRows(out, id, b.Count)
 	for len(*out) <= int(id) {
 		*out = append(*out, nil)
 	}
@@ -808,3 +813,22 @@ func (s *BoolMatrixSeq) ArrayEnd(id ID) error {
 	s.cur = nil
 	return PlaceRow(s.out, s.b, s.c, id, arrivedRow(row))
 }
+
+// reserveRows gives a collector's destination room for the whole schema count,
+// in one allocation, the first time an element lands past its capacity. The
+// gap-filling append loops otherwise grow a count-5 array 1 -> 2 -> 4 -> 8: four
+// allocations and three copies per decoded array where one does.
+//
+// The size is the SCHEMA's count bound (b.Count), never a wire number (§6.6),
+// and only a small one: past reserveRowsMax, or with no bound, or for an id the
+// bound will refuse anyway, the ordinary append growth applies unchanged.
+func reserveRows[T any](out *[]T, id ID, count int) {
+	if n := int(id) + 1; n > cap(*out) && n <= count && count <= reserveRowsMax {
+		grown := make([]T, len(*out), count)
+		copy(grown, *out)
+		*out = grown
+	}
+}
+
+// reserveRowsMax is the largest schema count reserveRows commits up front.
+const reserveRowsMax = 64
