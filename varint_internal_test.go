@@ -122,20 +122,22 @@ func TestVarintDecodersAgree(t *testing.T) {
 		// about.
 		var d Decoder
 		d.init(VisitorBase{}, newLimits(nil))
+		var got uint64
 		for k := range enc {
-			np, done := d.varint(enc[k:k+1], 0)
+			x, np, done := d.readVarintSlow(enc[k:k+1], 0)
 			if np != 1 {
 				t.Fatalf("resumable(%d): byte %d consumed %d", v, k, np)
 			}
 			if done != (k == len(enc)-1) {
 				t.Fatalf("resumable(%d): byte %d done=%v", v, k, done)
 			}
+			got = x
 		}
 		if d.err != nil {
 			t.Fatalf("resumable(%d): %v", v, d.err)
 		}
-		if d.acc != v || d.nb != len(enc) {
-			t.Fatalf("resumable(%d) = (%d, %d bytes), want (%d, %d)", v, d.acc, d.nb, v, len(enc))
+		if got != v || d.nb != 0 {
+			t.Fatalf("resumable(%d) = (%d, accumulator %d bytes), want (%d, rearmed)", v, got, d.nb, v)
 		}
 	}
 }
@@ -256,10 +258,10 @@ func resumeVarint(enc []byte) (uint64, error) {
 	var d Decoder
 	d.init(VisitorBase{}, newLimits(nil))
 	for k := range enc {
-		if _, done := d.varint(enc[k:k+1], 0); d.err != nil {
+		if x, _, done := d.readVarintSlow(enc[k:k+1], 0); d.err != nil {
 			return 0, d.err
 		} else if done {
-			return d.acc, nil
+			return x, nil
 		}
 	}
 	return 0, ErrIncomplete
