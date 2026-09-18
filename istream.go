@@ -295,30 +295,7 @@ func (d *Decoder) cur() Visitor {
 // beginVarint arms the accumulator for the next varint.
 func (d *Decoder) beginVarint() { d.acc, d.shift, d.nb = 0, 0, 0 }
 
-// varint consumes bytes of one varint from in[i:], returning the position it
-// reached and whether the varint completed. An incomplete varint leaves its
-// bytes in the accumulator for the next chunk and carries no verdict at all
-// (§4.1.1) — it is not a construct the decoder has read.
-//
-// The fast path is the whole reason the split exists: with the accumulator empty
-// and at least maxVarintLen bytes in hand, the unrolled shared decoder
-// (varint.go) reads the varint with no per-byte end test, which is what a
-// contiguous AcceptBytes hits for every header, scalar and element in the
-// message. Only the last few bytes of a chunk fall into the resumable loop.
-func (d *Decoder) varint(in []byte, i int) (int, bool) {
-	if d.nb == 0 && len(in)-i >= maxVarintLen {
-		v, np, ok := uvarintFast(in, i)
-		if !ok {
-			d.fail(ErrInvalidMsg) // > 64 bits: malformed, never truncated
-			return i, false
-		}
-		d.acc, d.nb = v, np-i
-		return np, true
-	}
-	return d.varintResume(in, i)
-}
-
-// varintResume is the byte-at-a-time half of varint: the tail of a chunk, and
+// varintResume is the byte-at-a-time half of readVarintSlow: the tail of a chunk, and
 // every varint that a chunk boundary splits. Value and overflow semantics are
 // uvarintFast's exactly (varint.go) — the tenth byte carries one payload bit and
 // must terminate, and anything else is the >64-bit malformed case.
@@ -346,6 +323,35 @@ func (d *Decoder) varintResume(in []byte, i int) (int, bool) {
 	return i, false
 }
 
+// readVarintSlow is the complete varint reader for every state of run. The
+// single-byte case — a field header for id < 16, a small count, a small scalar,
+// nearly every varint a message carries — is spelled out at each call site
+// instead (see run): as a helper it costs ~100 against the inline budget of 80,
+// so it would be a call per varint, which is exactly what the old contiguous
+// cursor's uvarint1 avoided. This function handles the rest: a multi-byte
+// varint, one resumed from an earlier chunk, and the end of a chunk. ok false
+// means the varint did not complete — d.err nil: suspended, resumable; d.err
+// set: malformed.
+//
+//go:noinline
+func (d *Decoder) readVarintSlow(in []byte, i int) (uint64, int, bool) {
+	if d.nb == 0 && len(in)-i >= maxVarintLen {
+		v, np, ok := uvarintFast(in, i)
+		if !ok {
+			d.fail(ErrInvalidMsg) // > 64 bits: malformed, never truncated
+			return 0, i, false
+		}
+		return v, np, true
+	}
+	np, ok := d.varintResume(in, i)
+	if !ok {
+		return 0, np, false
+	}
+	v := d.acc
+	d.beginVarint()
+	return v, np, true
+}
+
 // run is the state machine. It consumes as much of in as it can and suspends
 // wherever the bytes run out.
 func (d *Decoder) run(in []byte) error {
@@ -353,16 +359,16 @@ func (d *Decoder) run(in []byte) error {
 	for {
 		switch d.st {
 		case stHeader:
-			np, ok := d.varint(in, i)
-			i = np
-			if d.err != nil {
-				return d.err
+			var h uint64
+			if i < len(in) && in[i] < 0x80 && d.nb == 0 {
+				h = uint64(in[i]) // single-byte fast path, inline
+				i++
+			} else {
+				var ok bool
+				if h, i, ok = d.readVarintSlow(in, i); !ok {
+					return d.err // nil err: suspended
+				}
 			}
-			if !ok {
-				return nil // suspended mid-header, or exactly out of bytes
-			}
-			h := d.acc
-			d.beginVarint()
 			// The id ceiling binds every header without exception, the
 			// sequence-end marker included: its id is discarded (§4.9) but
 			// discarded is not unvalidated, so an id above ID_MAX is INVALID here
@@ -376,16 +382,16 @@ func (d *Decoder) run(in []byte) error {
 			}
 
 		case stScalarU:
-			np, ok := d.varint(in, i)
-			i = np
-			if d.err != nil {
-				return d.err
+			var v uint64
+			if i < len(in) && in[i] < 0x80 && d.nb == 0 {
+				v = uint64(in[i]) // single-byte fast path, inline
+				i++
+			} else {
+				var ok bool
+				if v, i, ok = d.readVarintSlow(in, i); !ok {
+					return d.err // nil err: suspended
+				}
 			}
-			if !ok {
-				return nil
-			}
-			v := d.acc
-			d.beginVarint()
 			d.st = stHeader
 			if cur := d.cur(); cur != nil {
 				if err := cur.Unsigned(d.id, v); err != nil {
@@ -394,16 +400,17 @@ func (d *Decoder) run(in []byte) error {
 			}
 
 		case stScalarS:
-			np, ok := d.varint(in, i)
-			i = np
-			if d.err != nil {
-				return d.err
+			var raw uint64
+			if i < len(in) && in[i] < 0x80 && d.nb == 0 {
+				raw = uint64(in[i]) // single-byte fast path, inline
+				i++
+			} else {
+				var ok bool
+				if raw, i, ok = d.readVarintSlow(in, i); !ok {
+					return d.err // nil err: suspended
+				}
 			}
-			if !ok {
-				return nil
-			}
-			v := zigzagDecode(d.acc)
-			d.beginVarint()
+			v := zigzagDecode(raw)
 			d.st = stHeader
 			if cur := d.cur(); cur != nil {
 				if err := cur.Signed(d.id, v); err != nil {
@@ -412,16 +419,16 @@ func (d *Decoder) run(in []byte) error {
 			}
 
 		case stFixWord:
-			np, ok := d.varint(in, i)
-			i = np
-			if d.err != nil {
-				return d.err
+			var w uint64
+			if i < len(in) && in[i] < 0x80 && d.nb == 0 {
+				w = uint64(in[i]) // single-byte fast path, inline
+				i++
+			} else {
+				var ok bool
+				if w, i, ok = d.readVarintSlow(in, i); !ok {
+					return d.err // nil err: suspended
+				}
 			}
-			if !ok {
-				return nil
-			}
-			w := d.acc
-			d.beginVarint()
 			if err := d.fixlenWord(w); err != nil {
 				return err
 			}
@@ -463,16 +470,16 @@ func (d *Decoder) run(in []byte) error {
 			}
 
 		case stArrCount:
-			np, ok := d.varint(in, i)
-			i = np
-			if d.err != nil {
-				return d.err
+			var n uint64
+			if i < len(in) && in[i] < 0x80 && d.nb == 0 {
+				n = uint64(in[i]) // single-byte fast path, inline
+				i++
+			} else {
+				var ok bool
+				if n, i, ok = d.readVarintSlow(in, i); !ok {
+					return d.err // nil err: suspended
+				}
 			}
-			if !ok {
-				return nil
-			}
-			n := d.acc
-			d.beginVarint()
 			if err := d.arrayCount(n); err != nil {
 				return err
 			}
@@ -488,16 +495,16 @@ func (d *Decoder) run(in []byte) error {
 			}
 
 		case stArrWord:
-			np, ok := d.varint(in, i)
-			i = np
-			if d.err != nil {
-				return d.err
+			var w uint64
+			if i < len(in) && in[i] < 0x80 && d.nb == 0 {
+				w = uint64(in[i]) // single-byte fast path, inline
+				i++
+			} else {
+				var ok bool
+				if w, i, ok = d.readVarintSlow(in, i); !ok {
+					return d.err // nil err: suspended
+				}
 			}
-			if !ok {
-				return nil
-			}
-			w := d.acc
-			d.beginVarint()
 			if err := d.fixlenArrayWord(w); err != nil {
 				return err
 			}
@@ -536,16 +543,16 @@ func (d *Decoder) arrayElements(in []byte, i int) (int, error) {
 		}
 	}
 	for d.remain > 0 {
-		np, ok := d.varint(in, i)
-		i = np
-		if d.err != nil {
-			return i, d.err
+		var v uint64
+		if i < len(in) && in[i] < 0x80 && d.nb == 0 {
+			v = uint64(in[i]) // single-byte fast path, inline
+			i++
+		} else {
+			var ok bool
+			if v, i, ok = d.readVarintSlow(in, i); !ok {
+				return i, d.err // nil err: suspended
+			}
 		}
-		if !ok {
-			return i, nil // suspended mid-element; d.st is unchanged
-		}
-		v := d.acc
-		d.beginVarint()
 		idx := d.idx
 		d.idx++
 		d.remain--
