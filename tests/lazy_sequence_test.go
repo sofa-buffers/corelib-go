@@ -405,3 +405,49 @@ func TestDeepNestingCommitsInOrder(t *testing.T) {
 		t.Fatalf("decode: %v", err)
 	}
 }
+
+// WithMaxDepth bounds nesting at construction: opening sequence n+1 is refused
+// with ErrArgument and writes nothing, exactly like sequence MaxDepth+1, and a
+// bound within the inline capacity costs construction no id-stack allocation.
+func TestWithMaxDepthBoundsNestingAtConstruction(t *testing.T) {
+	for _, n := range []int{1, 2, 8, 9, 40} {
+		buf := make([]byte, 4*n+16)
+		e, err := sofab.NewEncoderBuffer(buf, 0, sofab.WithMaxDepth(n))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for k := 0; k < n; k++ {
+			if err := e.WriteSequenceBeginLazy(sofab.ID(k)); err != nil {
+				t.Fatalf("n=%d: open %d: %v", n, k+1, err)
+			}
+		}
+		if err := e.WriteSequenceBeginLazy(1); err != sofab.ErrArgument {
+			t.Fatalf("n=%d: open %d = %v, want ErrArgument", n, n+1, err)
+		}
+		if len(e.Bytes()) != 0 {
+			t.Fatalf("n=%d: refused open wrote % x", n, e.Bytes())
+		}
+	}
+	// Out-of-range bounds leave the format's MaxDepth.
+	for _, n := range []int{0, -1, sofab.MaxDepth + 1} {
+		e, _ := sofab.NewEncoderBuffer(make([]byte, 8), 0, sofab.WithMaxDepth(n))
+		for k := 0; k < sofab.MaxDepth; k++ {
+			if err := e.WriteSequenceBeginLazy(1); err != nil {
+				t.Fatalf("n=%d: open %d: %v", n, k+1, err)
+			}
+		}
+		if err := e.WriteSequenceBeginLazy(1); err != sofab.ErrArgument {
+			t.Fatalf("n=%d: open MaxDepth+1 = %v, want ErrArgument", n, err)
+		}
+	}
+	buf := make([]byte, 64)
+	opt := sofab.WithMaxDepth(3)
+	if a := testing.AllocsPerRun(100, func() {
+		e, _ := sofab.NewEncoderBuffer(buf, 0, opt)
+		_ = e.WriteSequenceBeginLazy(1)
+		_ = e.WriteUnsigned(0, 1)
+		_ = e.WriteSequenceEnd()
+	}); a > 1 {
+		t.Fatalf("schema-bounded encoder construction allocs = %v, want <= 1 (the Encoder)", a)
+	}
+}
