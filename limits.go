@@ -3,8 +3,9 @@ package sofab
 // Option configures a decode- or encode-time POLICY. Options are passed to
 // NewDecoder, AcceptBytes and NewEncoder.
 //
-// There is exactly one: WithStrictUTF8, the SOFAB_STRICT_UTF8 string-validity
-// policy of §6.4.
+// There are two: WithStrictUTF8, the SOFAB_STRICT_UTF8 string-validity policy
+// of §6.4, and the encoder-only WithMaxDepth, a construction-time nesting bound
+// tighter than MAX_DEPTH (see there).
 //
 // There is deliberately NO receiver-cap option here. CORELIB_PLAN §6.2.1 puts
 // the max_dyn_array_count / max_dyn_string_len / max_dyn_blob_len numbers with
@@ -31,6 +32,26 @@ type Option func(*limits)
 // instead of the intended ON.
 type limits struct {
 	strictUTF8 bool // SOFAB_STRICT_UTF8 (§6.4); default ON via newLimits
+	// maxDepth is the encoder's WithMaxDepth bound; 0 (the default) means the
+	// format's own MaxDepth. The decoder ignores it: what it accepts on the wire
+	// is §4.9's MAX_DEPTH and nothing a producer declared.
+	maxDepth int
+}
+
+// WithMaxDepth bounds how deeply an Encoder may nest sequences, at
+// CONSTRUCTION, to n (1..MaxDepth; anything else leaves the format's MaxDepth).
+//
+// It exists for §6.0.1's "at most MAX_DEPTH ids, sized at construction": the
+// lazy-sequence id stack has to be sized before the first write, and sized to
+// MaxDepth it is a 1 KB allocation every Encoder pays although a schema
+// typically nests two or three levels. Generated code knows its schema's static
+// nesting depth and passes it here; up to a small inline capacity the stack then
+// lives inside the Encoder and construction allocates nothing for it. Opening
+// sequence n+1 is refused with ErrArgument exactly as sequence MaxDepth+1 is,
+// and writes nothing — a bound is still sized at construction and never grown
+// (§6.6). The decoder ignores the option.
+func WithMaxDepth(n int) Option {
+	return func(l *limits) { l.maxDepth = n }
 }
 
 // WithStrictUTF8 sets the SOFAB_STRICT_UTF8 string-validity policy (§6.4). It

@@ -91,6 +91,44 @@ type Encoder struct {
 	// cache line, and that showed up as ~30% on a reused encoder.
 	staged  stagedTail
 	staging bool
+	// maxDepth is the nesting bound this Encoder was constructed with: MaxDepth,
+	// or the tighter WithMaxDepth one. pendingInline backs pending when that
+	// bound fits it, so a schema-bounded Encoder sizes its §6.0.1 id stack at
+	// construction without a separate allocation. Pointer-free and at the END of
+	// the struct, so the GC's scan of the Encoder stops before it.
+	maxDepth      int
+	pendingInline [pendingInlineCap]ID
+}
+
+// pendingInlineCap is how many lazy-sequence ids an Encoder holds inline. It
+// covers every schema nesting at most this deep (WithMaxDepth); a deeper bound,
+// or none, gets its own construction-time allocation as before.
+const pendingInlineCap = 8
+
+// init applies opts and sizes the lazy-sequence id stack, once, at construction
+// (§6.0.1).
+//
+// The options are applied straight into the Encoder's own lim rather than
+// through newLimits: an Option is an opaque function value, so the limits it is
+// handed escapes, and applyOptions pays a heap allocation for it on every call
+// that passes one. The Encoder is on the heap already, so writing into it costs
+// nothing extra — which is what lets generated code pass WithMaxDepth on every
+// one-shot Encode without trading the saved id-stack allocation for another.
+func (e *Encoder) init(opts []Option) {
+	e.lim = limits{strictUTF8: true}
+	for _, opt := range opts {
+		opt(&e.lim)
+	}
+	d := e.lim.maxDepth
+	if d <= 0 || d > MaxDepth {
+		d = MaxDepth
+	}
+	e.maxDepth = d
+	if d <= pendingInlineCap {
+		e.pending = e.pendingInline[:0:d]
+		return
+	}
+	e.pending = make([]ID, 0, d)
 }
 
 // stagedTail is the sink-less caller-supplied buffer's exact-fit tail: dst is
@@ -158,11 +196,12 @@ type Sink func(e *Encoder, b []byte) error
 // once and driving the codec over it is the caller's act, and here the
 // constructor performs it on the caller's behalf.
 //
-// The one Option, WithStrictUTF8, is the SOFAB_STRICT_UTF8 policy (§6.4, default
-// ON) and applies here as on decode.
+// WithStrictUTF8 is the SOFAB_STRICT_UTF8 policy (§6.4, default ON) and applies
+// here as on decode; WithMaxDepth sizes the lazy-sequence id stack to a
+// schema's nesting depth instead of MaxDepth.
 func NewEncoder(w io.Writer, opts ...Option) *Encoder {
-	e := &Encoder{w: w, buf: make([]byte, encWindow), lim: newLimits(opts)}
-	e.pending = make([]ID, 0, MaxDepth)
+	e := &Encoder{w: w, buf: make([]byte, encWindow)}
+	e.init(opts)
 	return e
 }
 
@@ -204,8 +243,8 @@ func NewEncoderSink(buf []byte, offset int, sink Sink, opts ...Option) (*Encoder
 // newBufferEncoder is the shared tail of the two caller-supplied-buffer
 // constructors, once their arguments have been checked.
 func newBufferEncoder(buf []byte, offset int, sink Sink, opts []Option) *Encoder {
-	e := &Encoder{sink: sink, buf: buf, n: offset, start: offset, lim: newLimits(opts)}
-	e.pending = make([]ID, 0, MaxDepth)
+	e := &Encoder{sink: sink, buf: buf, n: offset, start: offset}
+	e.init(opts)
 	return e
 }
 
@@ -804,13 +843,14 @@ func (e *Encoder) WriteBytes(id ID, data []byte) error {
 // contentless one survives: WriteSequenceEnd drops it, WriteSequenceEndKeep
 // forces the frame out.
 //
-// Opening would-be sequence number MaxDepth+1 is rejected with ErrArgument and
-// writes no bytes, so the wire never nests deeper than MaxDepth (§4.9).
+// Opening would-be sequence number MaxDepth+1 — or n+1 on an Encoder built with
+// WithMaxDepth(n) — is rejected with ErrArgument and writes no bytes, so the
+// wire never nests deeper than MaxDepth (§4.9).
 func (e *Encoder) WriteSequenceBeginLazy(id ID) error {
 	if e.err != nil {
 		return e.err
 	}
-	if e.depth >= MaxDepth || id > IDMax {
+	if e.depth >= e.maxDepth || id > IDMax {
 		e.setErr(ErrArgument)
 		return e.err
 	}
