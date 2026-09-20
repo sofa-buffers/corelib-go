@@ -127,6 +127,10 @@ const (
 	minSkipAxes             = 16  // group "skip": the axes beside the matrix
 	minInvalidUTF8          = 1   // the §6.4 group
 	minSkipIDsPerVec        = 9   // the longest skip_ids list the corpus carries
+	// The §4.4 tolerant-decode block: five untagged cases (0, 1, 2, 255, 256)
+	// plus the 2^64-1 scalar and the two array cases. A floor, like every
+	// number here -- the block is expected to grow upstream.
+	minBooleanTolerant = 8
 
 	// The widest values the corpus reaches anywhere, and -- for the two that
 	// decide how much of the skip path is really crossed -- the widest it
@@ -273,6 +277,18 @@ func TestVectorFileInventory(t *testing.T) {
 	} else {
 		t.Logf("top-level header_limits block present (%d bytes) and run by "+
 			"header_limits_test.go (§6.2.1/§6.3)", len(vf.HeaderLimits))
+	}
+
+	// §4.4 (canonical on encode, tolerant on decode) is run by
+	// boolean_tolerant_test.go, and asserted present for the same reason: the
+	// file is copied verbatim (§7.1/§8), and a copy that predates the block
+	// yields an absent key, a loop that never runs and a green suite that
+	// tested nothing about a non-canonical boolean.
+	if len(vf.BooleanTolerant) == 0 {
+		t.Error("top-level boolean_tolerant block missing; §4.4's decode half has no corpus to run")
+	} else {
+		t.Logf("top-level boolean_tolerant block present (%d bytes) and run by "+
+			"boolean_tolerant_test.go (§4.4)", len(vf.BooleanTolerant))
 	}
 }
 
