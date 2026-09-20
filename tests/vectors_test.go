@@ -76,6 +76,14 @@ type vectorFile struct {
 	// cases are keyed by a PARTIAL byte string carrying a required VERDICT and
 	// the ceiling to configure for it, which a vector has no field for at all.
 	HeaderLimits json.RawMessage `json:"header_limits"`
+
+	// boolean_tolerant is the corpus for CORELIB_PLAN §4.4's decode half, run by
+	// boolean_tolerant_test.go. RawMessage again, and for the sharpest reason of
+	// the three: its bytes are NOT replayable through `fields`, because a
+	// conforming encoder cannot produce them — a non-canonical boolean only ever
+	// arrives from someone else's encoder, so the case is hand-authored as
+	// bytes-in, values-and-bytes-out.
+	BooleanTolerant json.RawMessage `json:"boolean_tolerant"`
 }
 
 // loadVectors reads the shared vector file.
