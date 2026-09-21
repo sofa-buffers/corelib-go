@@ -550,7 +550,16 @@ Which ceiling speaks is the subject: a schema `maxlen` makes the breach
 carry identical bytes under the two ceilings to keep them apart. Every rejection
 is paired with an in-cap control that must still answer INCOMPLETE, and
 `TestHeaderLimitsNegativeControl` replays the rejections with the ceilings lifted
-to show the verdicts come from the guard.
+to show the verdicts come from the guard. `header_limits_nested_test.go` runs the
+file's fifth block, which is that same assertion one or two sequence frames
+deeper: each case names in `frames` the chain of sequence ids its field is nested
+in, and the ceiling has to bind to the destination at the *innermost* depth — the
+object `BeginSequence` handed back, not the top-level receiver. Depth is its own
+axis because a port can cap the top-level receiver and leave every nested one
+uncapped, which no flat case can see. These messages end with their frames still
+open, so an unrelated rejection would pass the forward pass unnoticed; the
+negative control is what rules that out, lifting the same kind of ceiling the
+case states above what it declares and requiring the answer to change.
 
 ## Benchmarks
 
