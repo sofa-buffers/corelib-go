@@ -106,22 +106,37 @@ type headerCase struct {
 	Serialized  string         `json:"serialized"`
 	Chunks      []string       `json:"chunks"`
 	Expect      headerExpect   `json:"expect"`
+
+	// Frames is the ONE key header_limits_nested adds: the chain of sequence
+	// field ids the target field is nested in, outermost first. The flat block
+	// never carries it (its fields are top-level), so it is empty here and
+	// header_limits_nested_test.go is the file that reads it. The two blocks
+	// share this struct because they are required to share everything else —
+	// see that file's header.
+	Frames []int `json:"frames"`
+}
+
+// loadHeaderBlock decodes one of the two header-ceiling blocks. Both are read
+// through this one function so the nested block cannot drift into a loader,
+// or a shape, of its own.
+func loadHeaderBlock(t *testing.T, block string, raw json.RawMessage) []headerCase {
+	t.Helper()
+	if len(raw) == 0 {
+		t.Fatalf("vector file carries no %s block", block)
+	}
+	var cases []headerCase
+	if err := json.Unmarshal(raw, &cases); err != nil {
+		t.Fatalf("parse %s: %v", block, err)
+	}
+	if len(cases) == 0 {
+		t.Fatalf("%s block is empty", block)
+	}
+	return cases
 }
 
 func loadHeaderCases(t *testing.T) []headerCase {
 	t.Helper()
-	vf := loadVectors(t)
-	if len(vf.HeaderLimits) == 0 {
-		t.Fatal("vector file carries no header_limits block")
-	}
-	var cases []headerCase
-	if err := json.Unmarshal(vf.HeaderLimits, &cases); err != nil {
-		t.Fatalf("parse header_limits: %v", err)
-	}
-	if len(cases) == 0 {
-		t.Fatal("header_limits block is empty")
-	}
-	return cases
+	return loadHeaderBlock(t, "header_limits", loadVectors(t).HeaderLimits)
 }
 
 // --- reading the header the case is made of ----------------------------------
@@ -155,6 +170,33 @@ func headerVarint(t *testing.T, name string, b []byte, off int) (uint64, int) {
 	return 0, 0
 }
 
+// headerFramePrefix walks the sequence headers the case's `frames` names and
+// returns the offset of the TARGET FIELD's header. It is 0 for every flat case,
+// which carries no frames at all.
+//
+// It also CHECKS the walk: each prefix byte must open a sequence, at the id
+// `frames` states, in the order it states them. The key and the bytes are two
+// statements of the same nesting, and a case where they disagree would run
+// against a chain built from the key while the wire carried another — which is
+// precisely the confusion the nested block exists to detect, so it must not
+// arise inside the runner itself.
+func headerFramePrefix(t *testing.T, c headerCase, raw []byte) int {
+	t.Helper()
+	off := 0
+	for d, want := range c.Frames {
+		h, next := headerVarint(t, c.Name, raw, off)
+		if wt := sofab.WireType(h & 0x07); wt != sofab.TypeSequenceStart {
+			t.Fatalf("%s: frames[%d] says a sequence opens at id %d, but the bytes carry wire type %d",
+				c.Name, d, want, wt)
+		}
+		if got := int(h >> 3); got != want {
+			t.Fatalf("%s: frames[%d] says id %d, the bytes open a sequence at id %d", c.Name, d, want, got)
+		}
+		off = next
+	}
+	return off
+}
+
 // headerShape is what the case's bytes declare: the construct whose ceiling is
 // under test, the field id, and the length or count word's value.
 type headerShape struct {
@@ -169,7 +211,7 @@ func readHeaderShape(t *testing.T, c headerCase) headerShape {
 	if err != nil {
 		t.Fatalf("%s: serialized is not hex: %v", c.Name, err)
 	}
-	h, off := headerVarint(t, c.Name, raw, 0)
+	h, off := headerVarint(t, c.Name, raw, headerFramePrefix(t, c, raw))
 	s := headerShape{id: sofab.ID(h >> 3)}
 	switch sofab.WireType(h & 0x07) {
 	case sofab.TypeFixlen:
@@ -218,13 +260,20 @@ func readHeaderShape(t *testing.T, c headerCase) headerShape {
 // route is what leaves the case's own ceiling as the only cap in play.
 func headerDestination(t *testing.T, c headerCase, s headerShape) (sofab.Visitor, func() int) {
 	t.Helper()
+	elem, row, caps := headerCeilings(t, c, s)
+	return headerLeaf(t, c.Name, s, c.FieldID, elem, row, caps)
+}
+
+// headerCeilings turns the case's `schema` / `limits` entry into the two bound
+// values the collector takes. Split out of headerDestination so the nested
+// block's negative control can build the SAME leaf with one ceiling lifted
+// instead of growing a second, subtly different destination of its own.
+func headerCeilings(t *testing.T, c headerCase, s headerShape) (elem, row sofab.Bounds, caps sofab.Caps) {
+	t.Helper()
 	if (c.Schema == nil) == (c.Limits == nil) {
 		t.Fatalf("%s: a case carries exactly one of `schema` and `limits` (§6.2.1)", c.Name)
 	}
-	outer := sofab.Bounds{Count: c.FieldID + 1}
-	elem := sofab.Bounds{Count: c.FieldID + 1}
-	row := sofab.Bounds{}
-	var caps sofab.Caps
+	elem = sofab.Bounds{Count: c.FieldID + 1}
 
 	if c.Schema != nil {
 		if c.Schema.MaxLen == nil {
@@ -236,19 +285,28 @@ func headerDestination(t *testing.T, c headerCase, s headerShape) (sofab.Visitor
 		default:
 			elem.ElemLen = *c.Schema.MaxLen
 		}
-	} else {
-		switch {
-		case c.Limits.MaxDynStringLen != nil:
-			caps.StringLen = *c.Limits.MaxDynStringLen
-		case c.Limits.MaxDynBlobLen != nil:
-			caps.BlobLen = *c.Limits.MaxDynBlobLen
-		case c.Limits.MaxDynArrayCount != nil:
-			caps.ArrayCount = *c.Limits.MaxDynArrayCount
-		default:
-			t.Fatalf("%s: `limits` names no §6.2.1 cap", c.Name)
-		}
+		return elem, row, caps
 	}
+	switch {
+	case c.Limits.MaxDynStringLen != nil:
+		caps.StringLen = *c.Limits.MaxDynStringLen
+	case c.Limits.MaxDynBlobLen != nil:
+		caps.BlobLen = *c.Limits.MaxDynBlobLen
+	case c.Limits.MaxDynArrayCount != nil:
+		caps.ArrayCount = *c.Limits.MaxDynArrayCount
+	default:
+		t.Fatalf("%s: `limits` names no §6.2.1 cap", c.Name)
+	}
+	return elem, row, caps
+}
 
+// headerLeaf is THE destination both header blocks bind — the collector whose
+// FixlenBegin / ArrayBegin carries this library's §6.2.1 guard. The nested block
+// reaches it through a chain of sequences instead of at the top level, and that
+// is the ONLY thing the two blocks are allowed to differ in, so the leaf itself
+// is built here once.
+func headerLeaf(t *testing.T, name string, s headerShape, fieldID int, elem, row sofab.Bounds, caps sofab.Caps) (sofab.Visitor, func() int) {
+	t.Helper()
 	switch s.construct {
 	case "string":
 		var out []string
@@ -257,10 +315,11 @@ func headerDestination(t *testing.T, c headerCase, s headerShape) (sofab.Visitor
 		var out [][]byte
 		return sofab.NewBlobSeq(&out, elem, caps), func() int { return len(out) }
 	case "array":
+		outer := sofab.Bounds{Count: fieldID + 1}
 		var out [][]uint64
 		return sofab.NewUnsignedMatrixSeq[uint64](&out, outer, row, caps, 0), func() int { return len(out) }
 	}
-	t.Fatalf("%s: no destination for construct %q", c.Name, s.construct)
+	t.Fatalf("%s: no destination for construct %q", name, s.construct)
 	return nil, nil
 }
 
@@ -289,6 +348,15 @@ func feedHeaderCase(t *testing.T, c headerCase, v sofab.Visitor) (*sofab.Decoder
 			t.Fatalf("%s: chunk %d is not hex: %v", c.Name, i, derr)
 		}
 		out, err = d.Feed(b)
+		// EVERY FEED BEFORE THE LAST MUST ANSWER INCOMPLETE. The case's verdict
+		// belongs to the whole byte string, so a decoder that produced it early
+		// answered on bytes it had not been given — and one that produced it
+		// late would be reading the chunking rather than the message (§7.2
+		// item 4). Only the last feed's answer is the case's.
+		if i < len(pieces)-1 && (out != sofab.Incomplete || err != nil) {
+			t.Fatalf("%s: chunk %d of %d answered %v (err %v), want INCOMPLETE — "+
+				"the verdict is the whole byte string's", c.Name, i+1, len(pieces), out, err)
+		}
 	}
 	return d, out, err
 }

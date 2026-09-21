@@ -77,6 +77,16 @@ type vectorFile struct {
 	// the ceiling to configure for it, which a vector has no field for at all.
 	HeaderLimits json.RawMessage `json:"header_limits"`
 
+	// header_limits_nested is the same corpus ONE OR TWO SEQUENCE FRAMES DEEPER,
+	// run by header_limits_nested_test.go. Upstream keeps it a separate
+	// top-level block on purpose: its byte strings open with a sequence header,
+	// so a consumer that did not understand the `frames` key would bind its
+	// ceiling at the top level, cap nothing, and answer INCOMPLETE where the
+	// case demands a rejection. An unknown top-level block is simply ignored by
+	// an older consumer, so each port adopts the axis when it has a runner for
+	// it — and a port without one must not pretend otherwise.
+	HeaderLimitsNested json.RawMessage `json:"header_limits_nested"`
+
 	// boolean_tolerant is the corpus for CORELIB_PLAN §4.4's decode half, run by
 	// boolean_tolerant_test.go. RawMessage again, and for the sharpest reason of
 	// the three: its bytes are NOT replayable through `fields`, because a

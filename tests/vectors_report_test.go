@@ -279,6 +279,18 @@ func TestVectorFileInventory(t *testing.T) {
 			"header_limits_test.go (§6.2.1/§6.3)", len(vf.HeaderLimits))
 	}
 
+	// The same ceiling one or two sequence frames deeper is run by
+	// header_limits_nested_test.go, and asserted present separately: a copy that
+	// carries `header_limits` but predates `header_limits_nested` leaves the flat
+	// axis green while the nested one — the axis a port that caps only its
+	// top-level receiver fails — has no corpus at all.
+	if len(vf.HeaderLimitsNested) == 0 {
+		t.Error("top-level header_limits_nested block missing; the nested §6.2.1/§6.3 axis has no corpus to run")
+	} else {
+		t.Logf("top-level header_limits_nested block present (%d bytes) and run by "+
+			"header_limits_nested_test.go (§6.2.1/§6.3, nested)", len(vf.HeaderLimitsNested))
+	}
+
 	// §4.4 (canonical on encode, tolerant on decode) is run by
 	// boolean_tolerant_test.go, and asserted present for the same reason: the
 	// file is copied verbatim (§7.1/§8), and a copy that predates the block
