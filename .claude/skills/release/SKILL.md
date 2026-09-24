@@ -103,6 +103,26 @@ grep -n 'Go \*\*1\.' README.md
 grep -n "go: \['" .github/workflows/ci.yml
 ```
 
+**If a release version ever does enter the tree, this audit stops being enough and
+the repo needs the family's `version-consistency.yml` gate.** §12.3 exempts Go
+only because the tag is the sole copy of the version; add a second copy and the
+exemption lapses, because the two can now disagree. The trigger is any of: a
+`Version`/`version` constant or a `VERSION` file, a version written into the
+README or `doc.go`, or a packaging manifest. The gate to copy is
+`sofa-buffers/corelib-c-cpp`'s
+[`.github/workflows/version-consistency.yaml`](https://github.com/sofa-buffers/corelib-c-cpp/blob/main/.github/workflows/version-consistency.yaml)
+— it derives the reference from `${GITHUB_REF_NAME#v}` on a tag push and fails the
+tag on any mismatch. Say this to the user rather than adding the copy quietly:
+introducing a second version location is a decision, and the better answer is
+usually not to.
+
+Until then the check is that the tree stays clean of versions:
+
+```bash
+git ls-files -z | xargs -0 grep -nE '\b[0-9]+\.[0-9]+\.[0-9]+\b' \
+  | grep -viE 'assets/test_vectors|\.claude/skills|go 1\.|GO_VERSION|§'
+```
+
 ## Step 3 — the README must still be true
 
 CORELIB_PLAN §9 binds the README: every version number, dependency, feature flag
