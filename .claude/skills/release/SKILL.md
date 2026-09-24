@@ -23,7 +23,8 @@ should not be.
 
 ## Step 0 — settle the version number
 
-Ask the user for it if they did not say. Two rules constrain it:
+Ask the user for it if they did not say. It is a plain semver number here
+(`0.11.0`); the tag adds the lowercase `v` in step 4. Two rules constrain it:
 
 - **The family moves together.** The version is coordinated across all
   `corelib-*` ports and `sofabgen`; `v0.10.0`'s notes read "Aligns this library
@@ -115,8 +116,19 @@ The coverage badge and the godoc site are automatic (`ci.yml` publishes to the
 
 ## Step 4 — tag
 
+**The tag name is `v` + the semver number — lowercase `v`, no other prefix and no
+suffix: `v1.2.3`.** Never `V1.2.3`, never a bare `1.2.3`, never
+`corelib-go-v1.2.3`. This is not cosmetic. Go's toolchain only recognises a
+version tag in that exact form, so a tag without the `v` publishes nothing to the
+module proxy and `go get` cannot see the release at all. It is also the form
+`version-consistency.yml` matches family-wide (`tags: [ 'v*' ]`, CORELIB_PLAN
+§12.3) and the form both existing releases use.
+
 Use an **annotated** tag. `v0.9.0` is annotated and `v0.10.0` is lightweight;
 annotated is the one to keep, because the message carries the spec citation.
+
+The **message** names the version without the `v` ("SofaBuffers corelib 0.9.0"),
+which is what `v0.9.0` does; only the tag name carries the prefix.
 
 ```bash
 git tag -a v0.11.0 -m "SofaBuffers corelib 0.11.0
