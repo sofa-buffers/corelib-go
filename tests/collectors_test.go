@@ -503,6 +503,79 @@ func TestMessageSeqCapacityEdges(t *testing.T) {
 	}
 }
 
+// An element whose declared defaults are not zero (generator#609): every slot
+// the collector creates -- the gap before an id and the slot at the id -- is
+// seeded by init, so an interior element the encoder omitted for being at its
+// default reads back as that default, not as Go's zero value.
+func TestMessageSeqInitSeedsEveryCreatedSlot(t *testing.T) {
+	raw := wrapperSeq(t, func(e *sofab.Encoder) {
+		e.WriteSequenceBeginLazy(2)
+		e.WriteUnsigned(1, 1)
+		e.WriteSequenceEndKeep()
+	})
+
+	seeded := 0
+	init := func(m *elemMsg) { m.N = 9; m.S = "d"; seeded++ }
+	var out []elemMsg
+	mustCollect(t, raw, sofab.NewMessageSeqInit[elemMsg, *elemMsg](&out, sofab.Bounds{}, tcaps, init))
+
+	if len(out) != 3 {
+		t.Fatalf("length %d, want 3", len(out))
+	}
+	if seeded != 3 {
+		t.Fatalf("init ran %d times, want once per created slot (3)", seeded)
+	}
+	for i := 0; i < 2; i++ {
+		if out[i].N != 9 || out[i].S != "d" || out[i].ended != 0 {
+			t.Fatalf("gap element %d = %+v, want the element default {N:9 S:d}", i, out[i])
+		}
+	}
+	if out[2].N != 1 || out[2].S != "d" {
+		t.Fatalf("bound element = %+v, want N from the wire and S from its default", out[2])
+	}
+}
+
+// init seeds a slot when it is CREATED, never again: a reopened id continues the
+// element as it stands (§7.4), so a default must not wipe what an earlier
+// occurrence bound.
+func TestMessageSeqInitDoesNotResetAReopenedElement(t *testing.T) {
+	raw := wrapperSeq(t, func(e *sofab.Encoder) {
+		e.WriteSequenceBeginLazy(0)
+		e.WriteUnsigned(1, 7)
+		e.WriteSequenceEndKeep()
+		e.WriteSequenceBeginLazy(0)
+		e.WriteString(2, "late")
+		e.WriteSequenceEndKeep()
+	})
+
+	seeded := 0
+	init := func(m *elemMsg) { m.N = 9; seeded++ }
+	var out []elemMsg
+	mustCollect(t, raw, sofab.NewMessageSeqInit[elemMsg, *elemMsg](&out, sofab.Bounds{}, tcaps, init))
+
+	if len(out) != 1 || seeded != 1 {
+		t.Fatalf("length %d, init ran %d times; want 1 element seeded once", len(out), seeded)
+	}
+	if out[0].N != 7 || out[0].S != "late" {
+		t.Fatalf("out[0] = %+v, want both occurrences merged over the seeded default", out[0])
+	}
+}
+
+// A refused id creates nothing, so init must not run for it either.
+func TestMessageSeqInitNotRunOnARefusedID(t *testing.T) {
+	seeded := 0
+	var out []elemMsg
+	s := sofab.NewMessageSeqInit[elemMsg, *elemMsg](&out, sofab.Bounds{Count: 2}, tcaps,
+		func(*elemMsg) { seeded++ })
+
+	if _, err := s.BeginSequence(2); !errors.Is(err, sofab.ErrInvalidMsg) {
+		t.Fatalf("id cap: %v, want ErrInvalidMsg", err)
+	}
+	if len(out) != 0 || seeded != 0 {
+		t.Fatalf("refused id left %d elements and ran init %d times, want neither", len(out), seeded)
+	}
+}
+
 // --- NestedSeq ---------------------------------------------------------------
 
 // An array of string arrays: the outer collector reserves the row and hands the

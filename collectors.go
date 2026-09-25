@@ -315,16 +315,24 @@ func (s *BlobSeq) Bytes(id ID, total, offset int, chunk []byte) error {
 // consulted only where the schema states none.
 //
 // The element is decoded IN PLACE at out[id], after the gap up to it is filled
-// with zero elements. That is also what makes a reopened id (§7.4) continue the
-// element already there instead of starting a second one.
+// with element defaults. That is also what makes a reopened id (§7.4) continue
+// the element already there instead of starting a second one.
+//
+// An element default is Go's zero value unless the collector was built with
+// NewMessageSeqInit, whose init seeds each slot the collector creates — the gap
+// before id and the slot at id alike — with the element's declared defaults
+// (MESSAGE_SPEC §2/§5.1: an interior element equal to its default is omitted
+// from the wire, and absence reconstructs exactly that default, which is not
+// the zero value as soon as the element declares a non-zero one).
 type MessageSeq[T any, PT interface {
 	*T
 	Visitor
 }] struct {
 	VisitorBase
-	out *[]T
-	b   Bounds
-	c   Caps
+	out  *[]T
+	b    Bounds
+	c    Caps
+	init func(*T)
 }
 
 // NewMessageSeq builds a struct/union-array collector writing into out. See
@@ -339,6 +347,18 @@ func NewMessageSeq[T any, PT interface {
 	return &MessageSeq[T, PT]{out: out, b: b, c: c}
 }
 
+// NewMessageSeqInit is NewMessageSeq for an element type whose declared defaults
+// are not all zero: init seeds one freshly created element, in place, with those
+// defaults. It runs exactly once per slot the collector creates, and never on a
+// slot that already exists — a reopened id (§7.4) continues the element as it
+// stands, it does not reset it.
+func NewMessageSeqInit[T any, PT interface {
+	*T
+	Visitor
+}](out *[]T, b Bounds, c Caps, init func(*T)) *MessageSeq[T, PT] {
+	return &MessageSeq[T, PT]{out: out, b: b, c: c, init: init}
+}
+
 // BeginSequence hands back the element at id as the visitor for its scope.
 func (s *MessageSeq[T, PT]) BeginSequence(id ID) (Visitor, error) {
 	if err := overIndex(id, s.b.Count, s.c.ArrayCount); err != nil {
@@ -348,6 +368,9 @@ func (s *MessageSeq[T, PT]) BeginSequence(id ID) (Visitor, error) {
 	reserveRows(s.out, id, s.b.Count)
 	for len(*s.out) <= int(id) {
 		*s.out = append(*s.out, zero)
+		if s.init != nil {
+			s.init(&(*s.out)[len(*s.out)-1])
+		}
 	}
 	return PT(&(*s.out)[id]), nil
 }
