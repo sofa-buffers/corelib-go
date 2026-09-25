@@ -417,7 +417,8 @@ Generated code brings no array machinery of its own. An array of strings, blobs,
 structs/unions or arrays arrives as a nested sequence whose child ids are the
 element indices, and rebuilding a slice from those events is the same code for
 every schema, so it lives here: `VisitorBase`, `StringSeq` / `BlobSeq` /
-`MessageSeq` / `NestedSeq`, the matrix collectors with `PlaceRow`, and
+`MessageSeq` (built with `NewMessageSeqInit` when the element declares
+non-zero defaults) / `NestedSeq`, the matrix collectors with `PlaceRow`, and
 `PayloadAcc` for the pieces a payload arrives in. Each takes its bounds as
 fields — the schema's `count:`/`maxlen:` and the receiver caps beside them (see
 [Receiver-side limits](#receiver-side-limits)) — so a corelib that knows no
