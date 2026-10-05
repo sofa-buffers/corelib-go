@@ -1,6 +1,6 @@
 package sofab
 
-import "math"
+import "unsafe"
 
 // Bit-exact equality of float arrays (generator#636).
 //
@@ -22,32 +22,46 @@ import "math"
 // equals another NaN only when the patterns are identical, payload included.
 // The lengths are compared first, so arrays of different length cost one
 // comparison. It neither allocates nor mutates, and accepts a field slice and a
-// constant default literal alike:
+// constant default literal alike. Arrays of up to shortLen elements are compared
+// element by element, longer ones with a single memory compare; both read the
+// same bits, so the result does not depend on the strategy:
 //
 //	sofab.BitsEqual(m.A, []float32{0, 1.5})
 func BitsEqual[S ~[]E, E float32 | float64](a, b S) bool {
 	if len(a) != len(b) {
 		return false
 	}
-	// []E drops a named slice type, so the switch sees []float32 or []float64
-	// whatever S is.
-	switch x := any([]E(a)).(type) {
-	case []float32:
-		y := any([]E(b)).([]float32)
-		y = y[:len(x)]
-		for i := range x {
-			if math.Float32bits(x[i]) != math.Float32bits(y[i]) {
-				return false
-			}
-		}
-	case []float64:
-		y := any([]E(b)).([]float64)
-		y = y[:len(x)]
-		for i := range x {
-			if math.Float64bits(x[i]) != math.Float64bits(y[i]) {
-				return false
-			}
+	if len(a) > shortLen {
+		return bytesEqual(unsafe.Pointer(unsafe.SliceData(a)), unsafe.Pointer(unsafe.SliceData(b)), len(a)*int(unsafe.Sizeof(a[0])))
+	}
+	for i := range a {
+		if bitsDiffer(&a[i], &b[i]) {
+			return false
 		}
 	}
 	return true
+}
+
+// shortLen is the longest array compared element by element: a call into
+// memequal costs more than the compare, and short arrays are the common case
+// (every serialize and isDefault runs one).
+const shortLen = 4
+
+// bytesEqual compares n bytes at a and b. A float slice is len*Sizeof(E)
+// contiguous bytes with no padding, and two values have the same bit pattern
+// exactly when their bytes are equal, so one memequal answers for the whole
+// array. The string conversion of a byte view does not copy (the compiler
+// lowers the comparison to memequal) and nothing is retained or written.
+func bytesEqual(a, b unsafe.Pointer, n int) bool {
+	return unsafe.String((*byte)(a), n) == unsafe.String((*byte)(b), n)
+}
+
+// bitsDiffer reports whether *p and *q have different bit patterns: 4 bytes
+// for a float32, 8 for a float64. Sizeof(E) is a constant per instantiation,
+// so the branch is resolved at compile time.
+func bitsDiffer[E float32 | float64](p, q *E) bool {
+	if unsafe.Sizeof(*p) == 4 {
+		return *(*uint32)(unsafe.Pointer(p)) != *(*uint32)(unsafe.Pointer(q))
+	}
+	return *(*uint64)(unsafe.Pointer(p)) != *(*uint64)(unsafe.Pointer(q))
 }
