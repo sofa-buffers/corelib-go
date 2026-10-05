@@ -32,7 +32,7 @@ func BitsEqual[S ~[]E, E float32 | float64](a, b S) bool {
 		return false
 	}
 	if len(a) > shortLen {
-		return bytesEqual(unsafe.Pointer(unsafe.SliceData(a)), unsafe.Pointer(unsafe.SliceData(b)), len(a)*int(unsafe.Sizeof(a[0])))
+		return bytesEqual(unsafe.Pointer(unsafe.SliceData([]E(a))), unsafe.Pointer(unsafe.SliceData([]E(b))), len(a)*int(unsafe.Sizeof(a[0])))
 	}
 	for i := range a {
 		if bitsDiffer(&a[i], &b[i]) {
