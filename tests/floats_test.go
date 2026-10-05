@@ -312,3 +312,40 @@ func TestBitsEqualDoesNotAllocate(t *testing.T) {
 		t.Fatalf("BitsEqual allocated %v times per run", n)
 	}
 }
+
+// TestBitsEqualEveryLengthAndPosition sweeps the lengths around the point where
+// the helper changes strategy (element-wise for short arrays, one block compare
+// beyond), flipping each single bit pattern of interest at every position,
+// including the first and last byte of the element, so that neither strategy
+// can miss a difference the other would find.
+func TestBitsEqualEveryLengthAndPosition(t *testing.T) {
+	flips32 := []uint32{1, 1 << 7, 1 << 8, 1 << 23, 0x80000000, 0x00400000}
+	flips64 := []uint64{1, 1 << 7, 1 << 8, 1 << 52, 1 << 63, 1 << 51}
+	for n := 0; n <= 40; n++ {
+		a32, a64 := make([]float32, n), make([]float64, n)
+		for i := range a32 {
+			a32[i] = float32(i) + 0.5
+			a64[i] = float64(i) + 0.5
+		}
+		b32, b64 := slices.Clone(a32), slices.Clone(a64)
+		if !sofab.BitsEqual(a32, b32) || !sofab.BitsEqual(a64, b64) {
+			t.Fatalf("n=%d: identical arrays must be equal", n)
+		}
+		for pos := 0; pos < n; pos++ {
+			for _, f := range flips32 {
+				b := slices.Clone(a32)
+				b[pos] = math.Float32frombits(math.Float32bits(b[pos]) ^ f)
+				if got, want := sofab.BitsEqual(a32, b), refBits32(a32, b); got != want || got {
+					t.Fatalf("fp32 n=%d pos=%d flip=%#x: got %v, want %v", n, pos, f, got, want)
+				}
+			}
+			for _, f := range flips64 {
+				b := slices.Clone(a64)
+				b[pos] = math.Float64frombits(math.Float64bits(b[pos]) ^ f)
+				if got, want := sofab.BitsEqual(a64, b), refBits64(a64, b); got != want || got {
+					t.Fatalf("fp64 n=%d pos=%d flip=%#x: got %v, want %v", n, pos, f, got, want)
+				}
+			}
+		}
+	}
+}
