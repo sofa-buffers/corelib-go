@@ -23,8 +23,9 @@ import "unsafe"
 // The lengths are compared first, so arrays of different length cost one
 // comparison. It neither allocates nor mutates, and accepts a field slice and a
 // constant default literal alike. Arrays of up to shortLen elements are compared
-// element by element, longer ones with a single memory compare; both read the
-// same bits, so the result does not depend on the strategy:
+// element by element, longer ones by their first element and then a single
+// memory compare; all read the same bits, so the result does not depend on the
+// strategy:
 //
 //	sofab.BitsEqual(m.A, []float32{0, 1.5})
 func BitsEqual[S ~[]E, E float32 | float64](a, b S) bool {
@@ -32,6 +33,12 @@ func BitsEqual[S ~[]E, E float32 | float64](a, b S) bool {
 		return false
 	}
 	if len(a) > shortLen {
+		// A field usually leaves its default at the first element, and that
+		// answer must not pay for the block compare's call and setup: rejected
+		// here, one compare (generator#708).
+		if bitsDiffer(&a[0], &b[0]) {
+			return false
+		}
 		return bytesEqual(unsafe.Pointer(unsafe.SliceData([]E(a))), unsafe.Pointer(unsafe.SliceData([]E(b))), len(a)*int(unsafe.Sizeof(a[0])))
 	}
 	for i := range a {
