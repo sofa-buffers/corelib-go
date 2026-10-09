@@ -133,6 +133,11 @@ A write that could not produce a valid field writes **nothing** and reports
 | closing a sequence when none is open | a bare `0x07` is an unbalanced end marker |
 | a non-UTF-8 `string`, unless the check is off | see [Feature flags](#feature-flags) |
 
+A bound only the schema declares -- a `maxlen` on a string or blob, a `count` on
+an array -- is not the encoder's to know. Generated code compares the value with
+it and refuses an over-bound one with `e.RejectArgument()`, which records the
+same sticky `ErrArgument`: the encode stops there and `Flush` reports it.
+
 ### Serialize stream
 
 `NewEncoder` takes any `io.Writer` — socket, pipe, file, `gzip.Writer` — and
