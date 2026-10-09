@@ -266,7 +266,7 @@ func newBufferEncoder(buf []byte, offset int, sink Sink, opts []Option) *Encoder
 func (e *Encoder) SetBuffer(buf []byte, offset int) error {
 	if e.w != nil || offset < 0 || offset > len(buf) ||
 		(e.sink != nil && len(buf)-offset < MinOutputBuffer) {
-		return e.rejectArgument()
+		return e.RejectArgument()
 	}
 	if e.err != nil {
 		return e.err
@@ -684,12 +684,23 @@ func (e *Encoder) WriteBool(id ID, b bool) error {
 // bits the comparison is trivially false and the compiler drops it.
 func overCeiling(n int) bool { return uint64(n) > arrayMax }
 
-// rejectArgument records a caller-argument rejection as the sticky error and
-// reports it. It is out of line so a guard that calls it costs one
-// well-predicted compare on the hot path and nothing else.
+// RejectArgument records a caller-argument rejection (ErrArgument, §6.3
+// InvalidArgument) as the sticky error and reports it. From then on every write
+// is a no-op and Flush, Err and every later write report ErrArgument, so the
+// bytes written so far are never handed back as a complete message. An error
+// already recorded is kept: the first failure is the one reported.
+//
+// The encoder's own guards (the FIXLEN_MAX / ARRAY_MAX ceiling, sequence
+// balance) call it, and so does generated code: a value past a bound only the
+// schema declares -- a string or blob longer than its maxlen, an array holding
+// more elements than its count -- is compared with that bound by the generated
+// guard, which calls this to refuse it. The encoder itself knows no schema bound.
+//
+// It is out of line so a guard that calls it costs one well-predicted compare on
+// the hot path and nothing else.
 //
 //go:noinline
-func (e *Encoder) rejectArgument() error {
+func (e *Encoder) RejectArgument() error {
 	e.setErr(ErrArgument)
 	return e.err
 }
@@ -699,7 +710,7 @@ func (e *Encoder) rejectArgument() error {
 // A payload past FIXLEN_MAX is refused with ErrArgument and writes nothing.
 func (e *Encoder) writeFixlen(id ID, data []byte, sub uint64) {
 	if overCeiling(len(data)) {
-		e.rejectArgument()
+		e.RejectArgument()
 		return
 	}
 	if e.writeHeaderRoom(id, TypeFixlen, maxVarintLen) {
@@ -770,7 +781,7 @@ func (e *Encoder) WriteString(id ID, s string) error {
 		return e.err
 	}
 	if overCeiling(len(s)) {
-		return e.rejectArgument()
+		return e.RejectArgument()
 	}
 	if e.lim.strictUTF8On() && !utf8.ValidString(s) {
 		e.setErr(ErrArgument)
@@ -877,7 +888,7 @@ func (e *Encoder) WriteSequenceEnd() error {
 		return e.err
 	}
 	if e.depth == 0 {
-		return e.rejectArgument()
+		return e.RejectArgument()
 	}
 	if n := len(e.pending); n != 0 {
 		// The innermost open sequence is the last held-back one (pending is a
@@ -924,7 +935,7 @@ func (e *Encoder) WriteSequenceEndKeep() error {
 		return e.err
 	}
 	if e.depth == 0 {
-		return e.rejectArgument()
+		return e.RejectArgument()
 	}
 	if len(e.pending) != 0 {
 		e.commitPending()
@@ -941,7 +952,7 @@ func (e *Encoder) WriteSequenceEndKeep() error {
 // refused with ErrArgument and emits nothing.
 func WriteUnsignedArray[T Unsigned](e *Encoder, id ID, a []T) error {
 	if overCeiling(len(a)) {
-		return e.rejectArgument()
+		return e.RejectArgument()
 	}
 	if !e.writeHeaderRoom(id, TypeVarintArrayUnsigned, maxVarintLen) {
 		return e.err
@@ -955,7 +966,7 @@ func WriteUnsignedArray[T Unsigned](e *Encoder, id ID, a []T) error {
 // refused with ErrArgument and emits nothing.
 func WriteSignedArray[T Signed](e *Encoder, id ID, a []T) error {
 	if overCeiling(len(a)) {
-		return e.rejectArgument()
+		return e.RejectArgument()
 	}
 	if !e.writeHeaderRoom(id, TypeVarintArraySigned, maxVarintLen) {
 		return e.err
@@ -1157,7 +1168,7 @@ func putZigzagRun[T Signed](e *Encoder, a []T) error {
 // An array longer than ARRAY_MAX is refused with ErrArgument and emits nothing.
 func (e *Encoder) WriteFloat32Array(id ID, a []float32) error {
 	if overCeiling(len(a)) {
-		return e.rejectArgument()
+		return e.RejectArgument()
 	}
 	if !e.writeHeaderRoom(id, TypeFixlenArray, maxCountLen+fixlenWordFloat) {
 		return e.err
@@ -1190,7 +1201,7 @@ func (e *Encoder) WriteFloat32Array(id ID, a []float32) error {
 // An array longer than ARRAY_MAX is refused with ErrArgument and emits nothing.
 func (e *Encoder) WriteFloat64Array(id ID, a []float64) error {
 	if overCeiling(len(a)) {
-		return e.rejectArgument()
+		return e.RejectArgument()
 	}
 	if !e.writeHeaderRoom(id, TypeFixlenArray, maxCountLen+fixlenWordFloat) {
 		return e.err

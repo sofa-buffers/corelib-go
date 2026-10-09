@@ -334,3 +334,84 @@ func TestFullCallerBufferRefusesEverythingAfterwards(t *testing.T) {
 		t.Errorf("the buffer grew from %d to %d bytes after the failure", written, got)
 	}
 }
+
+// RejectArgument is how a caller -- generated code holding a schema bound the
+// encoder never sees -- refuses a value it found past that bound (§6.3
+// InvalidArgument). It must behave exactly like the encoder's own argument
+// guards: ErrArgument, sticky, every later write a no-op, and nothing written
+// before it ever reported as a complete message, on every encoder form.
+func TestRejectArgumentIsStickyOnEveryForm(t *testing.T) {
+	forms := map[string]func() (*sofab.Encoder, *bytes.Buffer){
+		"buffer": func() (*sofab.Encoder, *bytes.Buffer) {
+			e, err := sofab.NewEncoderBuffer(make([]byte, 64), 0)
+			if err != nil {
+				t.Fatalf("NewEncoderBuffer: %v", err)
+			}
+			return e, nil
+		},
+		"sink": func() (*sofab.Encoder, *bytes.Buffer) {
+			var out bytes.Buffer
+			e, err := sofab.NewEncoderSink(make([]byte, 32), 0, func(_ *sofab.Encoder, b []byte) error {
+				out.Write(b)
+				return nil
+			})
+			if err != nil {
+				t.Fatalf("NewEncoderSink: %v", err)
+			}
+			return e, &out
+		},
+		"writer": func() (*sofab.Encoder, *bytes.Buffer) {
+			var out bytes.Buffer
+			return sofab.NewEncoder(&out), &out
+		},
+	}
+	for name, mk := range forms {
+		t.Run(name, func(t *testing.T) {
+			e, out := mk()
+			if err := e.WriteUnsigned(1, 7); err != nil {
+				t.Fatalf("WriteUnsigned before the rejection: %v", err)
+			}
+			before := len(e.Bytes())
+			if err := e.RejectArgument(); !errors.Is(err, sofab.ErrArgument) {
+				t.Fatalf("RejectArgument = %v, want ErrArgument", err)
+			}
+			if err := e.Err(); !errors.Is(err, sofab.ErrArgument) {
+				t.Errorf("Err after the rejection = %v, want ErrArgument", err)
+			}
+			for i, w := range []func() error{
+				func() error { return e.WriteUnsigned(2, 1) },
+				func() error { return e.WriteString(3, "abc") },
+				func() error { return e.WriteBytes(4, []byte{1}) },
+				func() error { return sofab.WriteUnsignedArray(e, 5, []uint8{1, 2}) },
+				func() error { return e.WriteSequenceBeginLazy(6) },
+			} {
+				if err := w(); !errors.Is(err, sofab.ErrArgument) {
+					t.Errorf("write %d after the rejection = %v, want ErrArgument", i, err)
+				}
+			}
+			if got := len(e.Bytes()); got != before {
+				t.Errorf("%d byte(s) written after the rejection", got-before)
+			}
+			if err := e.Flush(); !errors.Is(err, sofab.ErrArgument) {
+				t.Errorf("Flush = %v, want ErrArgument", err)
+			}
+			if out != nil && out.Len() != 0 {
+				t.Errorf("%d byte(s) reached the destination after a rejected encode", out.Len())
+			}
+		})
+	}
+}
+
+// An error recorded before the rejection is the one reported: RejectArgument
+// never overwrites the first failure.
+func TestRejectArgumentKeepsTheFirstError(t *testing.T) {
+	e, err := sofab.NewEncoderBuffer(make([]byte, 4), 0)
+	if err != nil {
+		t.Fatalf("NewEncoderBuffer: %v", err)
+	}
+	_ = e.WriteBytes(1, bytes.Repeat([]byte{'x'}, 100))
+	_ = e.Flush()
+	if err := e.RejectArgument(); !errors.Is(err, sofab.ErrBufferFull) {
+		t.Fatalf("RejectArgument after a full buffer = %v, want the first error ErrBufferFull", err)
+	}
+}
