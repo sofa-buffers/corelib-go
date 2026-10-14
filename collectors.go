@@ -33,6 +33,16 @@ package sofab
 //     is always written, which is what makes the decoded length — highest
 //     present id + 1 — exact.
 //
+// A destination decoded into AGAIN reuses storage (#152). Generated code
+// truncates a wrapper array's field before refilling it, so the previous
+// decode's blob elements and rows are still in the backing array past the new
+// length; BlobSeq, NestedSeq and the matrix collectors refill the slot at an
+// index from the storage that same slot held. Two consequences are the
+// caller's to know: an element or row KEPT from a previous decode is
+// overwritten by the next decode into the same destination (copy what you
+// keep), and a slot keeps the largest storage it ever needed until the field is
+// set to nil. See grow.
+//
 // The collectors are decode destinations, so they are also where a materialized
 // string is checked for UTF-8 validity (§6.4): a payload the decoder skips
 // never reaches a collector at all, which is the point — validation follows the
@@ -243,10 +253,7 @@ func (s *StringSeq) String(id ID, total, offset int, chunk []byte) error {
 	if !s.UTF8Valid(b) {
 		return ErrInvalidMsg
 	}
-	reserveRows(s.out, id, s.b.Count)
-	for len(*s.out) <= int(id) {
-		*s.out = append(*s.out, "")
-	}
+	grow(s.out, id, s.b.Count)
 	(*s.out)[id] = string(b)
 	return nil
 }
@@ -255,7 +262,8 @@ func (s *StringSeq) String(id ID, total, offset int, chunk []byte) error {
 // placement, same piecewise assembly, no UTF-8 check (a blob is bytes).
 // Elements are COPIED out of the accumulator, because a payload that arrived in
 // one piece is a window into the caller's fed bytes and this collector keeps it
-// past the call (§6.7).
+// past the call (§6.7). The copy lands in the storage a previous decode left at
+// the same index when it is large enough — see stale for that contract.
 type BlobSeq struct {
 	VisitorBase
 	out *[][]byte
@@ -284,7 +292,9 @@ func (s *BlobSeq) FixlenBegin(id ID, subtype FixlenSubtype, total int) error {
 
 // Bytes accumulates one element's pieces and places a copy of the finished
 // element at the index its id names, growing Out with nil elements across any
-// gap.
+// gap. The copy reuses the storage a previous decode left at that index
+// (ReuseBytes), so a destination decoded into again pays no allocation for an
+// element that still fits.
 func (s *BlobSeq) Bytes(id ID, total, offset int, chunk []byte) error {
 	if err := overIndex(id, s.b.Count, s.c.ArrayCount); err != nil {
 		return err
@@ -296,11 +306,15 @@ func (s *BlobSeq) Bytes(id ID, total, offset int, chunk []byte) error {
 	if !done {
 		return nil
 	}
-	reserveRows(s.out, id, s.b.Count)
-	for len(*s.out) <= int(id) {
-		*s.out = append(*s.out, nil)
+	old := grow(s.out, id, s.b.Count)
+	if offset > 0 && cap(old) < len(b) {
+		// Assembled from several chunks, so b is the accumulator's buffer,
+		// handed over to us (PayloadAcc.Take): keep it rather than copy it a
+		// second time into storage that does not fit anyway.
+		(*s.out)[id] = b
+		return nil
 	}
-	(*s.out)[id] = append([]byte(nil), b...)
+	(*s.out)[id] = ReuseBytes(old, b)
 	return nil
 }
 
@@ -415,7 +429,9 @@ func NewNestedSeq[T any](out *[][]T, b Bounds, c Caps, make func(*[]T) Visitor) 
 // It is a truncation rather than a nil assignment so the row keeps its backing
 // array, which matches the reset generated code emits for a wrapper array's own
 // field id (`m.Field = m.Field[:0]`). MessageSeq does NOT do this, and must not:
-// the merging half of §7.4 is exactly its case.
+// the merging half of §7.4 is exactly its case. For the same reason a row past
+// Out's length starts from the backing array a previous decode left in that slot
+// (grow), not from nil.
 //
 // Order is load-bearing: overIndex returns FIRST, so a refused element index
 // cannot wipe a valid earlier row -- the §7.3 interaction where a destructive
@@ -426,9 +442,8 @@ func (s *NestedSeq[T]) BeginSequence(id ID) (Visitor, error) {
 	if err := overIndex(id, s.b.Count, s.c.ArrayCount); err != nil {
 		return nil, err
 	}
-	reserveRows(s.out, id, s.b.Count)
-	for len(*s.out) <= int(id) {
-		*s.out = append(*s.out, nil)
+	if stale := grow(s.out, id, s.b.Count); stale != nil {
+		(*s.out)[id] = stale
 	}
 	(*s.out)[id] = (*s.out)[id][:0]
 	return s.make(&(*s.out)[id]), nil
@@ -468,15 +483,13 @@ func arrivedRow[T any](row []T) []T {
 // requires the two to be one implementation.
 //
 // The row is stored as given, not copied — unlike a blob element, a decoded
-// native array is freshly built by the decoder and has no other owner.
+// native array is built by its collector, in storage only the destination owns
+// (a fresh slice, or the row a previous decode left at the same index).
 func PlaceRow[T any](out *[][]T, b Bounds, c Caps, id ID, row []T) error {
 	if err := overIndex(id, b.Count, c.ArrayCount); err != nil {
 		return err
 	}
-	reserveRows(out, id, b.Count)
-	for len(*out) <= int(id) {
-		*out = append(*out, nil)
-	}
+	grow(out, id, b.Count)
 	(*out)[id] = row
 	return nil
 }
@@ -522,8 +535,11 @@ func (g *rowGate) ended() bool { d := g.declined; g.declined = false; return d }
 // this shape ("an id-keyed wrapper-array collector, growing the container as
 // elements arrive") as the helper case.
 //
-// The finished row is handed to PlaceRow at ArrayEnd and the collector drops it,
-// so the next row starts from a fresh slice and no placed row is written over.
+// The finished row is handed to PlaceRow at ArrayEnd and the collector drops it.
+// The next row starts from the storage a PREVIOUS decode left at its index
+// (stale), and from a fresh slice otherwise — never from a row this decode has
+// placed, its own included: a reopened row (§7.4) that then fails mid-row must
+// leave the row it was replacing intact, not half overwritten.
 // An array the message truncates never reaches ArrayEnd, so no partial row is
 // ever placed — and a row DECLINED at ArrayBegin under §7.3 does not reach
 // PlaceRow either, which is what rowGate below is for.
@@ -572,9 +588,9 @@ func NewUnsignedMatrixSeq[T Unsigned](out *[][]T, b, row Bounds, c Caps, hi uint
 }
 
 // ArrayBegin declines a row whose wire kind is not this array's (§7.3), and
-// otherwise bounds the row id and the row's announced element count and opens a
-// fresh row. The decline is latched for ArrayEnd: neither bound is a declined
-// row's to answer to.
+// otherwise bounds the row id and the row's announced element count and opens
+// the row, over the storage a previous decode left at its index. The decline is
+// latched for ArrayEnd: neither bound is a declined row's to answer to.
 func (s *UnsignedMatrixSeq[T]) ArrayBegin(id ID, kind ArrayKind, count int) error {
 	if !s.mine(kind == ArrayUnsigned) {
 		return nil
@@ -585,7 +601,7 @@ func (s *UnsignedMatrixSeq[T]) ArrayBegin(id ID, kind ArrayKind, count int) erro
 	if err := overLen(count, s.row.Count, s.c.ArrayCount); err != nil {
 		return err
 	}
-	s.cur = nil
+	s.cur = stale(*s.out, id)[:0]
 	return nil
 }
 
@@ -636,9 +652,9 @@ func NewSignedMatrixSeq[T Signed](out *[][]T, b, row Bounds, c Caps, lo, hi int6
 }
 
 // ArrayBegin declines a row whose wire kind is not this array's (§7.3), and
-// otherwise bounds the row id and the row's announced element count and opens a
-// fresh row. The decline is latched for ArrayEnd: neither bound is a declined
-// row's to answer to.
+// otherwise bounds the row id and the row's announced element count and opens
+// the row, over the storage a previous decode left at its index. The decline is
+// latched for ArrayEnd: neither bound is a declined row's to answer to.
 func (s *SignedMatrixSeq[T]) ArrayBegin(id ID, kind ArrayKind, count int) error {
 	if !s.mine(kind == ArraySigned) {
 		return nil
@@ -649,7 +665,7 @@ func (s *SignedMatrixSeq[T]) ArrayBegin(id ID, kind ArrayKind, count int) error 
 	if err := overLen(count, s.row.Count, s.c.ArrayCount); err != nil {
 		return err
 	}
-	s.cur = nil
+	s.cur = stale(*s.out, id)[:0]
 	return nil
 }
 
@@ -693,9 +709,9 @@ func NewFloat32MatrixSeq(out *[][]float32, b, row Bounds, c Caps) *Float32Matrix
 }
 
 // ArrayBegin declines a row whose wire kind is not this array's (§7.3), and
-// otherwise bounds the row id and the row's announced element count and opens a
-// fresh row. The decline is latched for ArrayEnd: neither bound is a declined
-// row's to answer to.
+// otherwise bounds the row id and the row's announced element count and opens
+// the row, over the storage a previous decode left at its index. The decline is
+// latched for ArrayEnd: neither bound is a declined row's to answer to.
 func (s *Float32MatrixSeq) ArrayBegin(id ID, kind ArrayKind, count int) error {
 	if !s.mine(kind == ArrayFp32) {
 		return nil
@@ -706,7 +722,7 @@ func (s *Float32MatrixSeq) ArrayBegin(id ID, kind ArrayKind, count int) error {
 	if err := overLen(count, s.row.Count, s.c.ArrayCount); err != nil {
 		return err
 	}
-	s.cur = nil
+	s.cur = stale(*s.out, id)[:0]
 	return nil
 }
 
@@ -746,9 +762,9 @@ func NewFloat64MatrixSeq(out *[][]float64, b, row Bounds, c Caps) *Float64Matrix
 }
 
 // ArrayBegin declines a row whose wire kind is not this array's (§7.3), and
-// otherwise bounds the row id and the row's announced element count and opens a
-// fresh row. The decline is latched for ArrayEnd: neither bound is a declined
-// row's to answer to.
+// otherwise bounds the row id and the row's announced element count and opens
+// the row, over the storage a previous decode left at its index. The decline is
+// latched for ArrayEnd: neither bound is a declined row's to answer to.
 func (s *Float64MatrixSeq) ArrayBegin(id ID, kind ArrayKind, count int) error {
 	if !s.mine(kind == ArrayFp64) {
 		return nil
@@ -759,7 +775,7 @@ func (s *Float64MatrixSeq) ArrayBegin(id ID, kind ArrayKind, count int) error {
 	if err := overLen(count, s.row.Count, s.c.ArrayCount); err != nil {
 		return err
 	}
-	s.cur = nil
+	s.cur = stale(*s.out, id)[:0]
 	return nil
 }
 
@@ -802,9 +818,9 @@ func NewBoolMatrixSeq(out *[][]bool, b, row Bounds, c Caps) *BoolMatrixSeq {
 }
 
 // ArrayBegin declines a row whose wire kind is not this array's (§7.3), and
-// otherwise bounds the row id and the row's announced element count and opens a
-// fresh row. The decline is latched for ArrayEnd: neither bound is a declined
-// row's to answer to.
+// otherwise bounds the row id and the row's announced element count and opens
+// the row, over the storage a previous decode left at its index. The decline is
+// latched for ArrayEnd: neither bound is a declined row's to answer to.
 func (s *BoolMatrixSeq) ArrayBegin(id ID, kind ArrayKind, count int) error {
 	if !s.mine(kind == ArrayUnsigned) {
 		return nil
@@ -815,7 +831,7 @@ func (s *BoolMatrixSeq) ArrayBegin(id ID, kind ArrayKind, count int) error {
 	if err := overLen(count, s.row.Count, s.c.ArrayCount); err != nil {
 		return err
 	}
-	s.cur = nil
+	s.cur = stale(*s.out, id)[:0]
 	return nil
 }
 
@@ -855,3 +871,87 @@ func reserveRows[T any](out *[]T, id ID, count int) {
 
 // reserveRowsMax is the largest schema count reserveRows commits up front.
 const reserveRowsMax = 64
+
+// stale is the element a PREVIOUS decode left at index id of out's backing
+// array, past out's length — or the zero value when id is inside the length
+// (the slot belongs to this decode) or past the capacity (there is no slot).
+//
+// It is what lets a destination decoded into again reuse a blob element's or a
+// row's storage instead of allocating it anew: generated code truncates the
+// outer slice (`m.Field = m.Field[:0]`), but the inner slices are still there,
+// one per index, in the backing array.
+//
+// The reuse is index-for-index — the old storage of slot id only ever becomes
+// the new slot id — so it cannot make two elements of one decode share memory.
+// And it never reaches inside the length, so nothing this decode has placed is
+// written over by a later element of the same decode. A backing array whose
+// tail the caller does not own exclusively (out = buf[k:k], or a struct copy
+// sharing a field's array) is outside this contract — as it already was for the
+// outer slice, which append writes into the same way.
+func stale[T any](out []T, id ID) T {
+	if n := int(id); n >= len(out) && n < cap(out) {
+		return out[:cap(out)][n]
+	}
+	var zero T
+	return zero
+}
+
+// grow makes *out long enough to hold index id, filling every new slot with the
+// zero value (the element default of a gap), and returns what slot id held
+// before (stale). It is the one place that reads a stale slot ahead of the
+// zero-fill that overwrites it, so no collector has to get that order right.
+//
+// The room is reserved first (reserveRows): the schema count in one allocation
+// where it is small, ordinary append growth otherwise.
+func grow[T any](out *[]T, id ID, count int) T {
+	prev := stale(*out, id)
+	reserveRows(out, id, count)
+	var zero T
+	for len(*out) <= int(id) {
+		*out = append(*out, zero)
+	}
+	return prev
+}
+
+// ReuseSlice is the storage a generated ArrayBegin arm decodes a native array of
+// count elements into: s itself, truncated, when its capacity already holds
+// count, and otherwise a fresh slice of exactly that capacity. It replaces
+// `m.X = make([]T, 0, count)`, which allocated on every decode even into a
+// destination that already had the room.
+//
+// A nil s always allocates, so an array that ARRIVED empty decodes as an empty
+// slice and not as nil — the difference a serializer renders as `[]` versus
+// `null`, and the one make([]T, 0, 0) gave before.
+//
+// count is a wire number. The caller MUST have bounded it — the schema's
+// `count:`, or the §6.2.1 receiver cap — before this call: sizing storage from
+// it is this helper's job (§6.6.1), deciding whether it may be that large is
+// not.
+func ReuseSlice[T any](s []T, count int) []T {
+	if s != nil && cap(s) >= count {
+		return s[:0]
+	}
+	return make([]T, 0, count)
+}
+
+// ReuseBytes copies src into dst's storage when it fits, and into a fresh,
+// exactly sized slice when it does not, returning the result. It replaces `append([]byte(nil),
+// src...)` for a blob destination, which allocated on every decode.
+//
+// An empty src gives nil, whatever dst held, exactly as the expression it
+// replaces does: an empty blob decodes as nil, and that nil-versus-empty
+// distinction is observable (a JSON rendering prints `null`, not `""`).
+//
+// The result shares storage with dst, so dst's previous contents are gone; the
+// caller passes a dst it owns and no one else still reads.
+func ReuseBytes(dst, src []byte) []byte {
+	if len(src) == 0 {
+		return nil
+	}
+	if cap(dst) < len(src) {
+		// Exactly sized, as before: append(dst[:0], ...) would grow from
+		// cap(dst) by append's doubling rule and over-allocate up to 2x.
+		return append([]byte(nil), src...)
+	}
+	return append(dst[:0], src...)
+}
