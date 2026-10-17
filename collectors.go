@@ -433,6 +433,12 @@ func NewNestedSeq[T any](out *[][]T, b Bounds, c Caps, make func(*[]T) Visitor) 
 // Out's length starts from the backing array a previous decode left in that slot
 // (grow), not from nil.
 //
+// The opened row is never nil (ReuseSlice), so a row that ARRIVED empty is the
+// empty row whether its slot held storage or not -- as a matrix row is
+// (arrivedRow). Truncating alone left it nil in a fresh destination and empty in
+// a reused one, so the same bytes read `null` or `[]` depending on what the
+// destination held before. A gap row never reaches here and stays nil.
+//
 // Order is load-bearing: overIndex returns FIRST, so a refused element index
 // cannot wipe a valid earlier row -- the §7.3 interaction where a destructive
 // reset placed in front of the decision turns a loud failure into silent data
@@ -445,7 +451,7 @@ func (s *NestedSeq[T]) BeginSequence(id ID) (Visitor, error) {
 	if stale := grow(s.out, id, s.b.Count); stale != nil {
 		(*s.out)[id] = stale
 	}
-	(*s.out)[id] = (*s.out)[id][:0]
+	(*s.out)[id] = ReuseSlice((*s.out)[id], 0)
 	return s.make(&(*s.out)[id]), nil
 }
 

@@ -401,3 +401,50 @@ func TestNestedSeqReusesRowStorage(t *testing.T) {
 		t.Fatal("the second decode did not reuse the first decode's row storage")
 	}
 }
+
+// A row that ARRIVES empty is the empty row, not a nil one, whether its slot was
+// fresh or held a previous decode's storage -- otherwise the same bytes read
+// `null` in a fresh destination and `[]` in a reused one. A gap row (id 1 here)
+// never arrives and stays nil either way.
+func TestNestedSeqArrivedEmptyRowIsNeverNil(t *testing.T) {
+	full := wrapperSeq(t, func(e *sofab.Encoder) {
+		for id := sofab.ID(0); id < 3; id++ {
+			e.WriteSequenceBeginLazy(id)
+			e.WriteString(0, "a")
+			e.WriteSequenceEndKeep()
+		}
+	})
+	empty := wrapperSeq(t, func(e *sofab.Encoder) {
+		e.WriteSequenceBeginLazy(0)
+		e.WriteString(0, "x")
+		e.WriteSequenceEndKeep()
+		e.WriteSequenceBeginLazy(2)
+		e.WriteSequenceEndKeep()
+	})
+	var out [][]string
+	newSeq := func() sofab.Visitor {
+		return sofab.NewNestedSeq(&out, sofab.Bounds{}, tcaps, func(p *[]string) sofab.Visitor {
+			return sofab.NewStringSeq(p, sofab.Bounds{}, tcaps)
+		})
+	}
+	check := func(what string) {
+		t.Helper()
+		if len(out) != 3 || len(out[0]) != 1 || out[0][0] != "x" {
+			t.Fatalf("%s: out = %q, want [[x] [] []]", what, out)
+		}
+		if out[1] != nil {
+			t.Fatalf("%s: gap row = %#v, want nil", what, out[1])
+		}
+		if out[2] == nil || len(out[2]) != 0 {
+			t.Fatalf("%s: arrived-empty row = %#v, want empty and non-nil", what, out[2])
+		}
+	}
+	mustCollect(t, empty, newSeq())
+	check("fresh")
+
+	out = nil
+	mustCollect(t, full, newSeq())
+	out = out[:0]
+	mustCollect(t, empty, newSeq())
+	check("reused")
+}
